@@ -9,10 +9,10 @@
 use std::fs::File;
 use std::path::Path;
 
-use orc_core::config::Config;
-use orc_core::engine::Engine;
-use orc_core::flush::planner::series_dir;
-use orc_core::record::{Row, Value};
+use orc::config::Config;
+use orc::engine::Engine;
+use orc::flush::planner::series_dir;
+use orc::record::{Row, Value};
 
 /// Epoch microseconds for 2026-08-08T13:00:00Z, inside the default accept
 /// window (which starts at 2000-01-01 and ends 24h after now).

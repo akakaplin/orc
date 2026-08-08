@@ -38,8 +38,29 @@ pub mod codec;
 pub mod config;
 pub mod flush;
 pub mod manifest;
+pub mod protocol;
 pub mod time;
 pub mod wal;
+
+// The ZeroMQ transport is optional so the embeddable engine -- the common case
+// -- never pulls in a C++ toolchain. Both sides live behind the one feature, so
+// a process can be a server, a client, or both.
+#[cfg(feature = "net")]
+pub mod client;
+#[cfg(feature = "net")]
+pub mod server;
+
+/// The ZeroMQ binding this crate was built against.
+///
+/// Re-exported so callers can reach raw sockets -- and so the integration tests
+/// can, without a dev-dependency. Cargo cannot feature-gate dev-dependencies, so
+/// a `zmq` entry under `[dev-dependencies]` would make plain `cargo test` build
+/// libzmq from source on a machine that asked for the embeddable engine.
+///
+/// It also pins the version: a consumer mixing its own `zmq` with ours would
+/// link two libzmq builds. Going through this re-export makes that impossible.
+#[cfg(feature = "net")]
+pub use zmq;
 
 pub use engine::{Engine, RawIngest, Stats};
 pub use error::{Error, Result};

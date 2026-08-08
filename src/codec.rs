@@ -85,20 +85,31 @@ pub const MIN_PAYLOAD_BYTES: usize = 8 + 4 + 2 + 2 + 2 + 4;
 /// responds by truncating the file at that offset. `Corrupt` means bytes that
 /// are all present contradict each other, which recovery logs loudly and the
 /// flush path turns into one rejected record.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DecodeError {
     /// The buffer ends before the frame does. `needed` is the total byte length
     /// this frame will occupy once complete, so a streaming reader knows exactly
     /// how much more to pull.
-    #[error("truncated: frame needs {needed} bytes, buffer has {got}")]
     Truncated { needed: usize, got: usize },
 
     /// The frame is self-inconsistent: CRC mismatch, an implausible length, an
     /// unknown type tag, invalid UTF-8, or a section that does not end where the
     /// declared length says it must.
-    #[error("corrupt: {reason}")]
     Corrupt { reason: &'static str },
 }
+
+impl std::fmt::Display for DecodeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DecodeError::Truncated { needed, got } => {
+                write!(f, "truncated: frame needs {needed} bytes, buffer has {got}")
+            }
+            DecodeError::Corrupt { reason } => write!(f, "corrupt: {reason}"),
+        }
+    }
+}
+
+impl std::error::Error for DecodeError {}
 
 impl DecodeError {
     /// True for the "stop scanning, the tail is torn" case.

@@ -8,9 +8,8 @@ polars and Spark read directly.
 is the trade it makes — no query engine to build or maintain, and your data is in an
 open format from the moment it lands.
 
-> **Status: v0.1.** The embeddable engine works end to end — append, durable WAL,
-> crash recovery, hourly flush to sorted Parquet. The ZeroMQ server and client are
-> not built yet; see [Roadmap](#roadmap).
+> **Status: v0.1.** Works end to end — append, durable WAL, crash recovery, hourly
+> flush to sorted Parquet, and a ZeroMQ server and client. See [Roadmap](#roadmap).
 
 ## Design in one screen
 
@@ -34,6 +33,47 @@ open format from the moment it lands.
   a record is.
 - **The write path is append-only.** No Parquet file is ever read back, merged or
   replaced. Files within an hour may overlap in time; each is internally sorted.
+
+## Three ways to use it
+
+One crate, one dependency. ZeroMQ lives behind the optional `net` feature, so the
+embedded case never compiles a C++ toolchain.
+
+```toml
+orc = "0.1"                                   # embedded engine only — 58 crates
+orc = { version = "0.1", features = ["net"] } # + client and server — 88
+orc = { version = "0.1", features = ["cli"] } # + the two binaries — 106
+```
+
+`cli` is separate from `net` on purpose: argument parsing and log formatting are
+28 crates that a program embedding the client has no use for.
+
+**Embedded** — the engine in your process:
+
+```rust
+let engine = Engine::open(Config::load("./data/config.json")?)?;
+let trades = engine.series("trades")?;
+engine.append(&trades, &Row { ts, id, keys, extra, data })?;
+```
+
+**Server** — the same engine behind a socket:
+
+```rust
+let engine = Arc::new(Engine::open(config.clone())?);
+let server = Server::bind(engine, &config)?;
+server.run()?;                               // or: orc-server --data ./data
+```
+
+**Client** — send to a remote server:
+
+```rust
+let mut client = Client::builder().ingest("tcp://host:5555").connect()?;
+let trades = client.series("trades")?;       // schema handshake, once
+client.send(&trades, &row)?;
+```
+
+Nothing stops one process being both: embed the engine, and bind a server to it so
+other processes can write to the same data directory through you.
 
 ## Record shape
 
@@ -139,20 +179,27 @@ high-water mark by default rather than dropping silently.
 
 ## Dependencies
 
-Deliberately minimal: Parquet, ZeroMQ and JSON are the sanctioned surface, plus four
+Deliberately minimal: Parquet, ZeroMQ and JSON are the sanctioned surface, plus two
 small approved conveniences. Everything else is hand-rolled.
 
 | Crate | Where | Why |
 | --- | --- | --- |
-| `parquet`, `arrow-array`, `arrow-schema` | core | Output format. Sub-crates, not the `arrow` umbrella. |
-| `zmq` | server, client | Transport. Builds libzmq from source; needs cmake and a C++ compiler. |
-| `serde`, `serde_json` | core | Config and manifest only — never the ingest path. |
-| `crc32fast`, `thiserror`, `tracing`, `clap` | various | Approved conveniences. |
+| `parquet`, `arrow-array`, `arrow-schema` | default | Output format. Sub-crates, not the `arrow` umbrella. |
+| `serde`, `serde_json` | default | Config, manifest and control protocol — never the ingest path. |
+| `crc32fast`, `tracing` | default | Approved conveniences. |
+| `zmq` | **`net`** | Transport. Always builds libzmq and libsodium from C source — `zmq-sys` has no system-library path — so this is the one that needs cmake and a C++ compiler. |
+| `clap`, `tracing-subscriber` | **`cli`** | The two binaries only, and `tracing-subscriber` without `env-filter`: per-target filtering costs five crates and one binary has no targets to filter between. Set `RUST_LOG` to a bare level. |
 
-Hand-rolled instead of pulled in: the record codec (no `rmp-serde`), the civil-date
-helper (no `chrono` as a direct dep), the lock file (no `fs4`), the benchmark harness
-(no `criterion`). `orc-core` compiles with no ZeroMQ and no CLI dependency at all —
-`scripts/check-deps.sh` asserts it.
+Hand-rolled instead of pulled in: the record codec (no `rmp-serde`), the error types
+(no `thiserror`), the civil-date helper (no `chrono` as a direct dep), the lock file
+(no `fs4`), the benchmark harness (no `criterion`).
+
+`scripts/check-deps.sh` asserts the budget in both directions — that the default build
+has no transport and no CLI, that `net` adds the transport *without* the CLI, and that
+`cli` supplies what the binaries need. It also checks the `--edges all` graph, because
+Cargo cannot feature-gate a dev-dependency: a `zmq` entry under `[dev-dependencies]`
+would make plain `cargo test` build libzmq from source, and a `no-dev` check cannot
+see it. The network tests reach ZeroMQ through the `orc::zmq` re-export instead.
 
 ## Roadmap
 
@@ -162,17 +209,19 @@ helper (no `chrono` as a direct dep), the lock file (no `fs4`), the benchmark ha
 - [x] **M3** — recovery: truncate-and-amend, heartbeated lock
 - [x] **M4** — flush: sort, dedup, Parquet, hour partitions
 - [ ] **M5** — external merge for flushes larger than memory
-- [ ] **M6** — server: PULL ingest, control socket
-- [ ] **M7** — client: PUSH, batching, schema handshake
+- [x] **M6** — server: PULL ingest, control socket
+- [x] **M7** — client: PUSH, batching, schema handshake
 
 ## Development
 
 ```sh
-cargo build
-cargo test                                  # 119 tests
-cargo clippy --all-targets -- -D warnings
+cargo build                                    # engine only, no C++ toolchain
+cargo test                                     # 124 tests, still no libzmq
+cargo build --features cli                     # + ZeroMQ and binaries (builds libzmq)
+cargo test --features cli                      # 129 tests
+cargo clippy --all-targets --features cli -- -D warnings
 cargo fmt --all --check
-./scripts/check-deps.sh                     # orc-core dependency budget
+./scripts/check-deps.sh                        # dependency budget
 ```
 
 Reader-compatibility tests shell out to a real `duckdb` binary and skip when it is

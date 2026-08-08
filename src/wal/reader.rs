@@ -64,13 +64,12 @@ pub struct Frame<'a> {
 /// Every variant carries the offset, because the flush's response is to copy the
 /// offending bytes to `rejects/` and the operator's next question is always
 /// "which record?".
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FrameFault<'a> {
     /// The frame is intact but its contents do not decode under the schema its
     /// epoch names — a key section that disagrees with the arity, an unknown
     /// type tag, a string that is not UTF-8. A well-behaved encoder cannot
     /// produce this; a hand-rolled client can. Skippable.
-    #[error("frame at offset {offset} does not decode: {err}")]
     BadRecord {
         offset: usize,
         len: usize,
@@ -80,10 +79,6 @@ pub enum FrameFault<'a> {
     /// The frame names an epoch that is not in the manifest's history for its
     /// series. Old epochs are never removed, so this means the manifest was
     /// truncated or hand-edited. Skippable.
-    #[error(
-        "frame at offset {offset} names series {series:?} at schema epoch {epoch}, \
-         which is absent from the manifest history"
-    )]
     UnknownSchema {
         offset: usize,
         len: usize,
@@ -94,8 +89,39 @@ pub enum FrameFault<'a> {
     /// The bytes at this offset are not a locatable frame, so nothing after them
     /// can be found either. Iteration stops here; this is the fault recovery
     /// turns into a truncation.
-    #[error("frame at offset {offset} cannot be delimited: {err}")]
     Undecodable { offset: usize, err: DecodeError },
+}
+
+impl std::fmt::Display for FrameFault<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FrameFault::BadRecord { offset, err, .. } => {
+                write!(f, "frame at offset {offset} does not decode: {err}")
+            }
+            FrameFault::UnknownSchema {
+                offset,
+                series,
+                epoch,
+                ..
+            } => write!(
+                f,
+                "frame at offset {offset} names series {series:?} at schema epoch {epoch}, \
+                 which is absent from the manifest history"
+            ),
+            FrameFault::Undecodable { offset, err } => {
+                write!(f, "frame at offset {offset} cannot be delimited: {err}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for FrameFault<'_> {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            FrameFault::BadRecord { err, .. } | FrameFault::Undecodable { err, .. } => Some(err),
+            FrameFault::UnknownSchema { .. } => None,
+        }
+    }
 }
 
 impl FrameFault<'_> {

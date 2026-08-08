@@ -15,9 +15,9 @@
 use std::path::Path;
 use std::process::Command;
 
-use orc_core::config::Config;
-use orc_core::engine::Engine;
-use orc_core::record::{Row, Value};
+use orc::config::Config;
+use orc::engine::Engine;
+use orc::record::{Row, Value};
 
 const T13: i64 = 1_786_194_000_000_000;
 const HOUR_US: i64 = 3_600_000_000;

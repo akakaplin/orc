@@ -431,6 +431,15 @@ impl Engine {
         }
     }
 
+    /// Every resolved series handle, in arbitrary order.
+    ///
+    /// The control socket's schema handshake is built from these: a client
+    /// encodes keys positionally, so it needs each series' epoch and key order
+    /// before it can build a single frame.
+    pub fn series_handles(&self) -> impl Iterator<Item = &Arc<SeriesHandle>> {
+        self.handles.values()
+    }
+
     /// The data directory this engine owns.
     pub fn data_dir(&self) -> &Path {
         &self.data_dir
