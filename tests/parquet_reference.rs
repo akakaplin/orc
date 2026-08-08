@@ -61,7 +61,7 @@ fn the_leaf_columns_are_exactly_these_in_exactly_this_order() {
         "{}",
     )
     .unwrap();
-    write_file(&path, &b.finish().unwrap(), "trades", 7, "zstd", 1024).unwrap();
+    write_file(&path, &b.finish().unwrap(), "trades", 7, "lz4_raw", 1024).unwrap();
 
     assert_eq!(
         read_metadata(&path).unwrap().columns,
@@ -87,7 +87,7 @@ fn ts_is_column_zero_and_declared_sorted_ascending() {
     let path = dir.path().join("x.parquet");
     let mut b = RowBuilder::new("trades", &[], 1).unwrap();
     b.append(T13, "a", &[], &[], "").unwrap();
-    write_file(&path, &b.finish().unwrap(), "trades", 3, "zstd", 1024).unwrap();
+    write_file(&path, &b.finish().unwrap(), "trades", 3, "lz4_raw", 1024).unwrap();
 
     let meta = read_metadata(&path).unwrap();
     assert_eq!(meta.columns[0], "ts");
@@ -119,7 +119,7 @@ fn no_writer_specific_metadata_is_embedded() {
     let path = dir.path().join("x.parquet");
     let mut b = RowBuilder::new("s", &[], 1).unwrap();
     b.append(T13, "", &[], &[], "").unwrap();
-    write_file(&path, &b.finish().unwrap(), "s", 0, "zstd", 1024).unwrap();
+    write_file(&path, &b.finish().unwrap(), "s", 0, "lz4_raw", 1024).unwrap();
 
     let meta = read_metadata(&path).unwrap();
     let mut keys: Vec<&str> = meta.key_value.keys().map(String::as_str).collect();
@@ -248,7 +248,7 @@ fn an_absent_map_reads_back_empty_rather_than_null() {
     b.append(T13 + 1, "none", &[], &[], "").unwrap();
     b.append(T13 + 2, "empty-value", &[], &[("k", "")], "")
         .unwrap();
-    write_file(&path, &b.finish().unwrap(), "s", 0, "zstd", 1024).unwrap();
+    write_file(&path, &b.finish().unwrap(), "s", 0, "lz4_raw", 1024).unwrap();
 
     let rows = read_file(&path).unwrap();
     assert_eq!(rows[0].extra, [("k".to_string(), "v".to_string())]);
@@ -276,7 +276,7 @@ fn empty_strings_are_values_and_never_become_nulls() {
     b.append(T13, "", &[Value::Str("")], &[("", "")], "")
         .unwrap();
     b.append(T13 + 1, "x", &[Value::Null], &[], "d").unwrap();
-    write_file(&path, &b.finish().unwrap(), "s", 0, "zstd", 1024).unwrap();
+    write_file(&path, &b.finish().unwrap(), "s", 0, "lz4_raw", 1024).unwrap();
 
     let rows = read_file(&path).unwrap();
     assert_eq!(rows[0].id, "");
@@ -316,7 +316,7 @@ fn edge_case_scalars_survive_verbatim() {
         )
         .unwrap();
     }
-    write_file(&path, &b.finish().unwrap(), "s", 0, "zstd", 2).unwrap();
+    write_file(&path, &b.finish().unwrap(), "s", 0, "lz4_raw", 2).unwrap();
 
     let rows = read_file(&path).unwrap();
     assert_eq!(rows.len(), 4);

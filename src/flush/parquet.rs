@@ -32,7 +32,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use parquet::basic::{
-    Compression, ConvertedType, LogicalType, Repetition, TimeUnit, Type as PhysicalType, ZstdLevel,
+    Compression, ConvertedType, LogicalType, Repetition, TimeUnit, Type as PhysicalType,
 };
 use parquet::column::writer::ColumnWriter;
 use parquet::data_type::ByteArray;
@@ -58,6 +58,14 @@ pub const SERIES_META_KEY: &str = "orc.series";
 /// Index of the `ts` column. Fixed, and relied on by the sorting-column
 /// declaration below.
 const TS_COLUMN_IDX: i32 = 0;
+
+/// Compression codecs the pinned `parquet` feature set can actually write.
+///
+/// Config validation checks against this at load, so an unwritable codec fails
+/// immediately rather than at the first flush an hour later, with a WAL that has
+/// nowhere to go. Keeping the list here — next to the match that implements it —
+/// is what stops the two drifting apart.
+pub const SUPPORTED_COMPRESSION: [&str; 4] = ["lz4_raw", "lz4", "uncompressed", "none"];
 
 fn schema_err(what: &str, e: parquet::errors::ParquetError) -> Error {
     Error::Config(format!("building parquet schema ({what}): {e}"))
@@ -536,11 +544,16 @@ pub fn writer_properties(
     _row_group_rows: usize,
 ) -> Result<WriterProperties> {
     let codec = match compression {
-        "zstd" => Compression::ZSTD(ZstdLevel::default()),
+        // LZ4_RAW (codec 7, Parquet 2.9), never the deprecated LZ4 (codec 5),
+        // whose non-standard Hadoop framing is why it was deprecated. Bare
+        // "lz4" is accepted as a spelling of the same thing rather than
+        // rejected, because the one it might have meant is not one we write.
+        "lz4_raw" | "lz4" => Compression::LZ4_RAW,
         "uncompressed" | "none" => Compression::UNCOMPRESSED,
         other => {
             return Err(Error::Config(format!(
-                "unsupported compression {other:?}; supported: zstd, uncompressed"
+                "unsupported compression {other:?}; supported: {}",
+                SUPPORTED_COMPRESSION.join(", ")
             )));
         }
     };
@@ -742,7 +755,7 @@ mod tests {
         )
         .unwrap();
         let cols = b.finish().unwrap();
-        write_file(path, &cols, "trades", 7, "zstd", row_group_rows).unwrap();
+        write_file(path, &cols, "trades", 7, "lz4_raw", row_group_rows).unwrap();
         read_file(path).unwrap()
     }
 
@@ -886,9 +899,48 @@ mod tests {
 
     #[test]
     fn unsupported_compression_is_rejected_before_any_io() {
+        // Compiled out, so it must fail at config load rather than at the first
+        // flush an hour later.
         assert!(writer_properties("s", 0, "brotli", 128).is_err());
-        assert!(writer_properties("s", 0, "zstd", 128).is_ok());
-        assert!(writer_properties("s", 0, "uncompressed", 128).is_ok());
+        assert!(writer_properties("s", 0, "zstd", 128).is_err());
+    }
+
+    /// The list config validates against and the match that implements it must
+    /// agree in both directions.
+    ///
+    /// They used to be two separate lists and had already drifted: config
+    /// accepted `"none"` but not `"uncompressed"`, so a codec the writer handles
+    /// fine was refused at load. One list, checked both ways, is the fix.
+    #[test]
+    fn every_advertised_codec_can_actually_be_written() {
+        for name in SUPPORTED_COMPRESSION {
+            assert!(
+                writer_properties("s", 0, name, 128).is_ok(),
+                "config advertises {name:?} but the writer rejects it"
+            );
+        }
+        // And the error names the real list, so a typo is self-correcting.
+        let err = writer_properties("s", 0, "gzip", 128)
+            .unwrap_err()
+            .to_string();
+        for name in SUPPORTED_COMPRESSION {
+            assert!(err.contains(name), "{err:?} should list {name:?}");
+        }
+    }
+
+    /// LZ4_RAW (codec 7), never the deprecated LZ4 (codec 5) whose non-standard
+    /// Hadoop framing is why it was deprecated. Readers treat them differently,
+    /// so writing the wrong one is a compatibility bug, not a performance one.
+    #[test]
+    fn lz4_means_lz4_raw() {
+        for name in ["lz4", "lz4_raw"] {
+            let props = writer_properties("s", 0, name, 128).unwrap();
+            assert_eq!(
+                props.compression(&"ts".into()),
+                Compression::LZ4_RAW,
+                "{name:?}"
+            );
+        }
     }
 
     /// A zero-row file is never written by the flush (an empty flush is a
@@ -899,7 +951,7 @@ mod tests {
         let path = dir.path().join("empty.parquet");
         let b = RowBuilder::new("s", &[], 0).unwrap();
         let cols = b.finish().unwrap();
-        write_file(&path, &cols, "s", 0, "zstd", 128).unwrap();
+        write_file(&path, &cols, "s", 0, "lz4_raw", 128).unwrap();
         assert!(read_file(&path).unwrap().is_empty());
     }
 }

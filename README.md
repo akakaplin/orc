@@ -150,7 +150,7 @@ find data/series -name 'hour=*' -type d -mtime +90 -exec rm -rf {} +
 {
   "server": { "ingest_endpoint": "tcp://127.0.0.1:5555" },
   "wal":    { "fsync_interval_ms": 10, "segment_max_bytes": 67108864 },
-  "flush":  { "interval_ms": 3600000, "compression": "zstd" },
+  "flush":  { "interval_ms": 3600000, "compression": "lz4_raw" },
   "series": [
     { "name": "trades",
       "keys": [ {"name": "symbol", "type": "string"},
@@ -184,7 +184,7 @@ small approved conveniences. Everything else is hand-rolled.
 
 | Crate | Where | Why |
 | --- | --- | --- |
-| `parquet` | default | Output format. **Without the `arrow` feature** — see below. |
+| `parquet` | default | Output format. **Without the `arrow` feature** — see below. Codec is `lz4` (pure Rust, 1 crate), not `zstd` (8 crates and a C compiler). |
 | `serde`, `serde_json` | default | Config, manifest and control protocol — never the ingest path. |
 | `crc32fast`, `tracing` | default | Approved conveniences. |
 | `zmq` | **`net`** | Transport. Always builds libzmq and libsodium from C source — `zmq-sys` has no system-library path — so this is the one that needs cmake and a C++ compiler. |
@@ -193,6 +193,28 @@ small approved conveniences. Everything else is hand-rolled.
 Hand-rolled instead of pulled in: the record codec (no `rmp-serde`), the error types
 (no `thiserror`), the civil-date helper (no `chrono` as a direct dep), the lock file
 (no `fs4`), the benchmark harness (no `criterion`).
+
+**LZ4_RAW, not zstd.** Measured on 500k rows of realistic output — a monotonic `ts`,
+a 50-symbol column, incrementing ids, a near-constant `extra` map and a JSON `data`
+blob:
+
+| Codec | Adds | Toolchain | Size | Write | Read |
+| --- | --- | --- | --- | --- | --- |
+| **LZ4_RAW** | **+1** `lz4_flex` | **pure Rust** | 17.1 MB | 0.16s | **12 ms** |
+| zstd | +8 incl. `cc` | **C compiler** | 11.0 MB | 0.17s | 15 ms |
+| snappy | +1 | pure Rust | 18.1 MB | 0.17s | 15 ms |
+| brotli | +4 | pure Rust | 11.3 MB | 0.26s | 27 ms |
+| gzip | +4 | pure Rust | 11.3 MB | 0.91s | 21 ms |
+
+zstd compresses 55% better, so the trade is real: **files are larger in exchange for a
+pure-Rust build with no C compiler anywhere in the default tree.** LZ4_RAW reads
+fastest of the six, which matters for a write-only engine whose whole output exists to
+be queried. It is codec 7 (Parquet 2.9) — never the deprecated codec 5 `LZ4`, whose
+non-standard Hadoop framing is why it was deprecated. Verified readable by DuckDB
+1.5.5 and pyarrow 21.
+
+Files written by an earlier version with zstd stay readable: orc never reads Parquet
+back, so codec choice affects new files only.
 
 **No Arrow.** `parquet`'s `arrow` feature is all-or-nothing: it costs 12 crates — the
 six `arrow-*`, plus `arrow-ipc`'s `flatbuffers` and `bitflags`, plus `base64`,

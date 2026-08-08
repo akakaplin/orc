@@ -53,7 +53,18 @@ if cargo tree --edges no-dev --prefix none \
     | awk 'NF {print $1}' | grep -qE '^(arrow-|flatbuffers$)'; then
     echo "FAIL: the arrow stack is back in the default build." >&2
     echo "      parquet's 'arrow' feature pulls all six arrow-* crates plus" >&2
-    echo "      flatbuffers, chrono, ahash, half and bytes." >&2
+    echo "      flatbuffers, bitflags, base64, num-complex, rustc_version, semver." >&2
+    exit 1
+fi
+
+# The default build must stay pure Rust. `cc` is the tell: nothing here compiles
+# C, and the compression codec (lz4_flex) was chosen over zstd precisely so an
+# embedder needs no C compiler. If `cc` appears, some dependency started building
+# native code -- which is a portability change, not a size one.
+if cargo tree --edges no-dev --prefix none \
+    | awk 'NF {print $1}' | grep -qx cc; then
+    echo "FAIL: 'cc' is in the default build -- something now compiles C." >&2
+    echo "      The embeddable engine is meant to build with rustc alone." >&2
     exit 1
 fi
 

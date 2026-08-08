@@ -33,7 +33,7 @@ cli = ["net", "dep:clap", "dep:tracing-subscriber"]
 # tests/parquet_reference.rs pins that the output is indistinguishable from what
 # ArrowWriter produced.
 parquet = { version = "59.2", default-features = false, features = [
-    "zstd",
+    "lz4",
     "crc",
 ] }
 

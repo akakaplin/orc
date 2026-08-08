@@ -209,17 +209,20 @@ impl Default for FlushConfig {
         Self {
             interval_ms: 3_600_000, // 1 h
             on_startup: true,
-            compression: "zstd".into(),
+            compression: "lz4_raw".into(),
             row_group_rows: 131_072,
             merge_fan_in: 64,
         }
     }
 }
 
-/// Parquet codecs the pinned feature set can actually write. Configuring
-/// anything else must fail at load rather than at the first flush, an hour
-/// later, with a WAL that has nowhere to go.
-const SUPPORTED_COMPRESSION: [&str; 2] = ["zstd", "none"];
+/// Re-exported from the writer that implements it.
+///
+/// This list used to be duplicated here, and had already drifted: it accepted
+/// `"none"` but not `"uncompressed"`, which the writer has always handled — so a
+/// perfectly writable config was rejected at load. Taking it from the one place
+/// that turns a name into a codec is what stops that recurring.
+use crate::flush::parquet::SUPPORTED_COMPRESSION;
 
 impl LimitsConfig {
     /// `ts_min` as epoch microseconds.
@@ -501,7 +504,7 @@ mod tests {
 
         assert_eq!(cfg.flush.interval_ms, 3_600_000);
         assert!(cfg.flush.on_startup);
-        assert_eq!(cfg.flush.compression, "zstd");
+        assert_eq!(cfg.flush.compression, "lz4_raw");
         assert_eq!(cfg.flush.row_group_rows, 131_072);
         assert_eq!(cfg.flush.merge_fan_in, 64);
 
@@ -543,7 +546,7 @@ mod tests {
                        "validate_json": false },
           "wal":     { "fsync_interval_ms": 10, "fsync_bytes": 4194304,
                        "segment_max_bytes": 67108864 },
-          "flush":   { "interval_ms": 3600000, "on_startup": true, "compression": "zstd",
+          "flush":   { "interval_ms": 3600000, "on_startup": true, "compression": "lz4_raw",
                        "row_group_rows": 131072, "merge_fan_in": 64 },
           "series": [
             { "name": "trades",
