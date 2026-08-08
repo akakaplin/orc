@@ -1,0 +1,25 @@
+[package]
+name = "orc-core"
+description = "Embeddable time-series engine: low-latency WAL ingest, periodic Parquet flush"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+
+# No zmq, no clap. `orc-core` is the embeddable artifact, and CI asserts this list.
+[dependencies]
+parquet.workspace = true
+arrow-array.workspace = true
+arrow-schema.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+crc32fast.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+# Integration tests are a separate crate, so they cannot reach orc-core's own
+# dependencies -- these are the same versions, declared again for tests/.
+# `--edges no-dev` keeps them out of the dependency-budget check.
+[dev-dependencies]
+tempfile.workspace = true
+parquet.workspace = true
+serde_json.workspace = true

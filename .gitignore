@@ -1,1 +1,18 @@
+# Build artifacts
 /target
+**/*.rs.bk
+*.pdb
+
+# Coverage / profiling
+*.profraw
+*.profdata
+
+# Editors
+.vscode/
+.idea/
+*.iml
+*.swp
+*~
+
+# macOS
+.DS_Store
