@@ -9,9 +9,7 @@ set -eu
 
 cd "$(dirname "$0")/.."
 
-expected='arrow-array
-arrow-schema
-crc32fast
+expected='crc32fast
 parquet
 serde
 serde_json
@@ -35,7 +33,7 @@ if [ "$expected" != "$actual" ]; then
     exit 1
 fi
 
-# The three that matter, checked by name so the failure message is obvious even
+# The ones that matter, checked by name so the failure message is obvious even
 # if the list above is edited carelessly.
 for forbidden in zmq clap tracing-subscriber; do
     if cargo tree --edges no-dev --prefix none \
@@ -44,6 +42,20 @@ for forbidden in zmq clap tracing-subscriber; do
         exit 1
     fi
 done
+
+# Arrow is a whole subtree rather than one crate, and parquet's `arrow` feature
+# is all-or-nothing: turning it on for ArrowWriter also pulls arrow-ipc and
+# flatbuffers, which this engine never touches. src/flush/parquet.rs writes
+# against the low-level API instead, so any arrow-* crate reappearing means
+# someone re-enabled the feature -- probably by accident, since nothing here
+# names those crates directly.
+if cargo tree --edges no-dev --prefix none \
+    | awk 'NF {print $1}' | grep -qE '^(arrow-|flatbuffers$)'; then
+    echo "FAIL: the arrow stack is back in the default build." >&2
+    echo "      parquet's 'arrow' feature pulls all six arrow-* crates plus" >&2
+    echo "      flatbuffers, chrono, ahash, half and bytes." >&2
+    exit 1
+fi
 
 # `--edges all` includes dev-dependencies, and this is the check the earlier
 # no-dev-only version could not make. Cargo cannot feature-gate a dev-dependency,

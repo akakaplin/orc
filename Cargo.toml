@@ -21,17 +21,21 @@ net = ["dep:zmq"]
 cli = ["net", "dep:clap", "dep:tracing-subscriber"]
 
 [dependencies]
-# Sanctioned: Parquet. `arrow` feature only; the default would also pull
+# Sanctioned: Parquet. Only `zstd` and `crc`; the default would also pull
 # snap/brotli/flate2/lz4/base64/simdutf8. `crc` gates Parquet's own page
 # checksums onto crc32fast, which we already depend on.
+#
+# `arrow` is deliberately absent: an all-or-nothing feature costing 12 crates
+# (six arrow-*, flatbuffers, bitflags, base64, num-complex, rustc_version,
+# semver), of which arrow-ipc is pure toll -- we never touch IPC. All it does
+# for our schema is compute definition and repetition levels.
+# src/flush/parquet.rs computes them directly against the low-level writer, and
+# tests/parquet_reference.rs pins that the output is indistinguishable from what
+# ArrowWriter produced.
 parquet = { version = "59.2", default-features = false, features = [
-    "arrow",
     "zstd",
     "crc",
 ] }
-# The sub-crates, not the `arrow` umbrella: we only build RecordBatches.
-arrow-array = "59.2"
-arrow-schema = "59.2"
 
 # Sanctioned: JSON. Config, manifest and the control protocol.
 serde = { version = "1.0", features = ["derive"] }
@@ -63,7 +67,6 @@ tempfile = "3.27"
 # declaring it would make plain `cargo test` build libzmq from source -- exactly
 # what putting the transport behind `net` was meant to prevent. The network
 # tests reach it through `orc::zmq` instead.
-parquet = { version = "59.2", default-features = false, features = ["arrow", "zstd"] }
 serde_json = "1.0"
 
 [[bin]]

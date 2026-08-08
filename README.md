@@ -40,9 +40,9 @@ One crate, one dependency. ZeroMQ lives behind the optional `net` feature, so th
 embedded case never compiles a C++ toolchain.
 
 ```toml
-orc = "0.1"                                   # embedded engine only — 58 crates
-orc = { version = "0.1", features = ["net"] } # + client and server — 88
-orc = { version = "0.1", features = ["cli"] } # + the two binaries — 106
+orc = "0.1"                                   # embedded engine only — 46 crates
+orc = { version = "0.1", features = ["net"] } # + client and server — 77
+orc = { version = "0.1", features = ["cli"] } # + the two binaries — 95
 ```
 
 `cli` is separate from `net` on purpose: argument parsing and log formatting are
@@ -184,7 +184,7 @@ small approved conveniences. Everything else is hand-rolled.
 
 | Crate | Where | Why |
 | --- | --- | --- |
-| `parquet`, `arrow-array`, `arrow-schema` | default | Output format. Sub-crates, not the `arrow` umbrella. |
+| `parquet` | default | Output format. **Without the `arrow` feature** — see below. |
 | `serde`, `serde_json` | default | Config, manifest and control protocol — never the ingest path. |
 | `crc32fast`, `tracing` | default | Approved conveniences. |
 | `zmq` | **`net`** | Transport. Always builds libzmq and libsodium from C source — `zmq-sys` has no system-library path — so this is the one that needs cmake and a C++ compiler. |
@@ -193,6 +193,18 @@ small approved conveniences. Everything else is hand-rolled.
 Hand-rolled instead of pulled in: the record codec (no `rmp-serde`), the error types
 (no `thiserror`), the civil-date helper (no `chrono` as a direct dep), the lock file
 (no `fs4`), the benchmark harness (no `criterion`).
+
+**No Arrow.** `parquet`'s `arrow` feature is all-or-nothing: it costs 12 crates — the
+six `arrow-*`, plus `arrow-ipc`'s `flatbuffers` and `bitflags`, plus `base64`,
+`num-complex`, `rustc_version` and `semver` — and 5s of clean build, of which
+`arrow-ipc` is pure toll since this engine never touches IPC. All `ArrowWriter`
+actually does for a schema of four scalar types and one map is compute definition and
+repetition levels, so [`src/flush/parquet.rs`](src/flush/parquet.rs) computes them
+directly. Before the switch, both writers produced the same three fixtures and 2244
+lines of dumped schema, row-group boundaries, statistics, metadata, data and per-row
+map cardinality compared **identical**; `tests/parquet_reference.rs` pins that
+contract. Files are also ~700 bytes smaller each, since `ArrowWriter` embedded an
+`ARROW:schema` blob in every one.
 
 `scripts/check-deps.sh` asserts the budget in both directions — that the default build
 has no transport and no CLI, that `net` adds the transport *without* the CLI, and that
@@ -216,9 +228,9 @@ see it. The network tests reach ZeroMQ through the `orc::zmq` re-export instead.
 
 ```sh
 cargo build                                    # engine only, no C++ toolchain
-cargo test                                     # 124 tests, still no libzmq
+cargo test                                     # 136 tests, still no libzmq
 cargo build --features cli                     # + ZeroMQ and binaries (builds libzmq)
-cargo test --features cli                      # 129 tests
+cargo test --features cli                      # 141 tests
 cargo clippy --all-targets --features cli -- -D warnings
 cargo fmt --all --check
 ./scripts/check-deps.sh                        # dependency budget

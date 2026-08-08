@@ -178,7 +178,7 @@ pub fn run(
         // arity from the manifest and the codec reads whatever type tag it
         // finds, so a hand-rolled client can put an i64 where the config
         // declares a string and get all the way here. Left alone it would
-        // surface inside the Arrow builders and fail the whole flush over one
+        // surface inside the column builders and fail the whole flush over one
         // record -- the exact stall `rejects/` exists to prevent.
         let mut rejected = 0;
         rows.retain(|row| {
@@ -278,7 +278,7 @@ struct DecodedRow<'a> {
 ///
 /// Arity was already checked by `decode`, which took it from the manifest;
 /// **types were not**, because the codec reads whatever tag byte it finds. Both
-/// are checked here so the Arrow builders downstream cannot fail on data.
+/// are checked here so the column builders downstream cannot fail on data.
 /// [`Value::Null`] satisfies any column — nullability is enforced at ingest, and
 /// every key column is written nullable in Parquet regardless.
 fn matches_schema(keys: &[KeyDef], values: &[Value<'_>]) -> bool {
@@ -420,11 +420,11 @@ impl Sink<'_> {
         keys: &[KeyDef],
         rows: &[DecodedRow<'_>],
     ) -> Result<WrittenFile> {
-        let mut builder = RowBuilder::new(series, keys, rows.len());
+        let mut builder = RowBuilder::new(series, keys, rows.len())?;
         for row in rows {
             builder.append(row.ts, row.id, &row.keys, &row.extra, row.data)?;
         }
-        let batch = builder.finish()?;
+        let cols = builder.finish()?;
 
         let hour = hour_partition(rows[0].ts);
         // The segment range is what makes a re-run idempotent: the same
@@ -437,7 +437,7 @@ impl Sink<'_> {
         let staged = tmp_dir(self.data_dir).join(format!("{series}.{hour}.{name}"));
         write_file(
             &staged,
-            &batch,
+            &cols,
             series,
             epoch,
             &self.config.flush.compression,
@@ -596,9 +596,6 @@ mod tests {
     use super::*;
     use std::fs;
 
-    use arrow_array::{Array, StringArray, TimestampMicrosecondArray};
-    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-
     use crate::codec::{encode, encode_segment_header};
     use crate::config::SeriesConfig;
     use crate::record::{KeyType, Row};
@@ -702,30 +699,7 @@ mod tests {
 
     /// `(ts, id)` of every row in a Parquet file, in file order.
     fn read_rows(path: &Path) -> Vec<(i64, String)> {
-        let reader = ParquetRecordBatchReaderBuilder::try_new(fs::File::open(path).unwrap())
-            .unwrap()
-            .build()
-            .unwrap();
-        let mut out = Vec::new();
-        for batch in reader {
-            let batch = batch.unwrap();
-            let ts = batch
-                .column_by_name("ts")
-                .unwrap()
-                .as_any()
-                .downcast_ref::<TimestampMicrosecondArray>()
-                .unwrap();
-            let id = batch
-                .column_by_name("id")
-                .unwrap()
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .unwrap();
-            for i in 0..batch.num_rows() {
-                out.push((ts.value(i), id.value(i).to_string()));
-            }
-        }
-        out
+        crate::flush::read::read_ts_id(path).unwrap()
     }
 
     #[test]
@@ -910,7 +884,7 @@ mod tests {
         // The codec reads whatever type tag it finds, so a hand-rolled client
         // can encode an i64 into a column the config declares a string. It gets
         // past ingest -- which only reads the fixed prefix -- and past the
-        // decoder, and would otherwise fail the flush inside the Arrow builder.
+        // decoder, and would otherwise fail the flush inside the column builder.
         let dir = tempfile::tempdir().unwrap();
         let (cfg, mut m) = trades();
         write_segment(

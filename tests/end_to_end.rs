@@ -3,10 +3,9 @@
 //! The unit tests each prove one module in isolation. These prove the seams
 //! between them, which is where an integration bug actually lives: a record
 //! written through `Engine::append` has to survive encoding, the WAL, a fsync, a
-//! restart, decoding, sorting, dedup and Arrow before a reader sees it, and any
-//! one of those handoffs can lose or reshape it.
+//! restart, decoding, sorting, dedup and the Parquet writer before a reader sees
+//! it, and any one of those handoffs can lose or reshape it.
 
-use std::fs::File;
 use std::path::Path;
 
 use orc::config::Config;
@@ -45,14 +44,7 @@ fn open(dir: &Path) -> Engine {
 fn parquet_rows(dir: &Path, series: &str) -> usize {
     let mut total = 0;
     for path in parquet_files(dir, series) {
-        let f = File::open(&path).unwrap();
-        let reader = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(f)
-            .unwrap()
-            .build()
-            .unwrap();
-        for batch in reader {
-            total += batch.unwrap().num_rows();
-        }
+        total += orc::flush::read::read_metadata(&path).unwrap().num_rows as usize;
     }
     total
 }
