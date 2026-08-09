@@ -1,16 +1,10 @@
 # orc
 
-An embeddable time-series storage engine in Rust. Records go into a write-ahead log at
-sub-microsecond latency and are periodically flushed to sorted Parquet that DuckDB,
-polars and Spark read directly.
+An embeddable time-series storage engine in Rust. Records go into a write-ahead log at sub-microsecond latency and are periodically flushed to sorted Parquet that DuckDB, polars and Spark read directly.
 
-`orc` is **write-only**: it owns the write path and leaves reading to those tools. That
-is the trade it makes — no query engine to build or maintain, and your data is in an
-open format from the moment it lands.
+`orc` is **write-only**: it owns the write path and leaves reading to those tools. That is the trade it makes — no query engine to build or maintain, and your data is in an open format from the moment it lands.
 
-> **Status: 0.1.0, unreleased.** Works end to end — append, durable WAL, crash
-> recovery, hourly flush to sorted Parquet, and a ZeroMQ server and client.
-> Nothing is published to crates.io yet. See [Roadmap](#roadmap).
+> **Status: 0.1.0, unreleased.** Works end to end — append, durable WAL, crash recovery, hourly flush to sorted Parquet, and a ZeroMQ server and client. Nothing is published to crates.io yet.
 
 ## Design in one screen
 
@@ -24,31 +18,19 @@ open format from the moment it lands.
                                                     series/<name>/hour=.../*.parquet
 ```
 
-- **Ingest never blocks on disk.** `append()` encodes into a thread-local buffer and
-  copies it under a short mutex. A background committer thread owns `fsync`, so a
-  process crash loses nothing already appended and a power cut loses at most one
-  ~10 ms window.
-- **Every frame is self-describing.** It carries its own series name and its own schema
-  epoch, so a WAL segment is interpretable with nothing but itself — no registry, no
-  manifest. A lost `manifest.json` costs schema history, never the ability to tell what
-  a record is.
-- **The write path is append-only.** No Parquet file is ever read back, merged or
-  replaced. Files within an hour may overlap in time; each is internally sorted.
+- **Ingest never blocks on disk.** `append()` encodes into a thread-local buffer and copies it under a short mutex. A background committer thread owns `fsync`, so a process crash loses nothing already appended and a power cut loses at most one ~10 ms window.
+- **Every frame is self-describing.** It carries its own series name and its own schema epoch, so a WAL segment is interpretable with nothing but itself — no registry, no manifest. A lost `manifest.json` costs schema history, never the ability to tell what a record is.
+- **The write path is append-only.** No Parquet file is ever read back, merged or replaced. Files within an hour may overlap in time; each is internally sorted.
 
 ## Three ways to use it
 
-One crate, three feature levels. ZeroMQ lives behind the optional `net` feature, so
-the embedded case builds with rustc alone — no C or C++ toolchain anywhere in the
-default tree.
-
 ```toml
-orc = "0.1"                                   # embedded engine only — 39 crates
-orc = { version = "0.1", features = ["net"] } # + client and server — 75
-orc = { version = "0.1", features = ["cli"] } # + the two binaries — 93
+orc = "0.1"                                   # embedded engine
+orc = { version = "0.1", features = ["net"] } # + client and server
+orc = { version = "0.1", features = ["cli"] } # + the orc-server and orc-cli binaries
 ```
 
-`cli` is separate from `net` on purpose: argument parsing and log formatting are
-18 crates that a program embedding the client has no use for.
+The default build is pure Rust and needs no C toolchain. ZeroMQ lives behind `net`, and the binaries' argument parsing and log formatting behind `cli`, so embedding the client costs neither.
 
 **Embedded** — the engine in your process:
 
@@ -74,46 +56,47 @@ let trades = client.series("trades")?;       // schema handshake, once
 client.send(&trades, &row)?;
 ```
 
-Nothing stops one process being both: embed the engine, and bind a server to it so
-other processes can write to the same data directory through you.
+Nothing stops one process being both: embed the engine, and bind a server to it so other processes can write to the same data directory through you.
 
 ## Record shape
 
-| Field | Type | Required | Notes |
-| --- | --- | --- | --- |
-| `ts` | `i64` epoch **microseconds**, UTC | yes | The sort key. |
-| `id` | UTF-8 text | no | `(ts, id)` is the dedup key. May be empty. |
-| `series` | UTF-8 name | yes | Must exist in `config.json`. |
-| declared keys | typed, positional | per config | Real Parquet columns. |
-| `extra` | `map<utf8,utf8>` | no | Undeclared keys land here, no schema change. |
-| `data` | opaque UTF-8 | no | Stored verbatim, never parsed. |
+| Field         | Type                              | Required   | Notes                                        |
+| ------------- | --------------------------------- | ---------- | -------------------------------------------- |
+| `ts`          | `i64` epoch **microseconds**, UTC | yes        | The sort key.                                |
+| `id`          | UTF-8 text                        | no         | `(ts, id)` is the dedup key. May be empty.   |
+| `series`      | UTF-8 name                        | yes        | Must exist in `config.json`.                 |
+| declared keys | typed, positional                 | per config | Real Parquet columns.                        |
+| `extra`       | `map<utf8,utf8>`                  | no         | Undeclared keys land here, no schema change. |
+| `data`        | opaque UTF-8                      | no         | Stored verbatim, never parsed.               |
 
 ### Where does a field go?
 
 Three mechanisms can hold a field, which is one more than is obvious:
 
-| Put it in | When | Cost of getting it wrong |
-| --- | --- | --- |
-| a **declared key** | you filter, group or join on it | anything else means full scans |
-| **`extra`** | it varies per record, or you don't control the producer | string-typed, no pushdown |
-| **`data`** | payload you read *after* selecting rows | invisible to the query planner |
+| Put it in          | When                                                    | Cost of getting it wrong       |
+| ------------------ | ------------------------------------------------------- | ------------------------------ |
+| a **declared key** | you filter, group or join on it                         | anything else means full scans |
+| **`extra`**        | it varies per record, or you don't control the producer | string-typed, no pushdown      |
+| **`data`**         | payload you read *after* selecting rows                 | invisible to the query planner |
 
-The failure mode is putting a filter column inside `data`: Parquet cannot prune on it,
-so every query reads and JSON-parses every row.
+The failure mode is putting a filter column inside `data`: Parquet cannot prune on it, so every query reads and JSON-parses every row.
 
 ### Timestamps must be microseconds
 
-Not nanoseconds, not milliseconds. Every `append` checks
-`ts_min <= ts <= now + ts_max_skew`, which doubles as a **unit check** — each common
-mistake lands far outside the window and is rejected immediately instead of quietly
-writing records into the year 58,000:
+Not nanoseconds, not milliseconds. Every `append` checks `ts_min <= ts <= now + ts_max_skew`, which doubles as a **unit check** — each common mistake lands far outside the window and is rejected immediately instead of quietly writing records into the year 58,000:
 
-| You send | Interpreted as | Verdict |
-| --- | --- | --- |
-| seconds | 1970-01-01 | rejected |
-| milliseconds | 1970-01-21 | rejected |
-| **microseconds** | today | **accepted** |
-| nanoseconds | year ~58,600 | rejected |
+| You send         | Interpreted as | Verdict      |
+| ---------------- | -------------- | ------------ |
+| seconds          | 1970-01-01     | rejected     |
+| milliseconds     | 1970-01-21     | rejected     |
+| **microseconds** | today          | **accepted** |
+| nanoseconds      | year ~58,600   | rejected     |
+
+### Schema changes
+
+Adding, removing or reordering a series' declared keys is allowed and takes effect without downtime: each change bumps that series' schema epoch, every frame carries the epoch it was written under, and each Parquet file holds exactly one epoch. **Retyping an existing key is rejected at startup** — it would make old and new files unreadable in one query. Rename the key or start a new series instead.
+
+Removing a declared key does not lose data: values keep arriving in `extra`. Promoting an `extra` key to a declared column is what the generated `view.sql` coalesces across, so queries see one column spanning both eras.
 
 ## Layout on disk
 
@@ -138,9 +121,7 @@ duckdb -c "select count(*), min(ts), max(ts)
 cd data && duckdb -c ".read series/trades/view.sql"
 ```
 
-**Nothing is ever deleted.** There is no retention or compaction: an hourly flush leaves
-~8,760 files per series per year. Files are immutable and the manifest holds no file
-inventory, so external pruning is safe at any time, including mid-flush:
+**Nothing is ever deleted.** There is no retention or compaction: an hourly flush leaves ~8,760 files per series per year. Files are immutable and the manifest holds no file inventory, so external pruning is safe at any time, including mid-flush:
 
 ```sh
 find data/series -name 'hour=*' -type d -mtime +90 -exec rm -rf {} +
@@ -161,112 +142,57 @@ find data/series -name 'hour=*' -type d -mtime +90 -exec rm -rf {} +
 }
 ```
 
-Every field has a default, so a minimal config is just `series`. Durations are integer
-milliseconds.
+Every field has a default, so a minimal config is just `series`. Durations are integer milliseconds. `compression` accepts `lz4_raw` (default) or `uncompressed`; both are validated at load, so an unwritable codec fails immediately rather than at the first flush an hour later.
 
-**Endpoints default to loopback deliberately.** There is no authentication on the ingest
-socket — anything that can reach it can write records and consume disk. Before binding a
-real interface, put it on a private network or enable libzmq's built-in CURVE
-encryption and authentication.
+**Endpoints default to loopback deliberately.** There is no authentication on the ingest socket — anything that can reach it can write records and consume disk. Before binding a real interface, put it on a private network or enable libzmq's built-in CURVE encryption and authentication.
 
-## Two things to know before using it
+## Known limits
 
-**Recent data is invisible until it flushes.** A record is durable the instant it is
-appended, but no reader sees it for up to `interval_ms`. If you need fresher data,
-lower the interval and accept more files.
-
-**Remote ingest is fire-and-forget.** PUSH/PULL has no acknowledgement, so a successful
-send is not proof of durability. Backpressure still works — the client blocks at the
-high-water mark by default rather than dropping silently.
+- **Recent data is invisible until it flushes.** A record is durable the instant it is appended, but no reader sees it for up to `interval_ms`. If you need fresher data, lower the interval and accept more files.
+- **Remote ingest is fire-and-forget.** PUSH/PULL has no acknowledgement, so a successful send is not proof of durability. Backpressure still works — the client blocks at the high-water mark by default rather than dropping silently.
+- **Deduplication covers one flush.** `(ts, id)` duplicates collapse within a flush window, not across them. Two id-less records sharing a timestamp are treated as the same event, so a producer emitting genuinely distinct events at identical microseconds must set `id`.
+- **A flush must fit in memory.** Every row of the segments being flushed is held until the last file is written. At high ingest rates an hour does not fit; lower `interval_ms` until external merge lands.
+- **No retention and no compaction.** Files accumulate forever unless you prune them yourself — see [Layout on disk](#layout-on-disk).
+- **No read path.** By design: point DuckDB, polars or Spark at the data directory.
 
 ## Dependencies
 
-Deliberately minimal: Parquet, ZeroMQ and JSON are the sanctioned surface, plus two
-small approved conveniences. Everything else is hand-rolled.
+Parquet, ZeroMQ and JSON are the sanctioned surface. Everything else is hand-rolled: the record codec, the error types, the civil-date helper, the lock file, the benchmark harness.
 
-Of the 39 crates in a default build, **26 are `parquet`'s own** — it pulls `chrono`,
-`ahash`, `half`, `bytes`, `num-*`, `twox-hash` and the rest at *any* feature set,
-including none. The 13 we add are `serde` + `serde_json` (7), `lz4_flex` (1),
-`crc32fast` (1, free as above) and `tracing` (4).
+| Crate                        | Where   | Why                                                                                             |
+| ---------------------------- | ------- | ----------------------------------------------------------------------------------------------- |
+| `parquet`                    | default | Output format. Written against the low-level API, so no Arrow.                                  |
+| `serde`, `serde_json`        | default | Config, manifest and control protocol — never the ingest path.                                  |
+| `crc32fast`, `tracing`       | default | Frame checksums and logging.                                                                    |
+| `zmq`                        | `net`   | Transport. Builds libzmq and libsodium from source, so this one needs cmake and a C++ compiler. |
+| `clap`, `tracing-subscriber` | `cli`   | The two binaries only.                                                                          |
 
-| Crate | Where | Why |
-| --- | --- | --- |
-| `parquet` | default | Output format. **Without the `arrow` feature** — see below. Codec is `lz4` (pure Rust, 1 crate), not `zstd` (8 crates and a C compiler). |
-| `serde`, `serde_json` | default | Config, manifest and control protocol — never the ingest path. |
-| `crc32fast`, `tracing` | default | Approved conveniences. `crc32fast` is free — parquet's `crc` feature pulls it regardless. |
-| `zmq` | **`net`** | Transport. Always builds libzmq and libsodium from C source — `zmq-sys` has no system-library path — so this is the one that needs cmake and a C++ compiler. |
-| `clap`, `tracing-subscriber` | **`cli`** | The two binaries only, and `tracing-subscriber` without `env-filter`: per-target filtering costs five crates and one binary has no targets to filter between. Set `RUST_LOG` to a bare level. |
+Parquet output is LZ4_RAW-compressed. zstd would be ~35% smaller but costs eight crates and a C compiler, which would put a toolchain requirement on every embedder.
 
-Hand-rolled instead of pulled in: the record codec (no `rmp-serde`), the error types
-(no `thiserror`), the civil-date helper (no `chrono` as a direct dep), the lock file
-(no `fs4`), the benchmark harness (no `criterion`).
-
-**LZ4_RAW, not zstd.** Measured on 500k rows of realistic output — a monotonic `ts`,
-a 50-symbol column, incrementing ids, a near-constant `extra` map and a JSON `data`
-blob:
-
-| Codec | Adds | Toolchain | Size | Write | Read |
-| --- | --- | --- | --- | --- | --- |
-| **LZ4_RAW** | **+1** `lz4_flex` | **pure Rust** | 17.1 MB | 0.16s | **12 ms** |
-| zstd | +8 incl. `cc` | **C compiler** | 11.0 MB | 0.17s | 15 ms |
-| snappy | +1 | pure Rust | 18.1 MB | 0.17s | 15 ms |
-| brotli | +4 | pure Rust | 11.3 MB | 0.26s | 27 ms |
-| gzip | +4 | pure Rust | 11.3 MB | 0.91s | 21 ms |
-
-LZ4_RAW files are 55% larger, so the trade is real: **more disk in exchange for a
-pure-Rust build with no C compiler anywhere in the default tree.** LZ4_RAW reads
-fastest of the six, which matters for a write-only engine whose whole output exists to
-be queried. It is codec 7 (Parquet 2.9) — never the deprecated codec 5 `LZ4`, whose
-non-standard Hadoop framing is why it was deprecated. Verified readable by DuckDB
-1.5.5 and pyarrow 21.
-
-Files written by an earlier version with zstd stay readable: orc never reads Parquet
-back, so codec choice affects new files only.
-
-**No Arrow.** `parquet`'s `arrow` feature is all-or-nothing: it costs 12 crates — the
-six `arrow-*`, plus `arrow-ipc`'s `flatbuffers` and `bitflags`, plus `base64`,
-`num-complex`, `rustc_version` and `semver` — and 5s of clean build, of which
-`arrow-ipc` is pure toll since this engine never touches IPC. All `ArrowWriter`
-actually does for a schema of four scalar types and one map is compute definition and
-repetition levels, so [`src/flush/parquet.rs`](src/flush/parquet.rs) computes them
-directly. Before the switch, both writers produced the same three fixtures and 2244
-lines of dumped schema, row-group boundaries, statistics, metadata, data and per-row
-map cardinality compared **identical**; `tests/parquet_reference.rs` pins that
-contract. Files are also ~700 bytes smaller each, since `ArrowWriter` embedded an
-`ARROW:schema` blob in every one.
-
-`scripts/check-deps.sh` asserts the budget in both directions — that the default build
-has no transport and no CLI, that `net` adds the transport *without* the CLI, and that
-`cli` supplies what the binaries need. It also checks the `--edges all` graph, because
-Cargo cannot feature-gate a dev-dependency: a `zmq` entry under `[dev-dependencies]`
-would make plain `cargo test` build libzmq from source, and a `no-dev` check cannot
-see it. The network tests reach ZeroMQ through the `orc::zmq` re-export instead.
+`scripts/check-deps.sh` enforces this: the default build must contain no transport, no CLI and nothing that compiles C, and `net` must add the transport without dragging the CLI along.
 
 ## Roadmap
 
-- [x] **M0** — single crate, pinned dependencies
-- [x] **M1** — config, manifest, per-series schema history
-- [x] **M2** — frame codec + WAL writer, committer thread
-- [x] **M3** — recovery: truncate-and-amend, heartbeated lock
-- [x] **M4** — flush: sort, dedup, Parquet, hour partitions
-- [ ] **M5** — external merge for flushes larger than memory
-- [x] **M6** — server: PULL ingest, control socket
-- [x] **M7** — client: PUSH, batching, schema handshake
+Working: durable WAL with group-commit fsync, crash recovery with truncate-and-amend, per-series schema evolution, hourly flush to sorted deduplicated Parquet with hour partitioning, ZeroMQ server and client, generated DuckDB views.
+
+Not yet:
+
+- **External merge** — per-segment sorted runs and a bounded-fan-in k-way merge, so flush memory stays flat regardless of window size.
+- **`reload-config` over the control socket** — the request exists and returns an explicit "not implemented" rather than pretending; restart to pick up config changes.
+- **Retention** — safe to do externally today (see above), but nothing built in.
 
 ## Development
 
 ```sh
 cargo build                                    # engine only, pure Rust, no C toolchain
-cargo test                                     # 138 tests, still no libzmq
+cargo test
 cargo build --features cli                     # + ZeroMQ and binaries (builds libzmq)
-cargo test --features cli                      # 143 tests
+cargo test --features cli
 cargo clippy --all-targets --features cli -- -D warnings
 cargo fmt --all --check
 ./scripts/check-deps.sh                        # dependency budget
 ```
 
-Reader-compatibility tests shell out to a real `duckdb` binary and skip when it is
-absent. Set `ORC_REQUIRE_DUCKDB=1` to make a missing binary a failure instead.
+Reader-compatibility tests shell out to a real `duckdb` binary and skip when it is absent. Set `ORC_REQUIRE_DUCKDB=1` to make a missing binary a failure instead.
 
-Toolchain: Rust 1.91, edition 2024. The first build compiles libzmq from source, so it
-takes noticeably longer than later ones.
+Toolchain: Rust 1.91, edition 2024. The first `--features net` build compiles libzmq from source, so it takes noticeably longer than later ones.
