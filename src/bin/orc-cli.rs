@@ -21,12 +21,11 @@ struct Args {
 
     /// Control endpoint (REQ -> server REP). Defaults to the ingest port + 1.
     ///
-    /// `Option`, not a `default_value`: a default is always present, so it
-    /// unconditionally suppressed the client's port+1 derivation and
-    /// `--ingest tcp://prod:5555` would hand records to prod while doing its
-    /// schema handshake against localhost. The client encodes keys positionally
-    /// against whatever schema it was given, so two hosts declaring the same
-    /// series in a different key order is silently swapped columns.
+    /// `Option`, not a `default_value`: a default is always present, so it would
+    /// suppress the client's port+1 derivation and `--ingest tcp://prod:5555`
+    /// would send records to prod while handshaking against localhost. Keys
+    /// travel positionally, so two hosts declaring a series in a different order
+    /// means silently swapped columns.
     #[arg(long)]
     control: Option<String>,
 

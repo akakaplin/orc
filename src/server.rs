@@ -1,8 +1,8 @@
 //! ZeroMQ ingest server: a PULL socket for records, a REP socket for control.
 //!
-//! The whole point of sharing [`crate::codec`] with the client is visible here:
-//! a received batch is already in WAL frame format, so it is validated and
-//! copied straight in. A batch crosses the process boundary exactly once.
+//! Sharing [`crate::codec`] with the client pays off here: a received batch is
+//! already in WAL frame format, so it is validated and copied straight in,
+//! crossing the process boundary exactly once.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -20,11 +20,10 @@ const POLL_TIMEOUT_MS: i64 = 100;
 
 /// Batches taken from the ingest socket per poll wakeup.
 ///
-/// Draining to `EAGAIN` was unbounded, and a producer sustained faster than the
-/// WAL can absorb never lets it reach `EAGAIN` — so the control socket is never
-/// polled again and `ping`, `stats`, `flush` and `shutdown` all hang. Returning
-/// to the poll after a bounded burst keeps ingest batched while giving control
-/// a turn. Large enough that the poll overhead stays amortised.
+/// An unbounded drain to `EAGAIN` never returns under a producer faster than the
+/// WAL can absorb, so the control socket is never polled again and `ping`,
+/// `stats`, `flush` and `shutdown` all hang. A bounded burst keeps ingest batched
+/// while giving control a turn.
 const MAX_BATCHES_PER_POLL: usize = 1024;
 
 /// How long `shutdown` keeps draining the ingest queue before giving up.
@@ -59,9 +58,9 @@ impl std::fmt::Debug for Server {
 impl Server {
     /// Bind both sockets.
     ///
-    /// Endpoints default to loopback. There is no authentication on the ingest
-    /// socket, so binding a routable interface is a decision to make on
-    /// purpose — with a private network or libzmq's CURVE in front of it.
+    /// Loopback by default. The ingest socket has no authentication, so binding a
+    /// routable interface is a deliberate decision — with a private network or
+    /// libzmq's CURVE in front of it.
     pub fn bind(engine: Arc<Engine>, config: &Config) -> Result<Server> {
         let ctx = zmq::Context::new();
 
@@ -69,11 +68,10 @@ impl Server {
         // A high-water mark is backpressure, not a leak: when it fills, PUSH
         // clients block instead of the server buffering without bound.
         ingest.set_rcvhwm(config.server.rcv_hwm).map_err(zmq_err)?;
-        // The high-water mark bounds the number of messages, not their size, and
-        // libzmq's own size default is unlimited. Without this a single hostile
-        // message is allocated in full before one frame inside it is looked at,
-        // and `append_batch` writes it to one segment however small
-        // `wal.segment_max_bytes` is -- which the flush then reads whole.
+        // The high-water mark bounds message *count*, not size, and libzmq's
+        // size default is unlimited -- so one hostile message would be allocated
+        // in full before a frame inside it was looked at, then written to a
+        // single segment for the flush to read whole.
         ingest
             .set_maxmsgsize(config.server.max_batch_bytes)
             .map_err(zmq_err)?;
@@ -110,11 +108,11 @@ impl Server {
 
     /// Serve until a `Shutdown` request or a `stop_handle` flip.
     ///
-    /// A socket error ends the loop but never skips [`Server::shutdown`]: with a
-    /// `?` straight out of the loop body, an `ETERM` or a failed control send
-    /// took the drain and the engine close with it, discarding whatever ZeroMQ
-    /// had already buffered. The loop's error is still what the caller gets —
-    /// shutdown's is only reported if there is no earlier one to lose.
+    /// A socket error ends the loop but never skips [`Server::shutdown`]: a `?`
+    /// straight out of the loop body would take the drain and the engine close
+    /// with it, discarding whatever ZeroMQ had buffered. The loop's error is
+    /// still what the caller gets; shutdown's only surfaces if there is no
+    /// earlier one to lose.
     pub fn run(&self) -> Result<()> {
         let outcome = self.serve();
         let closed = self.shutdown();
@@ -148,12 +146,8 @@ impl Server {
 
     /// Read up to [`MAX_BATCHES_PER_POLL`] queued batches, not just one.
     ///
-    /// Returning to the poll after a single message would cap throughput at one
-    /// batch per poll wakeup; draining in bursts keeps the socket from backing
-    /// up under load. The bound is what stops the burst from becoming the whole
-    /// loop: a producer faster than the WAL can absorb never lets this reach
-    /// `EAGAIN`, and an unbounded drain then starves the control socket
-    /// completely — including the `Shutdown` that would stop it.
+    /// One message per wakeup would cap throughput; an unbounded drain would
+    /// starve the control socket, including the `Shutdown` that would stop it.
     fn drain_ingest(&self) -> Result<()> {
         for _ in 0..MAX_BATCHES_PER_POLL {
             match self.ingest.recv_bytes(zmq::DONTWAIT) {
@@ -171,11 +165,9 @@ impl Server {
 
     /// Empty the ingest queue on the way out, but not forever.
     ///
-    /// The queue is drained because the loop may have been woken by the control
-    /// socket while records were still buffered, and closing there would discard
-    /// them with no way for a client to know. The deadline is because producers
-    /// do not stop just because the server decided to: without it, a shutdown
-    /// request against a busy server never returns.
+    /// Drained because the loop may have been woken by the control socket with
+    /// records still buffered, and closing would discard them unannounced.
+    /// Deadlined because producers do not stop when the server decides to.
     fn drain_for_shutdown(&self) -> Result<()> {
         let deadline = Instant::now() + SHUTDOWN_DRAIN;
         loop {
@@ -203,9 +195,8 @@ impl Server {
 
     /// Validate a batch header and hand the frames to the engine.
     ///
-    /// Never fatal. A malformed batch is counted and dropped: ingest is
-    /// fire-and-forget, so there is nobody to return an error to, and one bad
-    /// client must not be able to stop the server.
+    /// Never fatal: ingest is fire-and-forget, so there is nobody to return an
+    /// error to and one bad client must not stop the server.
     fn ingest_batch(&self, bytes: &[u8]) {
         let (count, rest) = match codec::parse_batch_header(bytes) {
             Ok(count) => (count, &bytes[codec::BATCH_HEADER_BYTES..]),
@@ -216,11 +207,10 @@ impl Server {
         };
         match self.engine.append_raw(rest) {
             Ok(res) => {
-                // The header's `count` is a hint, not a length -- but it is the
-                // only statement of how many records the sender believed it was
-                // sending, so a shortfall against it is worth naming. Without
-                // it, a batch cut short at its first frame reports "1 rejected"
-                // for a thousand lost records.
+                // `count` is a hint, not a length -- but it is the only
+                // statement of how many records the sender thought it sent, so a
+                // shortfall is worth naming. Without it a batch cut short at its
+                // first frame reports "1 rejected" for a thousand lost records.
                 let seen = res.accepted + res.rejected;
                 if res.rejected > 0 || seen < count as usize {
                     tracing::warn!(
@@ -290,10 +280,9 @@ impl Server {
                 series: self.schema(),
                 max_batch_bytes: Some(self.max_batch_bytes),
             },
-            // Deliberately not implemented rather than silently accepted:
-            // adopting a new config means rebuilding the handle table the engine
-            // hands out, and pretending to succeed would leave clients encoding
-            // against a schema the server never took.
+            // Not implemented rather than silently accepted: adopting a config
+            // means rebuilding the handle table, and pretending to succeed would
+            // leave clients encoding against a schema the server never took.
             ControlRequest::ReloadConfig => ControlResponse::error(
                 "reload-config is not implemented yet; restart the server to adopt a new config",
             ),
@@ -320,12 +309,8 @@ impl Server {
         out
     }
 
-    /// Drain what ZeroMQ already buffered, then close cleanly.
-    ///
-    /// The loop may have been woken by the control socket while records were
-    /// still queued on the ingest socket. Closing there would discard them with
-    /// no way for any client to know, so the queue is emptied first — under a
-    /// deadline, since a live producer would otherwise keep refilling it.
+    /// Drain what ZeroMQ already buffered, then close cleanly. Deadlined, since a
+    /// live producer would otherwise keep refilling the queue.
     fn shutdown(&self) -> Result<()> {
         tracing::info!("draining the ingest queue before exit");
         self.drain_for_shutdown()?;

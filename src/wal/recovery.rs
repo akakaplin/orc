@@ -1,42 +1,36 @@
 //! Startup: take the directory lock, drop flushed segments, amend the tail.
 //!
-//! Recovery's whole job is to make the log consistent again *cheaply*, because
-//! this engine is built for a process that restarts constantly. Two decisions
-//! follow from that and neither is obvious.
+//! Recovery's job is to make the log consistent again *cheaply*, because this
+//! engine is built for a process that restarts constantly. Two decisions follow,
+//! and neither is obvious.
 //!
 //! # The lock is heartbeated, not exclusive-create
 //!
-//! A plain `create_new` lockfile is the wrong primitive here. Every `kill -9`
-//! would leave a stale file demanding manual intervention before the process
-//! could start again — a crash turned into an outage. So [`DirLock`] holds the
-//! pid and the committer thread refreshes its mtime about once a second; a lock
-//! older than [`LOCK_STALE_MS`] is treated as abandoned and taken over, with a
-//! warning naming the dead pid. The common case self-heals while two live
-//! engines still cannot share one directory. (`flock` would give this for free
-//! from the OS, but only via a *direct* `libc` dependency. `libc` is in the tree
-//! transitively — `parquet` reaches it through `ahash` and `getrandom` — so the
-//! cost would be the direct dependency and the `unsafe` call, not a new crate.
-//! Worth revisiting if the heartbeat ever proves fragile.) `--force-unlock`
-//! remains for the pathological case of a process that is genuinely stuck but
-//! alive.
+//! A plain `create_new` lockfile turns every `kill -9` into an outage needing
+//! manual intervention. So [`DirLock`] holds the pid and the committer refreshes
+//! its mtime about once a second; a lock older than [`LOCK_STALE_MS`] is
+//! abandoned and taken over, with a warning naming the dead pid. The common case
+//! self-heals while two live engines still cannot share a directory, and
+//! `--force-unlock` covers a process that is stuck but alive.
+//!
+//! (`flock` would give this for free, but only through a *direct* `libc`
+//! dependency and an `unsafe` call — `libc` is already in the tree via
+//! `parquet`, so the cost is the directness, not a new crate. Worth revisiting
+//! if the heartbeat proves fragile.)
 //!
 //! # Only the tail segment is scanned
 //!
-//! [`recover`] validates the frames of the highest-numbered segment and no
-//! other. Sealed segments are deliberately skipped: a segment is fully written
-//! and fsynced *before* the writer rolls past it, so it cannot be torn, and the
-//! flush validates every frame it reads anyway — a bad one is counted and routed
-//! to `rejects/` there.
+//! [`recover`] validates the highest-numbered segment and no other. A sealed
+//! segment was fully written and fsynced before the writer rolled past it, so it
+//! cannot be torn, and the flush validates every frame it reads anyway.
 //!
-//! Scanning them here would make startup time proportional to *unflushed* WAL:
-//! tens of gigabytes of CRC checking before the first write is accepted, on an
-//! engine whose whole premise is frequent restarts, and worse the further behind
-//! the flush has fallen — exactly when you least want a slow start. Skipping
-//! them bounds startup at one segment (64 MiB by default) no matter what.
+//! Scanning them would make startup proportional to *unflushed* WAL — tens of
+//! gigabytes of CRC checking before the first write is accepted, and worse the
+//! further behind the flush has fallen, which is exactly when a slow start hurts
+//! most. Skipping them bounds startup at one segment.
 //!
-//! What is left after recovery is a log whose every segment either was sealed
-//! intact or has been truncated at its last good frame, so the flush can read it
-//! start to finish.
+//! What is left is a log whose every segment was either sealed intact or
+//! truncated at its last good frame, so the flush can read it start to finish.
 
 use std::fs::{File, OpenOptions};
 use std::io::Write;
@@ -86,16 +80,14 @@ pub struct DirLock {
 impl DirLock {
     /// Take the lock, or fail if a live engine holds it.
     ///
-    /// `force_unlock` takes it regardless — the documented escape for a process
-    /// that is stuck but alive, and the only way past a genuinely concurrent
-    /// engine.
+    /// `force_unlock` takes it regardless — the escape for a process that is
+    /// stuck but alive, and the only way past a genuinely concurrent engine.
     ///
-    /// Two engines racing to take over the *same* stale lock is possible: there
-    /// is no atomic compare-and-swap on a file's contents without a `libc`
-    /// dependency. Writing the pid and reading it back closes the interesting
-    /// window — the loser sees a pid that is not its own and refuses to start —
-    /// but this is a narrowing, not a proof. The guarantee that matters is the
-    /// one above it: a lock being heartbeated by a live process is never taken.
+    /// Two engines can race to take over the *same* stale lock: there is no
+    /// atomic compare-and-swap on file contents without `libc`. Writing the pid
+    /// and reading it back closes the interesting window — the loser sees a pid
+    /// that is not its own — but that is a narrowing, not a proof. The guarantee
+    /// that holds is the one above: a heartbeated lock is never taken.
     pub fn acquire(data_dir: impl AsRef<Path>, force_unlock: bool) -> Result<DirLock> {
         let data_dir = data_dir.as_ref();
         std::fs::create_dir_all(data_dir)?;
@@ -178,12 +170,10 @@ impl Drop for DirLock {
 
 /// Move the lock's mtime forward, which is the whole heartbeat.
 ///
-/// Rewriting the pid is how the mtime moves: `std` has no `utimensat`, and
-/// adding `libc` for one syscall is not worth it. Two properties are
-/// deliberate — the write is not fsynced, because only the *visibility* of the
-/// mtime to another process matters and a durable heartbeat would put a real
-/// disk write on a one-second timer forever; and the pid is rewritten rather
-/// than appended, so the file stays one short line.
+/// Rewriting the pid is how the mtime moves — `std` has no `utimensat`. Not
+/// fsynced, because only the mtime's *visibility* to another process matters and
+/// a durable heartbeat would mean a real disk write on a one-second timer
+/// forever. Rewritten rather than appended, so the file stays one line.
 pub fn touch_lock(path: &Path) -> std::io::Result<()> {
     let mut f = OpenOptions::new().write(true).truncate(true).open(path)?;
     write_pid(&mut f, std::process::id())
@@ -226,9 +216,8 @@ pub struct Recovery {
     /// itself damaged the file.
     pub discarded_bytes: u64,
     /// Segments moved aside as `<id>.wal.corrupt` because their header did not
-    /// parse. Their frames are **not** in the dataset and never will be without
-    /// manual work — but every byte is still on disk, which is the difference
-    /// between a recoverable incident and silent data loss.
+    /// parse. Their frames are **not** in the dataset and will not be without
+    /// manual work, but every byte is still on disk.
     pub quarantined: Vec<u64>,
     /// The id the writer must open. Always greater than every id ever seen in
     /// this directory, so a segment is never reused or overwritten.
@@ -237,18 +226,14 @@ pub struct Recovery {
 
 /// Bring `wal/` into a state the flush can read start to finish.
 ///
-/// Takes `last_flushed_segment` rather than the whole manifest, because that
-/// single number is all recovery uses: the engine reads the manifest (which also
-/// discards a stale `manifest.json.tmp`) and passes it in.
+/// Takes `last_flushed_segment` rather than the whole manifest, because that one
+/// number is all recovery uses.
 ///
-/// This does not re-validate records. A record that was accepted once stays
-/// accepted even if the config has since been tightened, because rejecting it
-/// would mean discarding durable data on a config edit — which is also why the
-/// scan bounds frame lengths by the segment's own size rather than by
-/// `limits.max_record_bytes`. That cap exists to stop a corrupt length prefix
-/// becoming a huge allocation; the scan has the file in memory already and
-/// allocates nothing from the length, so applying it here would buy nothing and
-/// cost every record above a freshly lowered limit.
+/// Does not re-validate records: one accepted once stays accepted even if the
+/// config has since been tightened, or a config edit would discard durable data.
+/// Which is also why the scan bounds frame lengths by the segment's own size
+/// rather than `limits.max_record_bytes` — that cap bounds allocation, and the
+/// scan has the file in memory already.
 pub fn recover(data_dir: impl AsRef<Path>, last_flushed_segment: u64) -> Result<Recovery> {
     let data_dir = data_dir.as_ref();
     let dir = wal_dir(data_dir);
@@ -366,10 +351,9 @@ struct TailScan {
 
 /// What the tail segment's header turned out to be.
 ///
-/// The three cases call for three different answers, and collapsing them is how
-/// a version bump or a single flipped bit used to unlink a segment full of
-/// perfectly good records. `parse_segment_header` reports them distinctly for
-/// exactly this caller — it is the one whose response has to differ.
+/// Three cases, three answers; collapsing them is how a version bump or one
+/// flipped bit used to unlink a segment full of good records.
+/// `parse_segment_header` reports them distinctly for exactly this caller.
 enum TailHeader {
     /// A usable header; the frames after it were scanned and amended.
     Scanned(TailScan),
@@ -383,14 +367,10 @@ enum TailHeader {
 
 /// Validate the tail's frames and truncate it at the last good offset.
 ///
-/// The scan checks exactly what can be checked without a schema: that each frame
-/// is delimited by the buffer, and the CRC. Whether the *contents* decode is the
-/// flush's question, asked once an hour instead of on every startup.
-///
-/// The frame-length cap is the buffer's own length, not `limits.max_record_bytes`
-/// — see [`recover`] on why a config edit must never invalidate a record that was
-/// accepted when it was written. Nothing here reserves memory from the length, so
-/// the cap that exists to bound allocation has no work to do.
+/// Checks what can be checked without a schema: that each frame is delimited by
+/// the buffer, and the CRC. Whether the *contents* decode is the flush's
+/// question, asked hourly rather than on every startup. The length cap is the
+/// buffer's own size — see [`recover`].
 fn scan_tail(path: &Path) -> Result<TailHeader> {
     let bytes = std::fs::read(path)?;
     let size = bytes.len() as u64;

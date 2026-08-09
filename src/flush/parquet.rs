@@ -10,23 +10,19 @@
 //!
 //! # Why this is written against the low-level API
 //!
-//! `ArrowWriter` would do the same job, but reaching it means enabling
-//! `parquet/arrow`, which is all-or-nothing. Measured, it costs twelve crates —
-//! the six `arrow-*`, plus `arrow-ipc`'s `flatbuffers` and `bitflags`, plus
-//! `base64`, `num-complex`, `rustc_version` and `semver` — and five seconds of
-//! clean build, for a schema of four scalar types and one map. `arrow-ipc` in
-//! particular is pure toll: this engine never touches IPC, but the feature has
-//! no finer grain than "all of it". It also embeds a ~700-byte `ARROW:schema`
-//! blob in every file we write.
+//! `ArrowWriter` would do the same job, but reaching it means `parquet/arrow`,
+//! which is all-or-nothing: twelve crates (six `arrow-*`, `arrow-ipc`'s
+//! `flatbuffers` and `bitflags`, `base64`, `num-complex`, `rustc_version`,
+//! `semver`) and five seconds of clean build, for four scalar types and a map.
+//! `arrow-ipc` is pure toll — we never touch IPC — and it embeds a ~700-byte
+//! `ARROW:schema` blob in every file.
 //!
-//! The only thing it actually does for us is compute definition and repetition
-//! levels, which for this schema is the twenty lines in [`Columns::write_group`].
+//! All it does for us is compute definition and repetition levels, which for
+//! this schema is the twenty lines in [`Columns::write_group`].
 //!
-//! The switch changed nothing about the file's *structure*: schema, data,
-//! row-group boundaries and statistics all compared identical against
-//! `ArrowWriter` output, and `tests/parquet_reference.rs` pins that. Two things
-//! did change, both deliberately and both since: the `ARROW:schema` blob is
-//! gone, and the compression codec is now LZ4_RAW rather than zstd.
+//! The switch changed nothing structural: schema, data, row-group boundaries and
+//! statistics all compared identical against `ArrowWriter` output, and
+//! `tests/parquet_reference.rs` pins that.
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -50,9 +46,9 @@ use crate::wal::SEGMENT_ID_DIGITS;
 
 /// Parquet key-value metadata key recording which schema epoch wrote a file.
 ///
-/// Mirrors the `.eN.` tag in the filename. The filename is what `view.sql`
-/// generation reads (so the manifest never needs a file inventory); this copy
-/// survives a rename, so a file that gets moved is still self-describing.
+/// Mirrors the `.eN.` tag in the filename, which is what `view.sql` generation
+/// reads. This copy survives a rename, so a moved file is still
+/// self-describing.
 pub const EPOCH_META_KEY: &str = "orc.schema_epoch";
 
 /// Metadata key recording the series name, for the same reason.
@@ -64,10 +60,9 @@ const TS_COLUMN_IDX: i32 = 0;
 
 /// Compression codecs the pinned `parquet` feature set can actually write.
 ///
-/// Config validation checks against this at load, so an unwritable codec fails
-/// immediately rather than at the first flush an hour later, with a WAL that has
-/// nowhere to go. Keeping the list here — next to the match that implements it —
-/// is what stops the two drifting apart.
+/// Config validates against this at load, so an unwritable codec fails
+/// immediately rather than at the first flush an hour later. Kept next to the
+/// match that implements it, so the two cannot drift.
 pub const SUPPORTED_COMPRESSION: [&str; 4] = ["lz4_raw", "lz4", "uncompressed", "none"];
 
 fn schema_err(what: &str, e: parquet::errors::ParquetError) -> Error {
@@ -76,14 +71,13 @@ fn schema_err(what: &str, e: parquet::errors::ParquetError) -> Error {
 
 /// The Parquet schema for one series at one epoch.
 ///
-/// Built programmatically rather than through `parse_message_type`: key names
-/// come from user config and a string-built schema would need escaping rules
-/// for whatever they contain.
+/// Built programmatically, not through `parse_message_type`: key names come from
+/// user config, and a string-built schema would need escaping rules for whatever
+/// they contain.
 ///
-/// **Every key column is OPTIONAL regardless of its config `nullable`.** That is
-/// not an oversight: nullability is enforced at ingest, and writing a column as
-/// REQUIRED would mean a column added in a later epoch could not read back as
-/// NULL from older files, breaking the union that `view.sql` depends on.
+/// **Every key column is OPTIONAL regardless of config `nullable`.** Nullability
+/// is an ingest rule; writing REQUIRED would stop a column added in a later epoch
+/// reading back as NULL from older files, breaking `view.sql`'s union.
 pub fn parquet_schema(keys: &[KeyDef]) -> Result<TypePtr> {
     let mut fields: Vec<TypePtr> = Vec::with_capacity(keys.len() + 4);
 
@@ -164,9 +158,9 @@ fn utf8(name: &str, rep: Repetition) -> Result<Type> {
 
 /// One declared key column: the present values, plus a definition level per row.
 ///
-/// `defs` has one entry per row (1 present, 0 null) while `vals` has one entry
-/// per *present* row. That asymmetry is the whole encoding: Parquet stores only
-/// the values that exist and reconstructs the nulls from the levels.
+/// `defs` has an entry per row (1 present, 0 null); `vals` has one per *present*
+/// row. That asymmetry is the encoding — Parquet stores only the values that
+/// exist and reconstructs nulls from the levels.
 #[derive(Debug)]
 enum KeyColumn {
     Bool {
@@ -265,13 +259,12 @@ impl KeyColumn {
     }
 }
 
-/// Where each column has been written up to, so successive row groups pick up
-/// where the last left off.
+/// Where each column has been written up to, so successive row groups resume
+/// correctly.
 ///
-/// Values are not indexed by row: a nullable column skips nulls and the map
-/// columns hold a variable number of entries per row. Carrying a cursor forward
-/// is what keeps splitting O(rows) overall instead of rescanning the prefix for
-/// every group.
+/// Values are not indexed by row — a nullable column skips nulls, and the map
+/// columns hold a variable number of entries per row. Carrying a cursor keeps
+/// splitting O(rows) instead of rescanning the prefix per group.
 #[derive(Debug, Default)]
 struct Cursors {
     keys: Vec<usize>,
@@ -280,9 +273,9 @@ struct Cursors {
 
 /// Accumulated rows for one `(series, epoch)`, ready to write.
 ///
-/// Rows arrive already sorted and deduplicated; this type only materialises
-/// them. It is the first point in the flush where a record becomes owned data,
-/// which is why the sort upstream works on an index instead.
+/// Rows arrive sorted and deduplicated; this only materialises them. It is the
+/// first point where a record becomes owned data, which is why the sort upstream
+/// works on an index.
 #[derive(Debug)]
 pub struct Columns {
     series: String,
@@ -345,10 +338,9 @@ impl RowBuilder {
         self.len() == 0
     }
 
-    /// Append one row. `keys` must have exactly the declared arity — ingest
-    /// already guaranteed that, so a mismatch here means a frame was decoded
-    /// under the wrong epoch, which is worth an error rather than a silent
-    /// short row.
+    /// Append one row. `keys` must have exactly the declared arity: ingest
+    /// guaranteed that, so a mismatch means a frame was decoded under the wrong
+    /// epoch — an error, not a silent short row.
     pub fn append(
         &mut self,
         ts: u64,
@@ -367,12 +359,10 @@ impl RowBuilder {
                 got: keys.len(),
             });
         }
-        // The one place the engine's unsigned `ts` has to narrow: Parquet's
-        // TIMESTAMP(MICROS) is a signed INT64, so the top half of the u64 range
-        // has no representation. The accept window puts every real timestamp
-        // eleven orders of magnitude below the boundary -- year 294247 -- so
-        // this is unreachable through `append`, and an error rather than a
-        // silent wrap for the callers that reach the builder directly.
+        // The one place unsigned `ts` has to narrow: TIMESTAMP(MICROS) is a
+        // signed INT64. The accept window puts every real timestamp eleven orders
+        // of magnitude below the boundary (year 294247), so this is unreachable
+        // through `append` -- an error, not a silent wrap, for direct callers.
         let ts = i64::try_from(ts).map_err(|_| {
             Error::Config(format!(
                 "ts {ts} is past the largest instant Parquet can record \
@@ -419,9 +409,8 @@ impl RowBuilder {
                 push(k, v);
             }
         }
-        // A row with no undeclared keys gets a count of 0, which encodes as an
-        // *empty* map rather than a null one. The two are different values to a
-        // reader, and "this record had no undeclared keys" is the former.
+        // Count 0 encodes an *empty* map, not a null one. A reader tells them
+        // apart, and "no undeclared keys" is the former.
         c.extra_counts.push(kept);
         c.data.push(ByteArray::from(data.as_bytes().to_vec()));
         c.rows += 1;
@@ -445,9 +434,8 @@ impl Columns {
 
     /// Write rows `[start, end)` as one row group.
     ///
-    /// Columns must be handed to `next_column()` in schema order and each closed
-    /// before the next is opened; the writer enforces that, and the order here
-    /// is the order [`parquet_schema`] declares.
+    /// Columns go to `next_column()` in schema order, each closed before the next
+    /// opens. The writer enforces it; the order here is [`parquet_schema`]'s.
     fn write_group<W: std::io::Write + Send>(
         &self,
         rg: &mut parquet::file::writer::SerializedRowGroupWriter<'_, W>,
@@ -586,10 +574,9 @@ impl Columns {
 
 /// Writer properties for a flush output file.
 ///
-/// Declaring `ts` as a sorting column is not decoration: the rows really are
-/// sorted by it, and a reader that trusts the declaration can skip row groups
-/// on statistics alone. It would be actively harmful to set this if the sort
-/// upstream were ever dropped.
+/// Declaring `ts` a sorting column is not decoration: the rows really are sorted
+/// by it, and a reader that trusts the declaration prunes row groups on
+/// statistics alone. Actively harmful if the sort upstream were ever dropped.
 pub fn writer_properties(
     series: &str,
     epoch: u32,
@@ -631,10 +618,9 @@ pub fn writer_properties(
 
 /// Write `cols` to `path` as a complete Parquet file, then fsync it.
 ///
-/// The fsync matters: the flush renames this file into `series/` and only then
-/// commits the manifest. If the contents were not durable before the rename, a
-/// power cut could leave a committed manifest pointing at a file with a valid
-/// name and no data.
+/// The fsync matters: the flush renames this into `series/` and only then commits
+/// the manifest, so contents that were not durable before the rename leave a
+/// committed manifest pointing at a valid name with no data.
 pub fn write_file(
     path: &Path,
     cols: &Columns,
@@ -674,9 +660,9 @@ pub fn write_file(
 
 /// The name of a flush output file: segment range, epoch tag, extension.
 ///
-/// The segment range makes a re-run after a crash produce the *same* filename
-/// rather than a duplicate, which is what makes flush idempotent. The epoch tag
-/// is what lets `view.sql` be regenerated without the manifest tracking files.
+/// The range makes a re-run after a crash produce the *same* filename rather than
+/// a duplicate — that is what makes flush idempotent. The epoch tag is what lets
+/// `view.sql` be regenerated without the manifest tracking files.
 pub fn output_file_name(first_segment: u64, last_segment: u64, epoch: u32) -> String {
     format!("{first_segment:010}-{last_segment:010}.e{epoch}.parquet")
 }
@@ -684,11 +670,9 @@ pub fn output_file_name(first_segment: u64, last_segment: u64, epoch: u32) -> St
 /// The `(first_segment, last_segment, epoch)` a flush output name encodes, or
 /// `None` if the name is not one this engine wrote.
 ///
-/// Exact inverse of [`output_file_name`]. The startup sweep uses it to tell a
-/// committed file from one an interrupted flush left behind, so it must be strict:
-/// anything it fails to parse is left alone, which is the safe direction — the
-/// engine has no claim on a file it did not write, and `series/` is the one place
-/// it deletes from.
+/// Exact inverse of [`output_file_name`]. The startup sweep tells a committed
+/// file from an interrupted flush's leftovers with it, so it is strict: anything
+/// it cannot parse is left alone, which is the safe direction.
 pub fn parse_output_file_name(name: &str) -> Option<(u64, u64, u32)> {
     let rest = name.strip_suffix(".parquet")?;
     let (range, epoch) = rest.rsplit_once(".e")?;
@@ -705,10 +689,9 @@ pub fn parse_output_file_name(name: &str) -> Option<(u64, u64, u32)> {
 
 /// One zero-padded segment id from a file name.
 ///
-/// The width rule is `parse_segment_name`'s, for its reason: `{:010}` pads to ten
-/// digits but does not truncate, so the one spelling of an id is ten digits, or
-/// more with no leading zero. Accepting `041` as well as `0000000041` would mean
-/// two names for one range.
+/// `parse_segment_name`'s width rule, for its reason: `{:010}` pads but does not
+/// truncate, so an id is ten digits or more with no leading zero. Accepting `041`
+/// beside `0000000041` would mean two names for one range.
 fn parse_segment_field(s: &str) -> Option<u64> {
     if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
         return None;

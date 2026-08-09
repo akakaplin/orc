@@ -2,13 +2,11 @@
 //!
 //! Ingest is a binary frame stream (see [`crate::codec`]) because it runs per
 //! record. Control is JSON over request/reply because it runs per *connection* —
-//! a handshake, an occasional flush, a stats scrape. Nothing here is on a hot
-//! path, so legibility wins: an operator can drive the whole surface with
-//! `nc`, and a stuck server can be diagnosed without a decoder.
+//! a handshake, an occasional flush, a stats scrape. Nothing here is hot, so
+//! legibility wins: an operator can drive the whole surface with `nc`.
 //!
-//! Compiled unconditionally, outside the `net` feature that gates the sockets:
-//! these are plain serde types, so a program that speaks the protocol without
-//! using our client — or that only wants to render a reply — needs no ZeroMQ.
+//! Compiled outside the `net` feature that gates the sockets: these are plain
+//! serde types, so speaking the protocol without our client needs no ZeroMQ.
 
 use serde::{Deserialize, Serialize};
 
@@ -24,27 +22,22 @@ pub enum ControlRequest {
     Stats,
     /// Flush now, synchronously. Returns once the manifest has committed.
     Flush,
-    /// Every series' current epoch and key list.
-    ///
-    /// This is the connect handshake: a client encodes keys positionally, so it
-    /// cannot build a single frame until it knows the order and the epoch to
-    /// stamp. One round trip at startup, none afterwards.
+    /// Every series' current epoch and key list — the connect handshake. A
+    /// client encodes keys positionally, so it cannot build a frame until it
+    /// knows the order and the epoch to stamp. One round trip at startup.
     Schema,
     /// Re-read `config.json` and adopt it.
     ReloadConfig,
-    /// Drain and exit.
-    ///
-    /// The engine is crash-safe by construction, so this is a convenience
-    /// rather than a safety mechanism — but it is the difference between
-    /// stopping at a known-clean point and stopping wherever the process
-    /// happened to be.
+    /// Drain and exit. The engine is crash-safe by construction, so this is a
+    /// convenience — but it is the difference between stopping at a known-clean
+    /// point and stopping wherever the process happened to be.
     Shutdown,
 }
 
 /// A reply on the control socket.
 ///
-/// `Error` is a variant rather than a transport-level failure because REQ/REP
-/// has no other channel: a socket error would leave the client unable to tell a
+/// `Error` is a variant rather than a transport-level failure: REQ/REP has no
+/// other channel, and a socket error would leave the client unable to tell a
 /// rejected request from a dead server.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "kebab-case")]
@@ -122,9 +115,8 @@ pub struct FlushPayload {
 }
 
 impl ControlRequest {
-    /// Encode for the wire. Infallible in practice — these types always
-    /// serialise — but the error is surfaced rather than unwrapped so a server
-    /// never panics on a malformed reply it built itself.
+    /// Encode for the wire. Infallible in practice, but surfaced rather than
+    /// unwrapped so a server never panics on a reply it built itself.
     pub fn to_bytes(&self) -> Result<Vec<u8>, serde_json::Error> {
         serde_json::to_vec(self)
     }

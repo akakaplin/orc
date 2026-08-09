@@ -1,16 +1,13 @@
 //! Reading a segment back, one frame at a time — the flush's input side.
 //!
-//! The contract here is set by what the flush must be able to do with a bad
-//! record: **count it, route it aside, and keep going.** Ingest only validated a
-//! frame's fixed prefix, so a malformed `keys` section first surfaces here, an
-//! hour after it was accepted, with no way to reject it at the source. Aborting
-//! would be the worst possible response — a flush that can never finish means
-//! the WAL grows until the volume fills and no Parquet is ever produced again.
-//! So a fault is a *value* this reader yields, never an error that ends
-//! iteration on its own.
+//! The contract is what the flush must be able to do with a bad record: **count
+//! it, route it aside, keep going.** Ingest validated only a frame's fixed
+//! prefix, so a malformed `keys` section first surfaces here, an hour later, with
+//! no way to reject it at the source — and a flush that can never finish means no
+//! Parquet is ever produced again. So a fault is a *value* this reader yields,
+//! never an error that ends iteration.
 //!
-//! There are two different faults, and the difference is whether the reader can
-//! find the next frame:
+//! Two faults, and the difference is whether the reader can find the next frame:
 //!
 //! - [`FrameFault::BadRecord`] and [`FrameFault::UnknownSchema`] — the frame's
 //!   CRC checked out, so its `len` is trustworthy and the next frame's offset is
@@ -23,11 +20,10 @@
 //!
 //! # Key counts come from the caller
 //!
-//! [`crate::codec::decode`] needs the arity of the series' schema at the frame's
-//! epoch, which lives in the manifest and not in the frame — see the codec's
-//! module docs for why. So a reader is built with a lookup closure, and the
-//! reader does the cheap prefix read first to learn which `(series, epoch)` to
-//! ask about.
+//! [`crate::codec::decode`] needs the arity of the schema at the frame's epoch,
+//! which lives in the manifest — see the codec's module docs for why. So a reader
+//! takes a lookup closure and does the cheap prefix read first, to learn which
+//! `(series, epoch)` to ask about.
 
 use std::path::Path;
 
@@ -37,25 +33,22 @@ use crate::record::{RecordRef, Value};
 
 /// Read a whole segment file into memory.
 ///
-/// Reading the segment whole rather than streaming it is deliberate: the flush
-/// sorts an index of offsets pointing into this buffer rather than decoded rows,
-/// so a segment costs its own size and nothing per record.
+/// Whole rather than streamed, deliberately: the flush sorts an index of offsets
+/// into this buffer rather than decoded rows, so a segment costs its own size and
+/// nothing per record.
 ///
-/// It bounds flush memory only as well as segment size is itself bounded, which
-/// is *approximately* `wal.segment_max_bytes` (64 MiB by default) and not exactly
-/// it: a segment rolls once it is over the limit, so one `append_batch` larger
-/// than the limit produces one segment larger than the limit. The batch sizes
-/// that reach the writer are capped upstream — `server.max_batch_bytes` on the
-/// network path — which is what keeps the overshoot to one batch.
+/// That bounds flush memory only as well as segment size is bounded, which is
+/// *approximately* `wal.segment_max_bytes`: a segment rolls once it is over the
+/// limit, so one oversized `append_batch` makes one oversized segment.
+/// `server.max_batch_bytes` upstream is what keeps the overshoot to one batch.
 pub fn read_segment(path: impl AsRef<Path>) -> Result<Vec<u8>> {
     Ok(std::fs::read(path)?)
 }
 
 /// One decoded frame and where it sits in the segment.
 ///
-/// `offset` is half of the flush's `arrival` order — `(segment_id, offset)` is a
-/// total order over every record ever written, identical on every replay, which
-/// is what makes a re-run flush produce byte-identical Parquet.
+/// `offset` is half of the flush's `arrival` order — see
+/// [`crate::flush::planner`].
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Frame<'a> {
     pub record: RecordRef<'a>,
@@ -67,9 +60,8 @@ pub struct Frame<'a> {
 
 /// A frame that could not be turned into a record.
 ///
-/// Every variant carries the offset, because the flush's response is to copy the
-/// offending bytes to `rejects/` and the operator's next question is always
-/// "which record?".
+/// Every variant carries the offset: the flush copies the offending bytes to
+/// `rejects/`, and "which record?" is always the next question.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FrameFault<'a> {
     /// The frame is intact but its contents do not decode under the schema its
@@ -151,10 +143,10 @@ pub type FrameResult<'a> = std::result::Result<Frame<'a>, FrameFault<'a>>;
 
 /// A forward cursor over the frames of one segment.
 ///
-/// `L` maps `(series, epoch)` to that schema's key count; returning `None` is
-/// what produces [`FrameFault::UnknownSchema`]. It is a closure rather than a
-/// `&Manifest` so the flush can wrap the lookup in its own cache — the same
-/// `(series, epoch)` pair repeats for millions of consecutive frames.
+/// `L` maps `(series, epoch)` to that schema's key count; `None` produces
+/// [`FrameFault::UnknownSchema`]. A closure rather than a `&Manifest` so the
+/// flush can cache it — the same pair repeats for millions of consecutive
+/// frames.
 pub struct SegmentReader<'a, L> {
     id: u64,
     buf: &'a [u8],
@@ -185,9 +177,9 @@ where
 {
     /// Parse the segment header and position at the first frame.
     ///
-    /// A bad header is the one failure that *is* fatal here: without it the file
-    /// is not known to be an orc segment of a format this build understands, and
-    /// decoding its bytes anyway would be inventing records.
+    /// A bad header is the one fatal failure: without it the file is not known to
+    /// be an orc segment this build understands, and decoding anyway would be
+    /// inventing records.
     pub fn new(buf: &'a [u8], max_record_bytes: usize, key_count: L) -> DecodeResult<Self> {
         let id = codec::parse_segment_header(buf)?;
         Ok(Self {
@@ -202,10 +194,9 @@ where
         })
     }
 
-    /// The id the segment's own header declares.
-    ///
-    /// Worth comparing against the file name: they disagree only if a segment
-    /// was copied or renamed by hand, which silently reorders `arrival`.
+    /// The id the segment's own header declares. Worth comparing against the
+    /// file name: they disagree only for a hand-copied or renamed segment, which
+    /// silently reorders `arrival`.
     pub fn segment_id(&self) -> u64 {
         self.id
     }

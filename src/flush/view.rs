@@ -1,14 +1,12 @@
 //! Generating a DuckDB view that hides schema evolution from readers.
 //!
 //! `orc` is write-only, so it cannot help readers at query time. What it can do
-//! is emit the SQL they would otherwise have to write themselves — and get
-//! subtly wrong the first time. Each flush regenerates
-//! `series/<name>/view.sql`, which unions every epoch by name and coalesces
-//! promoted keys against `extra`.
+//! is emit the SQL they would otherwise write themselves and get subtly wrong.
+//! Each flush regenerates `series/<name>/view.sql`, which unions every epoch by
+//! name and coalesces promoted keys against `extra`.
 //!
-//! The file is derived: pure text, rewritable at any moment, reconstructible
-//! from the manifest plus the epoch tags in the Parquet filenames. A crash while
-//! writing it costs nothing.
+//! Derived: pure text, reconstructible from the manifest plus the epoch tags in
+//! the filenames, so a crash while writing it costs nothing.
 
 use std::collections::BTreeSet;
 
@@ -34,21 +32,18 @@ fn duckdb_type(ty: KeyType) -> &'static str {
 
 /// Quote an identifier for DuckDB, doubling embedded double quotes.
 ///
-/// Key names come from user config and can contain almost anything, so they are
-/// always quoted rather than quoted-if-needed — a column called `select` or
-/// `order` is otherwise a syntax error in the generated file.
+/// Always quoted, not quoted-if-needed: key names come from user config, and a
+/// column called `select` would otherwise be a syntax error.
 fn sql_ident(s: &str) -> String {
     format!("\"{}\"", s.replace('"', "\"\""))
 }
 
 /// Generate the `CREATE VIEW` text for one series.
 ///
-/// `history` is that series' full epoch history, oldest first. A key present in
-/// *every* epoch is selected directly. A key missing from at least one epoch is
-/// coalesced against `extra`, because in the epochs where it was not declared
-/// its values landed in the overflow map — that is exactly what promoting a key
-/// from `extra` looks like on disk, and the coalesce is what makes the two
-/// halves read as one column.
+/// `history` is the series' full epoch history, oldest first. A key present in
+/// *every* epoch is selected directly; one missing from any epoch is coalesced
+/// against `extra`, because that is where its values landed in the epochs where
+/// it was undeclared.
 pub fn view_sql(series: &str, history: &[EpochSchema]) -> String {
     let mut all_keys: Vec<&KeyDef> = Vec::new();
     for epoch in history {
@@ -90,18 +85,14 @@ pub fn view_sql(series: &str, history: &[EpochSchema]) -> String {
         } else {
             // Declared in some epochs, in `extra` in the others.
             //
-            // The cast is not optional. `extra`'s values are UTF-8, and DuckDB
-            // refuses to coalesce a BIGINT column against a VARCHAR one --
-            // "Cannot mix values of type BIGINT and VARCHAR in COALESCE
-            // operator - an explicit cast is required" -- so without it this
-            // file does not run at all once a non-string key is promoted. Every
-            // test covered `string` keys, where the two sides already agree,
-            // which is why that went unnoticed.
+            // The cast is not optional: `extra`'s values are UTF-8, and DuckDB
+            // refuses to coalesce BIGINT against VARCHAR ("an explicit cast is
+            // required"), so without it the file does not run at all once a
+            // non-string key is promoted.
             //
-            // `try_cast`, not `cast`: the `extra` half is whatever some producer
-            // wrote there, and a plain cast turns one unparseable value into a
-            // Conversion Error that fails the whole query rather than nulling
-            // the one row.
+            // `try_cast`, not `cast`: the `extra` half is whatever a producer
+            // wrote, and a plain cast turns one unparseable value into a
+            // Conversion Error that fails the whole query.
             let ty = duckdb_type(k.ty);
             sql.push_str(&format!(
                 "  coalesce({ident}, try_cast(extra[{}] AS {ty})) AS {ident},\n",
@@ -118,9 +109,8 @@ pub fn view_sql(series: &str, history: &[EpochSchema]) -> String {
     sql
 }
 
-/// Names of every column the generated view exposes, in order.
-///
-/// Useful for tests and for `orc-cli` to describe a series without parsing SQL.
+/// Names of every column the generated view exposes, in order — so a caller can
+/// describe a series without parsing SQL.
 pub fn view_columns(history: &[EpochSchema]) -> Vec<String> {
     let mut seen = BTreeSet::new();
     let mut cols = vec!["ts".to_string(), "id".to_string()];

@@ -9,19 +9,16 @@
 //! by frames in arrival order. Only the highest-numbered segment is ever written
 //! to; a segment becomes immutable the moment the writer rolls past it.
 //!
-//! The directory is deliberately **flat and id-ordered**. Recovery then scans
-//! exactly one directory and finds the tail with a single `max`, and the flush
-//! consumes segments in the order they were written with no index to keep in
-//! step. Names are zero-padded to [`SEGMENT_ID_DIGITS`] so lexical order is
-//! numeric order for anything that lists the directory — `ls`, a shell glob, or
-//! a person reading a bug report.
+//! The directory is deliberately **flat and id-ordered**: recovery scans one
+//! directory and finds the tail with a `max`, and the flush consumes segments in
+//! write order with no index to keep in step. Names are zero-padded to
+//! [`SEGMENT_ID_DIGITS`] so lexical order is numeric order for `ls`, a glob, or a
+//! person reading a bug report.
 //!
-//! **Segment ids start at 1.** Zero is reserved to mean "nothing has been
-//! flushed yet", which is what [`Manifest::last_flushed_segment`] defaults to on
-//! a fresh directory. If a segment could be numbered 0, the first restart after
-//! writing it would delete it as already-durable-in-Parquet — losing every
-//! record in it. Ids then increase monotonically forever; they are never reused,
-//! even after a segment is deleted.
+//! **Segment ids start at 1.** Zero means "nothing flushed yet", which is what
+//! [`Manifest::last_flushed_segment`] defaults to — a segment numbered 0 would be
+//! deleted as already-durable on the first restart. Ids increase monotonically
+//! and are never reused.
 //!
 //! [`Manifest::last_flushed_segment`]: crate::manifest::Manifest::last_flushed_segment
 
@@ -65,10 +62,10 @@ pub fn segment_path(data_dir: impl AsRef<Path>, id: u64) -> PathBuf {
 /// The id a segment file name encodes, or `None` if it is not one of ours.
 ///
 /// The width rule is not pedantry: `0000000042.wal` and `00000000042.wal` would
-/// otherwise both parse as 42, and two files claiming one id means the flush
-/// reads a segment twice or the writer overwrites live data. So a name is ours
-/// only if it is padded to exactly [`SEGMENT_ID_DIGITS`], or longer with no
-/// leading zero — which is the single spelling [`segment_name`] can produce.
+/// both parse as 42, and two files claiming one id means the flush reads a
+/// segment twice or the writer overwrites live data. So: exactly
+/// [`SEGMENT_ID_DIGITS`] digits, or longer with no leading zero — the single
+/// spelling [`segment_name`] produces.
 pub fn parse_segment_name(name: &str) -> Option<u64> {
     let digits = name.strip_suffix(&format!(".{SEGMENT_EXT}"))?;
     if !digits.bytes().all(|b| b.is_ascii_digit()) || digits.is_empty() {
@@ -85,10 +82,9 @@ pub fn parse_segment_name(name: &str) -> Option<u64> {
 
 /// Every segment id present in `wal/`, ascending.
 ///
-/// A missing directory is not an error — it is what an unopened data directory
-/// looks like. Files that are not segments are ignored rather than rejected: the
-/// engine has no claim on anything it did not write, and a stray `.DS_Store` is
-/// not a reason to refuse to start.
+/// A missing directory is what an unopened data directory looks like, not an
+/// error. Non-segment files are ignored: the engine has no claim on what it did
+/// not write, and a stray `.DS_Store` is no reason to refuse to start.
 pub fn list_segments(data_dir: impl AsRef<Path>) -> Result<Vec<u64>> {
     let dir = wal_dir(data_dir);
     let entries = match std::fs::read_dir(&dir) {
@@ -108,11 +104,9 @@ pub fn list_segments(data_dir: impl AsRef<Path>) -> Result<Vec<u64>> {
     Ok(ids)
 }
 
-/// Total bytes of WAL currently on disk.
-///
-/// This is the number that makes a stalled flush observable: the WAL is
-/// deliberately not size-capped, so a flush that stops making progress shows up
-/// here as steady growth long before the volume fills.
+/// Total bytes of WAL currently on disk — the number that makes a stalled flush
+/// observable, since the log is deliberately uncapped and a stall shows up here
+/// as steady growth long before the volume fills.
 pub fn total_bytes(data_dir: impl AsRef<Path>) -> Result<u64> {
     let data_dir = data_dir.as_ref();
     let mut total = 0;
@@ -130,10 +124,8 @@ pub fn total_bytes(data_dir: impl AsRef<Path>) -> Result<u64> {
 /// `fsync` a directory, making the *names* it contains durable.
 ///
 /// Syncing a file makes its contents durable; only syncing the directory makes
-/// the fact that the file exists durable. Skipping this is the classic way to
-/// lose a whole freshly-created segment to a power cut even though every byte in
-/// it was fsynced — the file's directory entry never reached the platter, so on
-/// reboot the segment is simply not there.
+/// its existence durable. Skipping this is the classic way to lose a whole
+/// freshly-created segment to a power cut with every byte in it fsynced.
 pub(crate) fn fsync_dir(path: &Path) -> std::io::Result<()> {
     std::fs::File::open(path)?.sync_all()?;
     #[cfg(test)]
@@ -141,9 +133,8 @@ pub(crate) fn fsync_dir(path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Per-directory `fsync` counter, so the durability rule above can be asserted
-/// rather than reviewed. Keyed by path because tests run concurrently and a
-/// single global counter would be a race, not a measurement.
+/// Per-directory `fsync` counter, so the rule above is asserted rather than
+/// reviewed. Keyed by path because tests run concurrently.
 #[cfg(test)]
 mod test_fsync_log {
     use std::collections::HashMap;

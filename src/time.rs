@@ -1,22 +1,17 @@
 //! Civil date arithmetic, in place of a direct `chrono` dependency.
 //!
-//! `chrono` is present transitively — `parquet` requires it unconditionally, at
-//! any feature set — so this module saves no compile time. What it avoids is a
-//! *direct* dependency on a crate whose presence is an implementation detail of
-//! something else: if `parquet` ever drops it, nothing here breaks.
+//! `chrono` is in the tree transitively — `parquet` requires it at any feature
+//! set — so this saves no compile time. It avoids a *direct* dependency on a
+//! crate whose presence is someone else's implementation detail.
 //!
-//! Timestamps in the engine are `u64` epoch **microseconds**, UTC — always at or
-//! after 1970-01-01. That is what lets [`hour_partition`] and
-//! [`format_rfc3339_utc`] use plain `/` and `%`: truncating division is only
-//! wrong for negative inputs, and there are none.
+//! Timestamps are `u64` epoch **microseconds**, UTC, always at or after
+//! 1970-01-01. That is what lets [`hour_partition`] and [`format_rfc3339_utc`]
+//! use plain `/` and `%`: truncating division is only wrong for negative inputs.
 //!
-//! The calendar conversions below keep their `i64` signature. They are the
-//! general algorithm, exact over the whole proleptic Gregorian range, and
-//! `days_to_ymd` is its own inverse's test — narrowing them to `u64` would buy
-//! nothing and cost the round-trip property that pins them.
-//!
-//! The conversions are Howard Hinnant's `civil_from_days` / `days_from_civil`:
-//! <https://howardhinnant.github.io/date_algorithms.html>
+//! The calendar conversions keep their `i64` signature — they are the general
+//! algorithm, exact over the whole proleptic Gregorian range, and `days_to_ymd`
+//! is its own inverse's test. Howard Hinnant's `civil_from_days` /
+//! `days_from_civil`: <https://howardhinnant.github.io/date_algorithms.html>
 
 use crate::error::{Error, Result};
 
@@ -26,12 +21,11 @@ const US_PER_DAY: u64 = 24 * US_PER_HOUR;
 
 /// Years [`parse_rfc3339_utc`] will accept.
 ///
-/// The lower bound is 1970 because the result is epoch microseconds in a `u64`
-/// and there is nothing before it to represent. The upper bound is well inside
-/// what a `u64` of microseconds reaches (~584 000 years), so the arithmetic at
-/// the end of `parse` cannot overflow — which is what makes a typo like
-/// `"999999999-01-01T00:00:00Z"` an error rather than a panic in a debug build
-/// and a wrapped, nonsensical accept window in release.
+/// 1970 because the result is unsigned epoch microseconds. The ceiling is well
+/// inside what a `u64` of microseconds reaches (~584 000 years), so the
+/// arithmetic at the end of `parse` cannot overflow — which makes a typo like
+/// `"999999999-01-01T00:00:00Z"` an error rather than a debug panic and a
+/// wrapped accept window in release.
 const MIN_YEAR: i64 = 1970;
 const MAX_YEAR: i64 = 250_000;
 
@@ -83,9 +77,9 @@ pub fn ymd_to_days(y: i64, m: u32, d: u32) -> i64 {
 
 /// The Hive partition directory name for a timestamp: `hour=YYYY-MM-DDTHH`.
 ///
-/// Width is fixed and zero-padded, because this string becomes a path component
-/// that readers glob and sort. Years beyond four digits are not padded further —
-/// the timestamp accept window rejects those long before they reach here.
+/// Fixed width and zero-padded, because this becomes a path component that
+/// readers glob and sort. Years past four digits are not padded further — the
+/// accept window rejects those long before they reach here.
 pub fn hour_partition(ts_us: u64) -> String {
     let days = ts_us / US_PER_DAY;
     let hour = ts_us % US_PER_DAY / US_PER_HOUR;
@@ -95,10 +89,10 @@ pub fn hour_partition(ts_us: u64) -> String {
 
 /// Parse an RFC 3339 timestamp into epoch microseconds.
 ///
-/// Accepts `YYYY-MM-DDTHH:MM:SS[.ffffff]Z` only — **UTC with a literal `Z`**.
-/// Numeric offsets like `+02:00` are rejected rather than silently mishandled,
-/// since this parses one config field (`limits.ts_min`) where being explicit
-/// costs nothing and a misread offset would silently shift the accept window.
+/// `YYYY-MM-DDTHH:MM:SS[.ffffff]Z` only — **UTC with a literal `Z`**. Offsets
+/// like `+02:00` are rejected rather than mishandled: this parses one config
+/// field, where being explicit costs nothing and a misread offset would shift
+/// the accept window.
 pub fn parse_rfc3339_utc(s: &str) -> Result<u64> {
     let bad = |why: &str| Error::Config(format!("invalid timestamp {s:?}: {why}"));
 
@@ -116,11 +110,8 @@ pub fn parse_rfc3339_utc(s: &str) -> Result<u64> {
     if dparts.next().is_some() {
         return Err(bad("too many '-' separated fields in the date"));
     }
-    // Bounded before `ymd_to_days`, which is a polynomial with no opinion about
-    // whether its inputs are a real date -- or whether they overflow. 1970 is
-    // the floor because the result is unsigned epoch microseconds; the ceiling
-    // is a sanity bound, and the accept window decides what is actually
-    // plausible.
+    // Bounded before `ymd_to_days`, a polynomial with no opinion about whether
+    // its inputs are a real date or whether they overflow.
     if !(MIN_YEAR..=MAX_YEAR).contains(&y) {
         return Err(bad(&format!(
             "year out of range; must be {MIN_YEAR}..={MAX_YEAR} (timestamps are unsigned \
@@ -130,10 +121,9 @@ pub fn parse_rfc3339_utc(s: &str) -> Result<u64> {
     if !(1..=12).contains(&mo) {
         return Err(bad("month out of range"));
     }
-    // Against the month's real length, not a flat 1..=31. `ymd_to_days` happily
-    // rolls 2026-02-31 forward to 2026-03-03, which would silently move the
-    // accept window off the day the operator wrote -- the same class of quiet
-    // misreading that rejecting a numeric offset above exists to prevent.
+    // Against the month's real length, not a flat 1..=31: `ymd_to_days` rolls
+    // 2026-02-31 forward to 2026-03-03, moving the accept window off the day the
+    // operator wrote.
     if d < 1 || d > days_in_month(y, mo as u32) {
         return Err(bad(&format!(
             "day {d} is out of range for month {mo} of {y}"
@@ -159,14 +149,13 @@ pub fn parse_rfc3339_utc(s: &str) -> Result<u64> {
     if tparts.next().is_some() {
         return Err(bad("too many ':' separated fields in the time"));
     }
-    // 60 would be a leap second; we have no leap-second table, so reject it
-    // rather than silently accept a value we cannot represent faithfully.
+    // 60 would be a leap second, and there is no leap-second table here.
     if h > 23 || mi > 59 || sec > 59 {
         return Err(bad("hour, minute or second out of range"));
     }
 
-    // `y >= 1970` makes this non-negative, and `y <= MAX_YEAR` keeps the
-    // product far inside `u64`, so the cast and the arithmetic are both exact.
+    // `y >= 1970` makes this non-negative and `y <= MAX_YEAR` keeps the product
+    // far inside `u64`, so the cast and the arithmetic are exact.
     let days = ymd_to_days(y, mo as u32, d as u32) as u64;
     let (h, mi, sec) = (h as u64, mi as u64, sec as u64);
     Ok(days * US_PER_DAY + h * US_PER_HOUR + mi * 60 * US_PER_SEC + sec * US_PER_SEC + frac_us)
@@ -187,9 +176,8 @@ fn next_num<'a>(parts: &mut impl Iterator<Item = &'a str>, what: &str, whole: &s
 
 /// Format epoch microseconds as `YYYY-MM-DDTHH:MM:SS.ffffffZ`.
 ///
-/// Exists for error messages: a rejected timestamp reported as `1970-01-21`
-/// tells you instantly that a client sent milliseconds, where the raw integer
-/// tells you nothing.
+/// For error messages: a rejected timestamp shown as `1970-01-21` says at once
+/// that a client sent milliseconds, where the raw integer says nothing.
 pub fn format_rfc3339_utc(ts_us: u64) -> String {
     let days = ts_us / US_PER_DAY;
     let rem = ts_us % US_PER_DAY;

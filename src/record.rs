@@ -1,13 +1,11 @@
 //! The record model shared by the ingest API, the codec and the flush path.
 //!
-//! This module is the contract every other module codes against. Nothing here
-//! allocates: a [`Row`] borrows its strings from the caller, and a decoded
-//! [`RecordRef`] borrows from the buffer it was decoded out of.
+//! The contract every other module codes against. Nothing here allocates: a
+//! [`Row`] borrows its strings from the caller, and a decoded [`RecordRef`]
+//! borrows from the buffer it came out of.
 
-/// A typed value for a declared key column.
-///
-/// Deliberately small and `Copy`: values are passed by value on the ingest path
-/// and never own their storage.
+/// A typed value for a declared key column. Small and `Copy`: passed by value on
+/// the ingest path, never owning its storage.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Value<'a> {
     Null,
@@ -63,17 +61,15 @@ impl Value<'_> {
 
 /// A record as supplied by a caller of `append`.
 ///
-/// `keys` is **positional**, in the order declared by the series' config. That
-/// is what keeps a name lookup off the hot path; `append_named` exists for code
-/// that would rather be readable than fast.
+/// `keys` is **positional**, in the order the series' config declares — that is
+/// what keeps a name lookup off the hot path.
 #[derive(Debug, Clone, Copy)]
 pub struct Row<'a> {
     /// Epoch **microseconds**, UTC. Validated against the accept window.
     ///
-    /// Unsigned: the accept window starts in 2000 by default and can never
-    /// start before 1970, so a pre-epoch timestamp was never a value the engine
-    /// would store. Making that unrepresentable removes the sign handling from
-    /// every date calculation downstream rather than testing for it repeatedly.
+    /// Unsigned: the window can never start before 1970, so a pre-epoch
+    /// timestamp was never storable anyway. Making it unrepresentable removes
+    /// sign handling from every date calculation downstream.
     pub ts: u64,
     /// Dedup key together with `ts`. May be empty.
     pub id: &'a str,
@@ -85,11 +81,9 @@ pub struct Row<'a> {
     pub data: &'a str,
 }
 
-/// The fixed part of a decoded frame.
-///
-/// `keys` and `extra` are written into caller-supplied scratch vectors rather
-/// than returned here, so decoding a stream of frames allocates only until those
-/// vectors reach their high-water mark.
+/// The fixed part of a decoded frame. `keys` and `extra` go into caller-supplied
+/// scratch instead, so decoding a stream allocates only up to their high-water
+/// mark.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct RecordRef<'a> {
     pub ts: u64,

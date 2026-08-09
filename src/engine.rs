@@ -41,12 +41,10 @@ thread_local! {
 /// arbitrarily large: `data` and a `Value::Str` key both carry `u32` lengths.
 ///
 /// Keeps a pathological record out of [`SCRATCH`], which is only ever
-/// `clear()`ed — so a rejected 500 MiB record would otherwise pin 500 MiB on
-/// this thread for the life of the process. The post-encode check is what
-/// enforces the limit exactly; this only has to catch the ruinous cases.
-///
-/// `extra` is left out: `u16` lengths, and walking it here would duplicate a
-/// pass the encoder is about to make on the hot path.
+/// `clear()`ed, so a rejected 500 MiB record would pin 500 MiB on this thread
+/// for the life of the process. The post-encode check enforces the limit
+/// exactly; this only catches the ruinous cases. `extra` is left out — `u16`
+/// lengths, and walking it would duplicate a hot-path pass.
 fn oversize(row: &Row<'_>, limit: usize) -> Option<usize> {
     let mut n = row.id.len().saturating_add(row.data.len());
     for v in row.keys {
@@ -121,10 +119,10 @@ pub struct RawIngest {
 /// The embeddable engine.
 ///
 /// Everything the engine *is* lives in [`Inner`], behind an `Arc` the flush timer
-/// shares. What stays out here is the timer's `JoinHandle`, and that placement is
-/// load-bearing: the thread owns a strong reference, so if the handle lived
-/// alongside it, the last `Arc` could be dropped *by the timer itself* at the end
-/// of a flush — and `Drop` would then try to join the thread it is running on.
+/// shares; the timer's `JoinHandle` stays out here. That placement is
+/// load-bearing: the thread holds a strong reference, so a handle stored beside
+/// it could see the last `Arc` dropped *by the timer itself*, and `Drop` would
+/// try to join the thread it was running on.
 #[derive(Debug)]
 pub struct Engine {
     inner: Arc<Inner>,
@@ -282,10 +280,9 @@ impl Engine {
 
     /// Stop the flush timer and wait for it, then close the WAL.
     ///
-    /// The order is the point: joining first lets a flush already in progress
-    /// finish against a live WAL, where closing first would fail it on a writer
-    /// that no longer exists. Idempotent — `Drop` calls this, and so may the
-    /// caller.
+    /// The order is the point: joining first lets a flush in progress finish
+    /// against a live WAL, where closing first would fail it on a writer that no
+    /// longer exists. Idempotent; `Drop` calls it.
     pub fn close(&self) -> Result<()> {
         let handle = {
             let mut stop = self.inner.stop.lock().unwrap_or_else(|e| e.into_inner());
@@ -316,10 +313,9 @@ impl Drop for Engine {
     }
 }
 
-/// The periodic flush.
-///
-/// Waits on a condvar rather than sleeping, so `close` interrupts an interval of
-/// any length immediately instead of shutdown taking up to an hour.
+/// The periodic flush. Waits on a condvar rather than sleeping, so `close`
+/// interrupts an interval of any length instead of shutdown taking up to an
+/// hour.
 fn flusher(inner: Arc<Inner>, interval: Duration) {
     loop {
         let stop = inner.stop.lock().unwrap_or_else(|e| e.into_inner());
@@ -378,9 +374,9 @@ impl Inner {
 
     /// The accept window's upper bound right now.
     ///
-    /// Suspended when the host clock reads before `ts_min`, which is the state a
-    /// device that boots with an unset clock is in. Rejecting everything until
-    /// NTP lands would be the worse failure.
+    /// Suspended when the host clock reads before `ts_min` — the state of a
+    /// device booting with an unset clock. Rejecting everything until NTP lands
+    /// would be the worse failure.
     fn ts_upper_bound(&self) -> Option<u64> {
         let now = now_us();
         if now < self.ts_min {
@@ -441,9 +437,9 @@ impl Inner {
 
     /// Append one record.
     ///
-    /// Runs entirely on the caller's thread: validate, encode into thread-local
-    /// scratch, then copy into the WAL under a short lock. No disk I/O happens
-    /// here — the committer thread owns that.
+    /// Entirely on the caller's thread: validate, encode into thread-local
+    /// scratch, copy into the WAL under a short lock. No disk I/O — the committer
+    /// owns that.
     pub fn append(&self, handle: &SeriesHandle, row: &Row<'_>) -> Result<()> {
         self.check_row(handle, row)?;
         let limit = self.config.limits.max_record_bytes;
@@ -500,39 +496,33 @@ impl Inner {
 
     /// Append frames a client already encoded, without re-encoding them.
     ///
-    /// This is what makes sharing the codec with the wire pay off: the server
-    /// hands over the bytes it received and they are copied exactly once, from
-    /// the ZeroMQ buffer into the WAL. Only the fixed prefix is validated —
-    /// CRC, length, `ts`, and that the series and epoch are known. Walking the
-    /// variable-length tail is deferred to the flush, where it is paid once an
-    /// hour instead of once per record.
+    /// What makes sharing the codec with the wire pay off: the bytes the server
+    /// received are copied exactly once, from the ZeroMQ buffer into the WAL.
+    /// Only the fixed prefix is validated — CRC, length, `ts`, and that the
+    /// series and epoch are known — with the variable-length tail deferred to the
+    /// flush, where it is paid hourly rather than per record.
     ///
-    /// Invalid frames are counted and skipped, never fatal: with fire-and-forget
-    /// there is no client to return an error to, and one bad frame must not cost
-    /// the whole batch.
+    /// Invalid frames are counted and skipped, never fatal: fire-and-forget has
+    /// no client to return an error to, and one bad frame must not cost a
+    /// batch.
     pub fn append_raw(&self, mut bytes: &[u8]) -> Result<RawIngest> {
         let limit = self.config.limits.max_record_bytes;
         let mut out = RawIngest::default();
-        // Grown as frames are accepted, not reserved from the message length.
-        // The length is attacker-supplied: reserving it up front paid for a
-        // whole batch before a single frame had been validated, so a hostile
-        // message cost its full size even when its first frame was garbage.
+        // Grown as frames are accepted, never reserved from the message length:
+        // that length is attacker-supplied, and reserving it up front paid for a
+        // whole batch before one frame had been validated.
         let mut good: Vec<u8> = Vec::new();
 
         while !bytes.is_empty() {
             let prefix = match codec::validate_prefix(bytes, limit) {
                 Ok(p) => p,
                 Err(e) => {
-                    // A corrupt frame has an untrustworthy length, so there is no
-                    // safe way to find the next one: stop here rather than
-                    // resynchronising onto whatever happens to look like a frame.
-                    //
-                    // Everything after it is discarded with it, and the byte
-                    // count is the only honest measure of how much -- the frames
-                    // cannot be counted precisely for the same reason they
-                    // cannot be found. Reporting a flat 1 made a corrupt frame
-                    // near the head of a 1024-record batch look like one lost
-                    // record.
+                    // A corrupt frame's length is untrustworthy, so the next one
+                    // cannot be found: stop rather than resynchronise onto
+                    // whatever looks like a frame. Everything after goes with it,
+                    // and bytes are the only honest measure of how much -- the
+                    // frames cannot be counted for the same reason they cannot be
+                    // found.
                     out.rejected += 1;
                     out.discarded_bytes += bytes.len();
                     tracing::warn!(
@@ -581,7 +571,7 @@ impl Inner {
 
     /// Seal the active segment and turn every sealed one into Parquet.
     ///
-    /// Single-flight; a concurrent caller waits rather than starting a second
+    /// Single-flight: a concurrent caller waits rather than starting a second
     /// flush over the same segments.
     pub fn flush(&self) -> Result<FlushOutcome> {
         let _guard = self.flush_lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -590,12 +580,11 @@ impl Inner {
         let pending = crate::wal::list_segments(&self.data_dir)?;
         let mut manifest = self.manifest.lock().unwrap_or_else(|e| e.into_inner());
 
-        // Never consume the segment the writer is appending to, and never
-        // reconsume one the manifest already calls durable. The second half is
-        // the rule startup applies too: without it, a `delete_segments` that
-        // fails after the commit leaves a segment that the next flush re-reads
-        // and rewrites under a wider name, so both files match the reader's glob
-        // and every row in the overlap comes back twice.
+        // Never the segment the writer is appending to, and never one the
+        // manifest already calls durable -- the rule startup applies too. Without
+        // the second half, a `delete_segments` that fails after the commit leaves
+        // a segment the next flush rewrites under a wider name, and both files
+        // match the reader's glob.
         let active = self.wal.segment();
         let floor = manifest.last_flushed_segment;
         let consumable: Vec<u64> = pending
@@ -615,8 +604,8 @@ impl Inner {
                 Ok(outcome)
             }
             Err(e) => {
-                // The WAL is not capped, so a failing flush costs disk, not
-                // availability: ingest keeps working and the counter makes the
+                // The WAL is uncapped, so a failing flush costs disk rather than
+                // availability: ingest keeps working, and the counter makes the
                 // stall visible.
                 self.counters.flush_failures.fetch_add(1, Ordering::Relaxed);
                 tracing::error!(error = %e, "flush failed; ingest continues and the wal grows");
@@ -655,11 +644,9 @@ impl Inner {
         }
     }
 
-    /// Every resolved series handle, in arbitrary order.
-    ///
-    /// The control socket's schema handshake is built from these: a client
-    /// encodes keys positionally, so it needs each series' epoch and key order
-    /// before it can build a single frame.
+    /// Every resolved series handle, in arbitrary order. The control socket's
+    /// handshake is built from these: a client encodes keys positionally, so it
+    /// needs each series' epoch and key order before it can build a frame.
     pub fn series_handles(&self) -> impl Iterator<Item = &Arc<SeriesHandle>> {
         self.handles.values()
     }
@@ -684,7 +671,7 @@ impl Inner {
 }
 
 /// Everything below forwards to [`Inner`]. The split exists only so the flush
-/// timer can hold the state without holding the thread handle that joins it.
+/// timer can hold the state without the handle that joins it.
 impl Engine {
     /// Resolve a series name to a handle. Do this once, outside the hot loop.
     pub fn series(&self, name: &str) -> Result<Arc<SeriesHandle>> {

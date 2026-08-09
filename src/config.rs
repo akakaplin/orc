@@ -3,15 +3,13 @@
 //! Two rules shape this module.
 //!
 //! **Every field has a default**, so a working config is just a `series` list.
-//! Defaults live in hand-written `Default` impls rather than in `#[serde(default
-//! = "...")]` helpers, because a reader comparing the file against the README
-//! should find every tunable's value in one place per block.
+//! Defaults live in hand-written `Default` impls rather than `#[serde(default =
+//! "...")]` helpers, so every tunable's value is in one place per block.
 //!
-//! **Unknown fields are rejected.** This config is hand-edited, and the whole
-//! point of the `limits` block is to bound how badly the engine can be hurt by
-//! bad input — a `fsync_interval` that silently means `fsync_interval_ms`
-//! stayed at its default would defeat that quietly. Failing at load names the
-//! typo instead.
+//! **Unknown fields are rejected.** This file is hand-edited, and the point of
+//! the `limits` block is to bound how badly bad input can hurt the engine — a
+//! `fsync_interval` silently leaving `fsync_interval_ms` at its default would
+//! defeat that quietly. Failing at load names the typo instead.
 //!
 //! Durations are integer milliseconds throughout: no duration-parsing crate, and
 //! no ambiguity about whether `10` meant seconds.
@@ -60,11 +58,11 @@ pub struct ServerConfig {
     pub rcv_hwm: i32,
     /// Largest ingest message libzmq will accept, in bytes.
     ///
-    /// `limits.max_record_bytes` bounds one *frame*; without this, nothing bounds
-    /// the *batch* that carries them. libzmq's own default is unlimited, so a
-    /// single hostile message would be allocated in full before the first frame
-    /// inside it is looked at, and `append_batch` would write it to one segment
-    /// whatever `wal.segment_max_bytes` says.
+    /// `limits.max_record_bytes` bounds one *frame*; nothing else bounds the
+    /// *batch* carrying them, and libzmq's own default is unlimited — so one
+    /// hostile message would be allocated in full before a frame inside it was
+    /// looked at, then written to a single segment whatever
+    /// `wal.segment_max_bytes` says.
     pub max_batch_bytes: i64,
 }
 
@@ -79,15 +77,15 @@ pub struct LimitsConfig {
     pub reject_max_bytes: u64,
     /// Lower bound of the timestamp accept window, RFC 3339 UTC.
     ///
-    /// Written as a string because a reader can check `2000-01-01T00:00:00Z` at
-    /// a glance and cannot check `946684800000000`. Parsed once — see
+    /// A string because a reader can check `2000-01-01T00:00:00Z` at a glance and
+    /// cannot check `946684800000000`. Parsed once — see
     /// [`LimitsConfig::ts_min_us`].
     pub ts_min: String,
     /// How far past `now` a timestamp may be before it is rejected.
     ///
     /// Unsigned, so "past" cannot accidentally mean "before": a negative value
-    /// used to move the window's *upper* bound into the past and reject every
-    /// live record, which is now a parse error rather than a validation rule.
+    /// would move the window's *upper* bound backwards and reject every live
+    /// record, which the type makes a parse error.
     pub ts_max_skew_ms: u64,
     /// The one exception to "`serde_json` is never on the ingest path". Off by
     /// default because it costs latency on every record.
@@ -117,18 +115,17 @@ pub struct WalConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct FlushConfig {
-    /// How often to dump. Also the delay before ingested data becomes visible
-    /// to readers, since the engine is write-only.
+    /// How often to dump — also the delay before ingested data becomes visible,
+    /// since the engine is write-only.
     ///
-    /// `0` disables the timer entirely, leaving flushing to explicit
+    /// `0` disables the timer, leaving flushing to explicit
     /// [`Engine::flush`](crate::engine::Engine::flush) calls and the control
-    /// socket. That is a real choice for an embedding application that wants to
-    /// own the schedule — but it means nothing else ever will, and the WAL is
-    /// not capped.
+    /// socket. A real choice for an application that wants to own the schedule,
+    /// but then nothing else ever will and the WAL is uncapped.
     pub interval_ms: u64,
-    /// Flush at startup *if more than `interval_ms` has already elapsed* since
-    /// the manifest's `last_flush_at` — not unconditionally, which on an engine
-    /// that restarts every few minutes would produce a tiny file per restart.
+    /// Flush at startup *if more than `interval_ms` has elapsed* since the
+    /// manifest's `last_flush_at`. Not unconditionally: an engine restarting
+    /// every few minutes would emit a tiny file per restart.
     pub on_startup: bool,
     /// Parquet compression codec. Only what the pinned `parquet` features
     /// actually compile in is accepted; see [`Config::validate`].
@@ -156,9 +153,9 @@ pub struct SeriesConfig {
 
 /// One declared key column.
 ///
-/// `name` and `type` are required: a key with no type is meaningless, and
-/// defaulting it to `string` would silently mistype a column for the life of the
-/// dataset. `nullable` defaults to `false`.
+/// `name` and `type` are required — defaulting the type to `string` would
+/// silently mistype a column for the life of the dataset. `nullable` defaults to
+/// `false`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct KeyDef {
@@ -166,9 +163,9 @@ pub struct KeyDef {
     /// Spelled `"string"`, `"i64"`, `"f64"` or `"bool"` in JSON.
     #[serde(rename = "type", with = "key_type_serde")]
     pub ty: KeyType,
-    /// Enforced at ingest only. Every key column is written *nullable* in
-    /// Parquet regardless, so a column added in a later epoch reads as NULL from
-    /// older files instead of failing the union.
+    /// Enforced at ingest only: Parquet key columns are always nullable, so a
+    /// column added in a later epoch reads as NULL from older files instead of
+    /// failing the union.
     #[serde(default)]
     pub nullable: bool,
 }
@@ -188,10 +185,10 @@ impl Default for Config {
 
 impl Default for ServerConfig {
     fn default() -> Self {
-        // Loopback is deliberate: there is no authentication on the ingest
-        // socket, so anything that can reach it can write records and consume
-        // disk. Binding 0.0.0.0 by default would mean a config copied from the
-        // README silently exposes a writable database to the network.
+        // Loopback is deliberate: the ingest socket has no authentication, so
+        // anything that can reach it can write records and consume disk. A
+        // 0.0.0.0 default would make a config copied from the README expose a
+        // writable database to the network.
         Self {
             ingest_endpoint: "tcp://127.0.0.1:5555".into(),
             control_endpoint: "tcp://127.0.0.1:5556".into(),
@@ -245,22 +242,18 @@ impl Default for FlushConfig {
     }
 }
 
-/// Re-exported from the writer that implements it.
-///
-/// This list used to be duplicated here, and had already drifted: it accepted
-/// `"none"` but not `"uncompressed"`, which the writer has always handled — so a
-/// perfectly writable config was rejected at load. Taking it from the one place
-/// that turns a name into a codec is what stops that recurring.
+/// Re-exported from the writer that implements it. Duplicated here once, and it
+/// had already drifted — accepting `"none"` but not `"uncompressed"`, so a
+/// writable config was rejected at load.
 use crate::flush::parquet::SUPPORTED_COMPRESSION;
 
 impl LimitsConfig {
     /// `ts_min` as epoch microseconds.
     ///
-    /// Parsed at most once and cached, because the ingest path compares this
-    /// against every record's `ts`: re-running an RFC 3339 parser per record
-    /// would put a string parse on the hot path for a value that never changes.
-    /// [`Config::validate`] calls this, so a validated config has already paid
-    /// the parse.
+    /// Parsed once and cached: the ingest path compares this against every
+    /// record's `ts`, and an RFC 3339 parse per record would be a string parse on
+    /// the hot path for a value that never changes. [`Config::validate`] pays it
+    /// up front.
     pub fn ts_min_us(&self) -> Result<u64> {
         if let Some(us) = self.ts_min_us.get() {
             return Ok(*us);
@@ -274,9 +267,8 @@ impl LimitsConfig {
 impl Config {
     /// Read and validate a config file.
     ///
-    /// I/O and parse failures are reported as [`Error::Config`] with the path
-    /// interpolated: a bare `No such file or directory` from a hand-edited file
-    /// tells the operator nothing about *which* file the engine wanted.
+    /// Failures are [`Error::Config`] with the path interpolated: a bare `No such
+    /// file or directory` says nothing about *which* file the engine wanted.
     pub fn load(path: impl AsRef<Path>) -> Result<Config> {
         let path = path.as_ref();
         let text = std::fs::read_to_string(path)
@@ -290,11 +282,10 @@ impl Config {
     /// Check every invariant the rest of the engine assumes, and pre-parse
     /// `limits.ts_min`.
     ///
-    /// Everything checked here is something that would otherwise fail later and
-    /// worse: a duplicate series name means two schemas sharing one directory, a
-    /// name with a path separator escapes `data_dir`, and a `ts_min` that only
-    /// fails to parse on the first record turns a typo into a total ingest
-    /// outage an hour after startup.
+    /// Everything here would otherwise fail later and worse: a duplicate series
+    /// name is two schemas sharing a directory, a path separator escapes
+    /// `data_dir`, and a `ts_min` that only fails on the first record turns a
+    /// typo into an ingest outage an hour after startup.
     pub fn validate(&self) -> Result<()> {
         let bad = |msg: String| Err(Error::Config(msg));
 
@@ -312,9 +303,8 @@ impl Config {
         if self.flush.row_group_rows == 0 {
             return bad("flush.row_group_rows must be greater than 0".into());
         }
-        // The timer converts this to microseconds as an i64. Bounding it here
-        // keeps that conversion honest and rejects a value that can only be a
-        // typo -- a century is not a flush interval.
+        // Bounds the microsecond conversion, and rejects a value that can only
+        // be a typo: a century is not a flush interval.
         if self.flush.interval_ms > MAX_FLUSH_INTERVAL_MS {
             return bad(format!(
                 "flush.interval_ms {} is out of range; the maximum is {} (~100 years), \
@@ -351,12 +341,10 @@ impl Config {
         }
 
         let mut seen_series = BTreeSet::new();
-        // Folded to lowercase, because the collision that matters is the one the
-        // *filesystem* sees. macOS and Windows are case-insensitive by default,
-        // so `trades` and `Trades` are two schemas silently sharing one
-        // `series/` directory -- two epochs' Parquet interleaved under one name,
-        // discovered much later by a reader. Rejecting costs nothing; the same
-        // config is portable to a case-sensitive filesystem either way.
+        // Folded, because the collision that matters is the one the *filesystem*
+        // sees: macOS and Windows are case-insensitive, so `trades` and `Trades`
+        // silently share one `series/` directory. Rejecting costs nothing, and
+        // the config stays portable either way.
         let mut seen_folded = BTreeSet::new();
         for s in &self.series {
             check_series_name(&s.name)?;
@@ -413,14 +401,11 @@ impl Config {
 ///
 /// `parquet_schema` emits `ts, id, <keys...>, extra, data`, and parquet's group
 /// builder does not check for duplicate field names — so a key called `ts` writes
-/// a perfectly valid-looking file with two `ts` columns. Nothing downstream
-/// survives that: `view.sql` becomes invalid SQL, and both `flush::read` and any
-/// external reader dispatch on the name.
+/// a valid-looking file with two `ts` columns. Nothing downstream survives that:
+/// `view.sql` becomes invalid SQL, and every reader dispatches on the name.
 ///
-/// Kept next to [`Config::validate`] rather than in `flush::parquet` because the
-/// check has to happen at load. The alternative is discovering it at the first
-/// flush an hour later, with a WAL that has nowhere to go — the same reasoning
-/// that puts the compression check here.
+/// Checked at load, like the compression codec, because the alternative is
+/// discovering it at the first flush an hour later.
 pub const RESERVED_KEY_NAMES: [&str; 4] = ["ts", "id", "extra", "data"];
 
 /// Upper bound on `flush.interval_ms`: ~100 years, comfortably past any real
@@ -452,15 +437,13 @@ fn check_series_name(name: &str) -> Result<()> {
 
 /// A series resolved for the ingest hot path.
 ///
-/// This exists for one reason: the frame carries the series *name*, not an id,
-/// so without a handle every `append` would re-encode the same length prefix and
-/// UTF-8 bytes per record. The handle pre-encodes them once at `engine.series()`
-/// and the hot path `memcpy`s [`SeriesHandle::encoded_name`] — no hashing, no
-/// string comparison, no allocation.
+/// The frame carries the series *name*, not an id, so without a handle every
+/// `append` would re-encode the same length prefix and UTF-8 bytes. This
+/// pre-encodes them once and the hot path `memcpy`s
+/// [`SeriesHandle::encoded_name`] — no hashing, no comparison, no allocation.
 ///
-/// It also pins the `epoch` the schema was resolved under, because every frame
-/// stamps its own epoch and a handle held across a `reload-config` must keep
-/// encoding under the layout it was built for.
+/// It also pins the `epoch` it was resolved under, so a handle held across a
+/// `reload-config` keeps encoding under the layout it was built for.
 #[derive(Debug, Clone)]
 pub struct SeriesHandle {
     name: String,
@@ -513,9 +496,9 @@ impl SeriesHandle {
         &self.encoded_name
     }
 
-    /// Position of a declared key, for `append_named` and tests. Linear because
-    /// key lists are short and this is deliberately *not* on the hot path — that
-    /// is what positional `keys` exists to avoid.
+    /// Position of a declared key. Linear because key lists are short and this
+    /// is deliberately not on the hot path — positional `keys` exists to avoid
+    /// it.
     pub fn key_index(&self, name: &str) -> Option<usize> {
         self.keys.iter().position(|k| k.name == name)
     }
@@ -532,11 +515,10 @@ pub fn key_type_name(ty: KeyType) -> &'static str {
     }
 }
 
-/// Serde bridge for [`KeyType`], which lives in `record.rs` and stays free of
-/// serde derives: the record model is the codec's contract, and the on-disk type
-/// *tags* are numeric bytes that have nothing to do with these JSON spellings.
-/// Keeping the bridge here means the JSON vocabulary can change without touching
-/// the wire format.
+/// Serde bridge for [`KeyType`], which stays free of serde derives: the record
+/// model is the codec's contract, and the on-disk type *tags* are numeric bytes
+/// with nothing to do with these JSON spellings. The bridge lives here so the
+/// JSON vocabulary can change without touching the wire format.
 mod key_type_serde {
     use super::{KeyType, key_type_name};
     use serde::{Deserialize, Deserializer, Serializer, de::Error as _};

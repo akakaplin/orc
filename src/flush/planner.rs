@@ -13,36 +13,29 @@
 //! 6. regenerate `view.sql`, which is derived and therefore not worth failing on
 //!
 //! A crash anywhere leaves either the old manifest — the segments are still on
-//! disk, so the flush simply re-runs — or the new one, whose orphan segments
-//! startup deletes because their ids are `<= last_flushed_segment`. No window
-//! loses data, and no window double-writes: the output filename is
-//! [`output_file_name`] over the *consumed segment range*, so a re-run of an
-//! interrupted flush writes the same paths with the same bytes rather than a
-//! second copy of the same rows.
+//! disk, so the flush re-runs — or the new one, whose orphan segments startup
+//! deletes on `id <= last_flushed_segment`. No window loses data or
+//! double-writes: [`output_file_name`] is a function of the *consumed segment
+//! range*, so a re-run writes the same paths with the same bytes.
 //!
 //! # A bad frame costs one record, never the flush
 //!
 //! Ingest validated only a frame's fixed prefix, so a malformed `keys` section
-//! first surfaces here, an hour after it was accepted. Aborting would be the
-//! worst possible response: a flush that can never finish means no Parquet is
-//! ever produced again and the WAL grows until the volume fills. So every fault
-//! the reader yields is counted, copied to `rejects/<segment_id>.rej` where it
-//! can be inspected, and skipped.
+//! first surfaces here, an hour later. Aborting would mean no Parquet is ever
+//! produced again and a WAL that grows until the volume fills, so every fault is
+//! counted, copied to `rejects/<segment_id>.rej`, and skipped.
 //!
-//! That is also why a flush that decoded *only* bad frames still commits. The
-//! no-op case this job is documented to have — no empty Parquet files, no
-//! manifest write — is the genuinely empty one; refusing to commit a segment
-//! whose every frame was rejected would resurrect exactly the stall the
-//! paragraph above exists to prevent.
+//! Which is why a flush that decoded *only* bad frames still commits. The
+//! documented no-op — no empty files, no manifest write — is the genuinely empty
+//! case; refusing to commit an all-rejected segment would rescan it forever.
 //!
 //! # Memory: M4 holds one flush in memory
 //!
-//! Every row of every listed segment is decoded and held until the last file is
-//! written, and each group is sorted with a single in-memory sort. That is
-//! bounded by the segments the caller hands over, not by a budget: an hour at a
-//! high ingest rate does not fit. **M5 replaces this with per-segment sorted
-//! runs and a bounded-fan-in k-way merge**; splitting it that way is deliberate,
-//! so an hour-scale flush is correct before it is scale-proof.
+//! Every row of every listed segment is held until the last file is written, and
+//! each group takes a single in-memory sort. Bounded by what the caller hands
+//! over, not by a budget: an hour at a high ingest rate does not fit. **M5
+//! replaces this with per-segment sorted runs and a bounded-fan-in k-way
+//! merge** — correct before scale-proof, deliberately.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -108,13 +101,12 @@ pub struct FlushOutcome {
     pub rows_deduplicated: usize,
     /// Frames that could not be decoded, copied to `rejects/`.
     pub frames_rejected: usize,
-    /// Bytes of sealed segment that were never scanned, because a frame with an
-    /// undecodable length made everything after it unlocatable.
+    /// Bytes of sealed segment never scanned, because an undecodable length made
+    /// everything after it unlocatable.
     ///
-    /// Distinct from `frames_rejected`, which counts records: nobody knows how
-    /// many records are in here, only how many bytes. Non-zero means the storage
-    /// damaged data that was already acknowledged. The bytes go to `rejects/`
-    /// rather than being dropped on the floor.
+    /// Not `frames_rejected`, which counts records: how many records are in here
+    /// is precisely what is unknowable. Non-zero means the storage damaged
+    /// already-acknowledged data. The bytes go to `rejects/`.
     pub bytes_skipped: u64,
 }
 
@@ -131,8 +123,8 @@ pub fn run(
     segments: &[u64],
 ) -> Result<FlushOutcome> {
     // Sorted and deduplicated up front: `arrival` is `(segment_id, offset)`, so
-    // the order segments are read in *is* part of the dedup answer, and reading
-    // one twice would invent duplicate arrivals for the same bytes.
+    // read order *is* part of the dedup answer and reading one segment twice
+    // would invent duplicate arrivals for the same bytes.
     let mut ids: Vec<u64> = segments.to_vec();
     ids.sort_unstable();
     ids.dedup();
@@ -196,12 +188,10 @@ pub fn run(
             .map(Vec::as_slice)
             .unwrap_or(&[]);
 
-        // The last thing that can disagree with the schema. `decode` took its
-        // arity from the manifest and the codec reads whatever type tag it
-        // finds, so a hand-rolled client can put an i64 where the config
-        // declares a string and get all the way here. Left alone it would
-        // surface inside the column builders and fail the whole flush over one
-        // record -- the exact stall `rejects/` exists to prevent.
+        // The last thing that can disagree with the schema: `decode` took arity
+        // from the manifest, but the codec reads whatever type tag it finds, so
+        // a hand-rolled client's i64 in a string column gets this far. Left
+        // alone it would fail the whole flush inside a column builder.
         let mut rejected = 0;
         rows.retain(|row| {
             if matches_schema(keys, &row.keys) {
@@ -220,16 +210,15 @@ pub fn run(
         });
         outcome.frames_rejected += rejected;
 
-        // Stable, and total: `arrival` is unique, so this order is identical on
-        // every replay of the same segments -- which is what makes a re-run
-        // produce byte-identical files.
+        // Total, because `arrival` is unique: the same segments sort the same way
+        // on every replay, which is what makes a re-run byte-identical.
         rows.sort_by(|a, b| (a.ts, a.id, a.arrival).cmp(&(b.ts, b.id, b.arrival)));
 
         let before = rows.len();
-        // Duplicates are adjacent after that sort, so one pass is enough, and
-        // the survivor is the first arrival. An empty id dedups like any other
-        // value: `(100, "")` twice is one row, which is why a producer emitting
-        // genuinely distinct events at one microsecond must set `id`.
+        // Duplicates are adjacent after that sort, and the survivor is the first
+        // arrival. An empty id dedups like any other value -- `(100, "")` twice
+        // is one row -- so a producer emitting distinct events at one microsecond
+        // must set `id`.
         rows.dedup_by(|later, first| later.ts == first.ts && later.id == first.id);
         outcome.rows_deduplicated += before - rows.len();
 
@@ -287,23 +276,21 @@ struct DecodedRow<'a> {
     keys: Vec<Value<'a>>,
     extra: Vec<(&'a str, &'a str)>,
     data: &'a str,
-    /// `(segment_id, frame_offset)` — a total order over every record ever
-    /// written, identical on every replay. It breaks `(ts, id)` ties, so "first
-    /// arrival wins" means the same thing on a re-run as it did on the run the
-    /// crash interrupted.
+    /// `(segment_id, frame_offset)`: a total order over every record ever
+    /// written, identical on every replay. Breaking `(ts, id)` ties with it is
+    /// what makes "first arrival wins" mean the same thing on a re-run.
     arrival: (u64, usize),
-    /// The frame's own bytes, so a row rejected after decoding can still be
-    /// copied to `rejects/` verbatim rather than described in a log line.
+    /// The frame's own bytes, so a row rejected after decoding goes to
+    /// `rejects/` verbatim rather than as a log line.
     frame: &'a [u8],
 }
 
 /// Does this row's key list satisfy the schema it would be written under?
 ///
-/// Arity was already checked by `decode`, which took it from the manifest;
-/// **types were not**, because the codec reads whatever tag byte it finds. Both
-/// are checked here so the column builders downstream cannot fail on data.
-/// [`Value::Null`] satisfies any column — nullability is enforced at ingest, and
-/// every key column is written nullable in Parquet regardless.
+/// `decode` checked arity against the manifest but **not types**, because the
+/// codec reads whatever tag byte it finds. Both are checked here so the column
+/// builders cannot fail on data. [`Value::Null`] satisfies any column:
+/// nullability is an ingest rule, and Parquet key columns are always nullable.
 fn matches_schema(keys: &[KeyDef], values: &[Value<'_>]) -> bool {
     keys.len() == values.len()
         && std::iter::zip(keys, values).all(|(k, v)| v.key_type().is_none_or(|ty| ty == k.ty))
@@ -313,8 +300,8 @@ fn matches_schema(keys: &[KeyDef], values: &[Value<'_>]) -> bool {
 ///
 /// The group key borrows the series name out of the segment buffer, so grouping
 /// millions of frames allocates nothing per row. `schemas` owns its key lists
-/// instead, because the manifest is needed mutably later and a borrow held here
-/// would outlive the commit.
+/// instead: the manifest is needed mutably later, and a borrow would outlive the
+/// commit.
 #[derive(Debug, Default)]
 struct Decoded<'a> {
     groups: BTreeMap<(&'a str, u32), Vec<DecodedRow<'a>>>,
@@ -358,13 +345,10 @@ fn decode_segments<'a>(
             arity
         };
 
-        // The frame-length cap is the segment's own size, not the configured
-        // `limits.max_record_bytes`. That cap exists to stop a corrupt length
-        // prefix becoming a huge allocation, and nothing here allocates from a
-        // length -- the whole segment is already in memory. Applying it would
-        // mean lowering the config truncates every sealed segment at its first
-        // record above the new limit, silently discarding data that was durable
-        // before the edit.
+        // The frame-length cap is the segment's own size, not
+        // `limits.max_record_bytes`: that cap bounds allocation, and the whole
+        // segment is already in memory. Applying it would make lowering the
+        // config truncate every sealed segment at its first oversized record.
         let mut reader = match SegmentReader::new(buf, buf.len(), key_count) {
             Ok(r) => r,
             Err(err) => {
@@ -406,17 +390,12 @@ fn decode_segments<'a>(
                             tracing::warn!(segment = segment_id, %fault, "rejecting a frame");
                             rejects.append(segment_id, &buf[offset..offset + len]);
                         }
-                        // Unknown length means the bytes cannot be delimited, so
-                        // no frame after this point can be found. Recovery
-                        // amends the *tail* segment, so reaching this in a
-                        // sealed one means the storage damaged bytes that were
-                        // already acked.
-                        //
-                        // The rest of the segment is lost to the dataset either
-                        // way, but it is not nothing: copy it verbatim so it can
-                        // be examined, and count the bytes. Reporting one
-                        // rejected "frame" for a possibly enormous tail was the
-                        // part that made this invisible.
+                        // No delimitable length means no frame after this can be
+                        // found. Recovery amends the *tail*, so reaching this in
+                        // a sealed segment means the storage damaged acked bytes.
+                        // The remainder is lost to the dataset either way, so
+                        // copy it verbatim and count it -- reporting one rejected
+                        // "frame" for a whole tail is what made this invisible.
                         FrameFault::Undecodable { offset, .. } => {
                             let tail = &buf[offset..];
                             out.bytes_skipped += tail.len() as u64;
@@ -468,9 +447,9 @@ struct Sink<'a> {
 impl Sink<'_> {
     /// Build, stage, fsync and rename one `(series, epoch, hour)` file.
     ///
-    /// `rows` must be sorted, deduplicated, and entirely within one hour — the
-    /// caller's loop guarantees all three, and the Parquet writer declares `ts`
-    /// a sorting column on the strength of it.
+    /// `rows` must be sorted, deduplicated and within one hour — the caller's
+    /// loop guarantees all three, and the Parquet writer declares `ts` a sorting
+    /// column on the strength of it.
     fn write_partition(
         &self,
         series: &str,
@@ -507,11 +486,10 @@ impl Sink<'_> {
         std::fs::create_dir_all(&dir)?;
         std::fs::rename(&staged, dir.join(&name))?;
 
-        // `write_file` synced the file's *contents*; only syncing a directory
-        // makes the names it holds durable, and the manifest is about to claim
-        // this file exists. The chain matters as much as the leaf: an unsynced
-        // `series/<name>/` can lose a freshly created `hour=` directory whole,
-        // taking a file whose every byte was on the platter with it.
+        // `write_file` synced the contents; only a directory fsync makes the
+        // *name* durable, and the manifest is about to claim this file exists.
+        // The whole chain, not just the leaf: an unsynced `series/<name>/` can
+        // lose a new `hour=` directory whole, file and all.
         fsync_dir(&dir)?;
         fsync_dir(&series_root)?;
         fsync_dir(&self.data_dir.join(SERIES_DIR))?;
@@ -527,26 +505,22 @@ impl Sink<'_> {
 
 /// Remove everything an interrupted flush left behind.
 ///
-/// Two kinds of debris, both from a flush that wrote files and then failed
-/// before [`Manifest::commit`]:
+/// Two kinds of debris, both from a flush that wrote files then failed before
+/// [`Manifest::commit`]:
 ///
 /// - **Staged files in `tmp/`.** A crash between `write_file` and the rename
-///   leaves a full-size Parquet file there. Nothing ever overwrote it, because
-///   the staging name embeds the segment range and the next flush covers a wider
-///   one. Staged files are uncommitted by definition, so the directory is emptied
-///   unconditionally.
+///   leaves one there, and nothing overwrites it because the staging name embeds
+///   the segment range. Staged files are uncommitted by definition, so `tmp/` is
+///   emptied unconditionally.
 /// - **Orphan Parquet in `series/`.** Files are renamed into place *before* the
-///   commit, so a failure between the two leaves a real file describing rows that
-///   the next flush — now covering a wider segment range, hence a different name
-///   — writes again under a name of its own. Both then match the reader's glob
-///   and every row in the overlap is returned twice.
+///   commit, so a failure between the two leaves a real file whose rows the next
+///   flush — wider range, different name — writes again beside it. Both match the
+///   reader's glob, so every row in the overlap comes back twice.
 ///
 /// The rule for the second is exact: a committed file's `last_segment` is at most
-/// `last_flushed_segment`, because the commit that made it visible set the
-/// watermark to at least that. So a file whose range reaches *past* the watermark
-/// can only come from a flush that never committed. Anything whose name does not
-/// parse is left alone — this is the only place the engine deletes from
-/// `series/`, and it has no claim on files it did not write.
+/// `last_flushed_segment`, so a range reaching past the watermark can only be
+/// uncommitted. A name that does not parse is left alone — this is the only place
+/// the engine deletes from `series/`.
 ///
 /// **`last_flushed_segment` must come from a manifest that was actually read off
 /// disk.** A missing `manifest.json` reads as 0, under which every committed
@@ -692,11 +666,10 @@ fn output_files(data_dir: &Path) -> Vec<(PathBuf, (u64, u64, u32))> {
 
 /// Move a segment out of `wal/` without destroying it.
 ///
-/// The counterpart of the same move in recovery, for the same reason: an
-/// unreadable header says nothing about the frames behind it, so the file has to
-/// stop being part of the log without ceasing to exist. Renaming does both —
-/// [`list_segments`](crate::wal::list_segments) no longer sees it, and every byte
-/// stays where an operator can get at it.
+/// Same move as recovery's, for the same reason: an unreadable header says
+/// nothing about the frames behind it, so the file must leave the log without
+/// ceasing to exist. [`list_segments`](crate::wal::list_segments) stops seeing
+/// it and every byte stays put.
 ///
 /// Returns whether the rename happened. A failure is logged and swallowed,
 /// which really does cost nothing but a repeated error on the next flush: the
@@ -724,9 +697,9 @@ fn quarantine_segment(data_dir: &Path, id: u64) -> bool {
 
 /// Drop the segments the manifest now says are durable in Parquet.
 ///
-/// Runs strictly after the commit. A crash in the middle leaves orphans, which
-/// startup deletes on the same `id <= last_flushed_segment` rule — so a missing
-/// file here is a completed job, not a failure.
+/// Runs strictly after the commit. A crash mid-way leaves orphans that startup
+/// deletes on the same `id <= last_flushed_segment` rule, so a missing file here
+/// is a completed job rather than a failure.
 fn delete_segments(data_dir: &Path, ids: &[u64]) -> Result<()> {
     for &id in ids {
         match std::fs::remove_file(segment_path(data_dir, id)) {
@@ -741,9 +714,9 @@ fn delete_segments(data_dir: &Path, ids: &[u64]) -> Result<()> {
 
 /// Rewrite `series/<name>/view.sql` for every series this flush touched.
 ///
-/// Derived output: pure text, rewritable at any moment, reconstructible from the
-/// manifest plus the epoch tags in the filenames. A failure here is logged and
-/// swallowed, because the flush it would otherwise fail has already committed.
+/// Derived: pure text, reconstructible from the manifest plus the epoch tags in
+/// the filenames. A failure is logged and swallowed — the flush it would fail has
+/// already committed.
 fn regenerate_views(data_dir: &Path, manifest: &Manifest, series: &BTreeSet<&str>) {
     for name in series {
         let dir = series_dir(data_dir, name);
@@ -756,12 +729,10 @@ fn regenerate_views(data_dir: &Path, manifest: &Manifest, series: &BTreeSet<&str
     }
 }
 
-/// Now, in epoch microseconds. Saturating rather than panicking: a wall clock
-/// far enough out of range to overflow is a reason to record an odd
-/// `last_flush_at`, not to fail a flush that has already written its data.
-///
-/// A clock reading before 1970 collapses to 0, which `flush_overdue` reads as
-/// "flushed at the epoch" and therefore always overdue — the safe direction.
+/// Now, in epoch microseconds. Saturating, not panicking: an absurd wall clock
+/// is a reason for an odd `last_flush_at`, not for failing a flush that has
+/// already written its data. A pre-1970 clock collapses to 0, which
+/// `flush_overdue` reads as always overdue — the safe direction.
 fn now_us() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -774,10 +745,9 @@ fn now_us() -> u64 {
 
 /// The `rejects/` sink: bad frames, verbatim, capped in total.
 ///
-/// Every write here is best-effort. The sink exists so bad data is inspectable
-/// rather than invisible; failing the flush because the sink is full or
-/// unwritable would trade a diagnostic for the outage the whole reject path
-/// exists to avoid. Once the cap is reached, frames are still counted.
+/// Best-effort throughout. The sink makes bad data inspectable; failing a flush
+/// because it is full would trade a diagnostic for the outage the reject path
+/// exists to avoid. Past the cap, frames are counted but not written.
 #[derive(Debug)]
 struct RejectSink {
     dir: PathBuf,

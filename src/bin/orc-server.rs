@@ -16,11 +16,10 @@ const DEFAULT_DATA_DIR: &str = "./data";
 struct Args {
     /// Data directory. Overrides `data_dir` in the config file.
     ///
-    /// `Option` rather than a `default_value`, so "not passed" is distinguishable
-    /// from "passed the default". With a default, the override below fired
-    /// unconditionally and `--config /etc/orc/config.json` silently ignored that
-    /// file's own `data_dir`, writing to `./data` relative to whatever working
-    /// directory the service manager happened to give us.
+    /// `Option`, not a `default_value`, so "not passed" differs from "passed the
+    /// default". With a default the override fires unconditionally, and
+    /// `--config /etc/orc/config.json` silently ignores that file's own
+    /// `data_dir`.
     #[arg(long)]
     data: Option<PathBuf>,
 
@@ -47,11 +46,10 @@ fn main() -> std::process::ExitCode {
 
 /// `RUST_LOG` as a bare level: `error`, `warn`, `info`, `debug` or `trace`.
 ///
-/// Not `EnvFilter`, which parses per-target directives like `orc=debug,zmq=warn`
-/// and costs five crates to do it. One binary logging from one crate has no
-/// targets to discriminate between, so a level is the whole of what the setting
-/// ever meant here. Anything else is reported rather than silently ignored --
-/// a filter that quietly does nothing is worse than no filter.
+/// Not `EnvFilter`: per-target directives cost five crates, and one binary
+/// logging from one crate has no targets to discriminate between. Anything else
+/// is reported rather than ignored — a filter that quietly does nothing is worse
+/// than no filter.
 fn log_level() -> tracing::Level {
     use std::str::FromStr;
 
@@ -80,11 +78,10 @@ fn run() -> orc::Result<()> {
     });
 
     let mut config = Config::load(&config_path)?;
-    // An explicit `--data` wins over the file's own `data_dir`. That field is
-    // self-referential -- it lives inside the directory it names -- so honouring
-    // it over the path we were actually pointed at is how a server ends up
-    // reading one directory's config while writing another's. Absent the flag,
-    // the file decides, which is the only way `--config` alone can work.
+    // `--data` wins over the file's own `data_dir`, which is self-referential:
+    // honouring it over the path we were pointed at is how a server reads one
+    // directory's config and writes another's. Absent the flag the file decides,
+    // which is the only way `--config` alone can work.
     if let Some(data) = &args.data {
         if data != &config.data_dir {
             tracing::info!(

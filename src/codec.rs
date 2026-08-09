@@ -21,35 +21,32 @@
 //! ```
 //!
 //! Little-endian throughout, and every multi-byte read goes through
-//! `from_le_bytes` on a bounds-checked slice, so nothing here assumes alignment
-//! or host endianness.
+//! `from_le_bytes` on a bounds-checked slice, so nothing assumes alignment or
+//! host endianness.
 //!
 //! Three properties are load-bearing and each has a dedicated test:
 //!
-//! - **`len` is validated against `max_record_bytes` before anything is read or
+//! - **`len` is checked against `max_record_bytes` before anything is read or
 //!   reserved.** A corrupt four-byte length is otherwise a request for 4 GiB.
 //! - **Truncated and corrupt are different answers.** [`DecodeError::Truncated`]
-//!   means "the buffer ends mid-frame, stop scanning here" — recovery truncates
-//!   the segment at that offset. [`DecodeError::Corrupt`] means the bytes that
-//!   *are* present disagree with themselves. Recovery logs them differently and
-//!   the flush counts them separately, so the split must be exact.
+//!   is "the buffer ends mid-frame, stop scanning"; [`DecodeError::Corrupt`] is
+//!   "the bytes that are present disagree with themselves". Recovery branches on
+//!   the difference, so it must be exact.
 //! - **Re-encoding a logical record is byte-identical**, which is what makes a
-//!   crash-recovered flush produce the same Parquet file as the run it replaced.
-//!   `extra` is sorted at encode time to get there.
+//!   crash-recovered flush produce the same Parquet file. `extra` is sorted at
+//!   encode time to get there.
 //!
 //! # Key counts are not in the frame
 //!
-//! A frame stores key *values* with no count: the arity comes from the series'
-//! schema for the frame's `epoch`, which the frame names. So [`decode`] takes the
-//! expected key count from the caller, and the caller learns which schema to ask
-//! for by reading the cheap fixed prefix first: `validate_prefix` yields the
-//! series and epoch, the caller maps those to an arity, and `decode` takes it.
+//! A frame stores key *values* with no count: the arity comes from the schema for
+//! the `epoch` the frame names. So [`decode`] takes the count from the caller,
+//! who learns it from the cheap fixed prefix — `validate_prefix` yields series
+//! and epoch, the caller maps those to an arity.
 //!
-//! The alternative — storing a key count in every frame — would let a decoder
-//! walk a frame with no schema at all, but it would also make the count a second
-//! source of truth that can disagree with the manifest, and pay 1-2 bytes per
-//! record forever to carry the disagreement. The prefix re-read costs a handful
-//! of loads at fixed offsets.
+//! Storing the count per frame would let a decoder work with no schema, but it
+//! would also be a second source of truth that can disagree with the manifest,
+//! at 1-2 bytes per record forever. The prefix re-read is a few loads at fixed
+//! offsets.
 
 use crate::error::{Error, FORMAT_VERSION, MAGIC, Result};
 use crate::record::{RecordRef, Row, Value, tag};
@@ -123,14 +120,12 @@ const fn corrupt(reason: &'static str) -> DecodeError {
     DecodeError::Corrupt { reason }
 }
 
-/// The `Corrupt` reason a header carrying an unrecognised [`FORMAT_VERSION`]
-/// produces.
+/// The `Corrupt` reason an unrecognised [`FORMAT_VERSION`] produces.
 ///
-/// Exported because recovery has to tell it apart from real damage: damage means
-/// quarantine the segment and carry on, while a version mismatch means this is
-/// the wrong binary for this directory and starting at all would strand records
-/// the right binary reads perfectly. Naming the constant here keeps the two ends
-/// of that comparison from drifting.
+/// Exported because recovery must tell it apart from real damage: damage means
+/// quarantine and carry on, a version mismatch means the wrong binary and
+/// refusing to start. Naming the constant keeps both ends of that comparison in
+/// step.
 pub const UNSUPPORTED_VERSION: &str = "unsupported format version";
 
 // ---------------------------------------------------------------------------
@@ -196,36 +191,29 @@ fn parse_common_header(buf: &[u8], needed: usize) -> DecodeResult<&[u8]> {
 /// Appends one frame to `out`.
 ///
 /// `out` is the caller's reusable buffer — the WAL writer's thread-local scratch
-/// or the client's batch buffer — so the steady-state path allocates only when
-/// that buffer grows.
+/// or the client's batch buffer — so the steady path allocates only as it grows.
 ///
-/// On any error `out` is restored to the length it had on entry. A half-written
-/// frame left in a WAL buffer would be indistinguishable from a real one to the
-/// next writer, so partial output is never an acceptable failure mode here.
+/// On any error `out` is restored to its entry length: a half-written frame in a
+/// WAL buffer is indistinguishable from a real one to the next writer.
 ///
-/// `extra` is sorted by `(name, value)` at encode time, and duplicate names are
-/// **collapsed, the first in that order winning** — matching how the flush
-/// resolves duplicate `(ts, id)`. Sorting by name alone would
-/// leave two pairs with equal names in input order, which is enough to make the
-/// same logical record encode to two different byte strings — and the
-/// byte-identical re-encode is what makes a crash-recovered flush reproducible.
+/// `extra` is sorted by `(name, value)` and duplicate names are **collapsed,
+/// first in that order winning** — the flush's rule for duplicate `(ts, id)`.
+/// Sorting by name alone would leave equal names in input order, enough to make
+/// one logical record encode two ways and break the byte-identical re-encode a
+/// replayed flush depends on.
 ///
-/// Collapsing rather than preserving is not about ingest being fussy: `extra`
-/// becomes a Parquet MAP, and a MAP with a repeated key is not a well-formed
-/// value. `extra['k']` has no answer, and DuckDB refuses the whole file rather
-/// than the one row — so one record with two `feed` entries would cost every
-/// reader every row in the file. There is no input-order "first" to keep once
-/// the pairs are sorted, so the rule is defined on the canonical order, which
-/// makes it reproducible.
+/// Collapsing is not fussiness: `extra` becomes a Parquet MAP, and a repeated key
+/// makes the MAP malformed — `extra['k']` has no answer and a reader rejects the
+/// whole file, so one record with two `feed` entries costs every reader every
+/// row. Defining the rule on the canonical order is what makes it reproducible.
 pub fn encode(out: &mut Vec<u8>, series: &str, epoch: u32, row: &Row) -> Result<()> {
     Encoder::default().encode(out, series, epoch, row)
 }
 
 /// A reusable encode-side scratch.
 ///
-/// The only allocation the frame layout forces is the ordering of `extra`, and
-/// this holds it across calls. It stores *indices*, not borrowed pairs, so the
-/// scratch outlives the rows it sorts without borrowing from any of them.
+/// Ordering `extra` is the only allocation the layout forces, and this holds it
+/// across calls. Indices, not borrowed pairs, so it outlives the rows it sorts.
 #[derive(Debug, Default)]
 pub struct Encoder {
     order: Vec<u32>,
@@ -317,13 +305,12 @@ impl Encoder {
 
 /// Already exactly what the encoder would produce: sorted by name, no duplicates.
 ///
-/// Strictly increasing rather than merely sorted, because equal names still need
-/// collapsing. Strictly increasing names imply sorted `(name, value)` pairs, so
-/// this is the full canonical-form check and not just half of it.
-///
-/// Shared with [`crate::flush::parquet::RowBuilder`], which has to collapse
-/// duplicates a second time for frames this encoder never saw. One definition of
-/// "canonical", so the two cannot come to disagree about what needs fixing.
+/// Strictly increasing, not merely sorted, because equal names still need
+/// collapsing — and strictly increasing names imply sorted `(name, value)`, so
+/// this is the whole check. Shared with
+/// [`crate::flush::parquet::RowBuilder`], which collapses duplicates again for
+/// frames this encoder never saw, so the two cannot disagree on what needs
+/// fixing.
 pub(crate) fn is_canonical(extra: &[(&str, &str)]) -> bool {
     extra.windows(2).all(|w| w[0].0 < w[1].0)
 }
@@ -354,12 +341,10 @@ fn put_str32(out: &mut Vec<u8>, s: &str) -> Result<()> {
 
 /// One positional key: its tag byte, then its value.
 ///
-/// `Value::Str` takes a `u32` length rather than the `u16` used for `extra`,
-/// deliberately. A declared key is a column value, not a label, and a `u16` here
-/// would put a 64 KiB cliff in the format that a `max_record_bytes` above 64 KiB
-/// could walk a caller off — an encodable record the config permits but the frame
-/// cannot represent. `extra` keeps its `u16` because the layout specifies it, and
-/// because labels that large are pathological by construction.
+/// `Value::Str` takes a `u32` length, not the `u16` `extra` uses. A declared key
+/// is a column value, not a label, and a `u16` would put a 64 KiB cliff in the
+/// format that any `max_record_bytes` above 64 KiB walks callers off — a record
+/// the config permits but the frame cannot represent.
 fn put_value(out: &mut Vec<u8>, v: Value<'_>) -> Result<()> {
     out.push(v.tag());
     match v {
@@ -392,17 +377,15 @@ pub struct Prefix<'a> {
 
 /// Verify a frame's integrity and read only its fixed prefix.
 ///
-/// This is the server's `append_raw` hot path. It checks `len` against
-/// `max_record_bytes` and verifies the CRC — so the frame is known to be intact
-/// and self-delimiting — then reads `ts`, `epoch`, `series` and `id` and stops.
-/// It never walks `keys`, `extra` or `data`, which is the whole point: those are
-/// variable-length and structurally rich, and validating them per record would
-/// put work on remote ingest that the hourly flush can do once, amortised.
+/// The server's `append_raw` hot path: check `len` against `max_record_bytes`,
+/// verify the CRC — so the frame is intact and self-delimiting — then read `ts`,
+/// `epoch`, `series`, `id` and stop. Never walks `keys`, `extra` or `data`, which
+/// is the point: validating those per record would put work on ingest that the
+/// hourly flush amortises.
 ///
-/// A frame that passes here can still fail [`decode`] later — a malformed `keys`
-/// section survives a correct CRC if it was encoded wrong in the first place.
-/// That is why the flush treats a decode failure as one rejected record rather
-/// than as an impossibility.
+/// So a frame that passes here can still fail [`decode`] — a malformed `keys`
+/// section survives a correct CRC. That is why the flush treats a decode failure
+/// as one rejected record rather than an impossibility.
 pub fn validate_prefix<'a>(buf: &'a [u8], max_record_bytes: usize) -> DecodeResult<Prefix<'a>> {
     let (payload, frame_len) = frame_payload(buf, max_record_bytes)?;
     let mut c = Cursor::new(payload);
@@ -419,19 +402,15 @@ pub fn validate_prefix<'a>(buf: &'a [u8], max_record_bytes: usize) -> DecodeResu
     })
 }
 
-/// Decode one frame from the front of `buf`.
+/// Decode one frame from the front of `buf`, returning it and the bytes consumed.
 ///
-/// `key_count` is the arity of the series' schema for this frame's epoch — see
-/// the module docs for why it comes from the caller. `keys` and `extra` are
-/// caller-owned scratch: they are cleared and refilled, so a decode loop
-/// allocates only until they reach their high-water mark. Their contents after
-/// an error are unspecified.
+/// `key_count` is the arity of the schema for this frame's epoch — see the module
+/// docs for why the caller supplies it. `keys` and `extra` are caller-owned
+/// scratch, cleared and refilled, so a decode loop allocates only up to their
+/// high-water mark; their contents after an error are unspecified.
 ///
-/// Returns the record and the number of bytes consumed.
-///
-/// The decoder allocates nothing itself. Every read is bounds-checked against the
-/// payload slice, which is why no input — however hostile — can make it panic or
-/// read past the buffer.
+/// The decoder allocates nothing itself and bounds-checks every read against the
+/// payload, so no input can make it panic or read past the buffer.
 pub fn decode<'a>(
     buf: &'a [u8],
     key_count: usize,
@@ -485,13 +464,12 @@ pub fn decode<'a>(
 /// Split `len` and `crc32` off the front of `buf`, returning the verified payload
 /// and the frame's total size.
 ///
-/// The order of checks here is the safety property, not an implementation
-/// detail. `len` is bounded against `max_record_bytes` **before** the buffer is
-/// consulted for that many bytes and before anything is reserved, so a corrupt
-/// four-byte length is rejected as corruption instead of becoming a demand for
-/// gigabytes. It is also why an over-large `len` is `Corrupt` rather than
-/// `Truncated`: "wait for more bytes" is exactly the wrong answer to a length
-/// the format can never produce.
+/// The order of checks is the safety property. `len` is bounded against
+/// `max_record_bytes` **before** the buffer is consulted for that many bytes and
+/// before anything is reserved, so a corrupt length is corruption rather than a
+/// demand for gigabytes — and why an over-large `len` is `Corrupt`, not
+/// `Truncated`: "wait for more bytes" is the wrong answer to a length the format
+/// can never produce.
 fn frame_payload(buf: &[u8], max_record_bytes: usize) -> DecodeResult<(&[u8], usize)> {
     if buf.len() < FRAME_HEADER_BYTES {
         return Err(DecodeError::Truncated {
@@ -530,9 +508,8 @@ fn frame_payload(buf: &[u8], max_record_bytes: usize) -> DecodeResult<(&[u8], us
 /// A bounds-checked forward reader over one frame's payload.
 ///
 /// Every overrun is [`DecodeError::Corrupt`], never `Truncated`: the payload is
-/// exactly as long as the frame said and the CRC has already agreed, so running
-/// out of bytes inside it means the contents contradict the length — a short
-/// *buffer* was ruled out before this cursor existed.
+/// exactly as long as the frame said and the CRC agreed, so running out of bytes
+/// inside it means the contents contradict the length.
 #[derive(Debug)]
 struct Cursor<'a> {
     buf: &'a [u8],

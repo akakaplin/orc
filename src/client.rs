@@ -4,10 +4,10 @@
 //! Encodes with the same [`crate::codec`] the WAL uses, so the server appends
 //! the bytes it receives without transcoding.
 //!
-//! **Ingest is fire-and-forget.** A successful `send` means the bytes reached
-//! the local ZeroMQ queue, not that they are durable. Backpressure still works:
+//! **Ingest is fire-and-forget.** A successful `send` means the bytes reached the
+//! local ZeroMQ queue, not that they are durable. Backpressure still works:
 //! [`OnFull::Block`] is libzmq's behaviour at the send high-water mark, so a
-//! saturated server slows producers instead of dropping silently.
+//! saturated server slows producers rather than dropping silently.
 
 use std::collections::HashMap;
 
@@ -29,10 +29,9 @@ pub enum OnFull {
 
 /// A series resolved against the server's schema.
 ///
-/// Holds the epoch to stamp and the key order to encode against, both fixed at
-/// handshake time. If the server's config changes afterwards this handle keeps
-/// encoding under its original epoch — which is safe, because every frame
-/// declares the epoch it was built with and the server decodes it accordingly.
+/// Epoch and key order are fixed at handshake time. If the server's config
+/// changes afterwards this keeps encoding under its original epoch, which is
+/// safe: every frame declares the epoch it was built with.
 #[derive(Debug, Clone)]
 pub struct RemoteSeries {
     name: String,
@@ -83,13 +82,12 @@ impl Default for ClientBuilder {
             sndhwm: 100_000,
             // A fallback: the handshake replaces it with the server's own.
             max_batch_bytes: crate::config::DEFAULT_MAX_BATCH_BYTES as usize,
-            // Non-zero so a clean exit flushes rather than discarding whatever
+            // Non-zero so a clean exit flushes rather than discarding what
             // libzmq still holds. Zero here is a classic silent-loss bug.
             linger_ms: 2_000,
             on_full: OnFull::Block,
-            // Fine for ping, stats and the schema handshake. Not for `Flush`,
-            // which is synchronous and proportional to the backlog -- see
-            // [`Client::control`], which raises it for that one request.
+            // Fine for ping, stats and the handshake. Not for `Flush`, which is
+            // synchronous and proportional to the backlog -- `control` raises it.
             control_timeout_ms: 5_000,
         }
     }
@@ -124,9 +122,8 @@ impl ClientBuilder {
     }
     /// How long to wait for a control reply. Defaults to 5s.
     ///
-    /// Does not apply to `Flush`, which the server handles synchronously over
-    /// however much WAL has accumulated; [`Client::control`] gives that one its
-    /// own, much longer bound.
+    /// Not for `Flush`, which the server handles synchronously over however much
+    /// WAL has accumulated; [`Client::control`] gives that its own bound.
     pub fn control_timeout_ms(mut self, ms: i32) -> Self {
         self.control_timeout_ms = ms;
         self
@@ -161,13 +158,12 @@ impl ClientBuilder {
         // turns "the server is down" into "my process is wedged".
         req.set_rcvtimeo(self.control_timeout_ms).map_err(zmq_err)?;
         req.set_sndtimeo(self.control_timeout_ms).map_err(zmq_err)?;
-        // A plain REQ socket is a strict send/recv state machine, so a timed-out
-        // `recv` leaves it still expecting a reply and every later `send` fails
-        // with EFSM -- permanently, with no way to reset it. One slow flush would
-        // brick the socket for the life of the process. RELAXED lets a new
-        // request replace the abandoned one; CORRELATE is what makes that safe,
-        // by tagging replies so a late one from the abandoned request is
-        // discarded instead of being read as the answer to the new one.
+        // A plain REQ socket is a strict send/recv state machine: a timed-out
+        // `recv` leaves it expecting a reply, and every later `send` fails with
+        // EFSM permanently -- one slow flush bricks the socket for the life of
+        // the process. RELAXED lets a new request replace the abandoned one;
+        // CORRELATE makes that safe by tagging replies, so a late one is
+        // discarded rather than read as the answer to the new request.
         req.set_req_relaxed(true).map_err(zmq_err)?;
         req.set_req_correlate(true).map_err(zmq_err)?;
         req.connect(&control_endpoint)
@@ -196,9 +192,9 @@ fn zmq_err(e: zmq::Error) -> Error {
     Error::Config(format!("zeromq: {e}"))
 }
 
-/// Receive timeout for a `Flush`, which the server answers only once the whole
-/// backlog is on disk. Ten minutes: long enough for a real hour of WAL, short
-/// enough that a genuinely wedged server is still eventually reported.
+/// Receive timeout for a `Flush`, answered only once the whole backlog is on
+/// disk. Ten minutes: long enough for a real hour of WAL, short enough that a
+/// wedged server is still eventually reported.
 const FLUSH_TIMEOUT_MS: i32 = 600_000;
 
 /// `tcp://host:5555` -> `tcp://host:5556`, matching the server's defaults.
@@ -213,9 +209,8 @@ fn default_control_endpoint(ingest: &str) -> Result<String> {
             "cannot derive a control endpoint from {ingest:?}; pass one explicitly"
         ))
     })?;
-    // 65535 has no successor. Unchecked, that is a panic in a debug build and a
-    // silent `:0` in release -- which connects nowhere and reports it as
-    // something else entirely.
+    // 65535 has no successor: unchecked, a debug panic and a silent `:0` in
+    // release, which connects nowhere and says nothing about why.
     let control = port.checked_add(1).ok_or_else(|| {
         Error::Config(format!(
             "cannot derive a control endpoint from {ingest:?}: port {port} has no successor; \
@@ -263,7 +258,7 @@ impl Client {
     /// Ask the server for every series' epoch and key order.
     ///
     /// Required before anything can be encoded: keys travel positionally, so
-    /// without the declared order the client cannot build a frame at all.
+    /// without the declared order there is no frame to build.
     pub fn refresh_schema(&mut self) -> Result<()> {
         match self.control(ControlRequest::Schema)? {
             ControlResponse::Schema {
@@ -295,11 +290,9 @@ impl Client {
 
     /// Send a control request and wait for the reply.
     ///
-    /// `Flush` gets its own receive timeout. The server runs it synchronously —
-    /// decoding, sorting and writing Parquet for every pending segment before it
-    /// replies — so the time it takes is proportional to the backlog, and the
-    /// default control timeout would give up on a flush that is working fine and
-    /// report it as a failure while the server went on to complete it.
+    /// `Flush` gets its own receive timeout: the server runs it synchronously, so
+    /// it takes as long as the backlog does, and the default would report a
+    /// working flush as a failure while the server went on to finish it.
     pub fn control(&self, req: ControlRequest) -> Result<ControlResponse> {
         let slow = matches!(req, ControlRequest::Flush);
         if slow {
@@ -439,10 +432,9 @@ impl Client {
 }
 
 impl Drop for Client {
-    /// Flush what is buffered before the socket goes away.
-    ///
-    /// Without this, a clean exit would silently discard a partial batch — the
-    /// most surprising possible loss, because nothing went wrong.
+    /// Flush what is buffered before the socket goes away — otherwise a clean
+    /// exit silently discards a partial batch, the most surprising possible loss
+    /// because nothing went wrong.
     fn drop(&mut self) {
         if self.pending > 0
             && let Err(e) = self.flush()
