@@ -4,17 +4,6 @@
 //! Encodes with the same [`crate::codec`] the WAL uses, so the server appends
 //! the bytes it receives without transcoding.
 //!
-//! ```ignore
-//! let mut client = Client::builder()
-//!     .ingest("tcp://host:5555")
-//!     .control("tcp://host:5556")
-//!     .batch(1024)
-//!     .connect()?;
-//! let trades = client.series("trades")?;
-//! client.send(&trades, &row)?;
-//! client.flush()?;
-//! ```
-//!
 //! **Ingest is fire-and-forget.** A successful `send` means the bytes reached
 //! the local ZeroMQ queue, not that they are durable. Backpressure still works:
 //! [`OnFull::Block`] is libzmq's behaviour at the send high-water mark, so a

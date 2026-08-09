@@ -3,11 +3,6 @@
 //! The whole point of sharing [`crate::codec`] with the client is visible here:
 //! a received batch is already in WAL frame format, so it is validated and
 //! copied straight in. A batch crosses the process boundary exactly once.
-//!
-//! ```ignore
-//! let server = Server::bind(engine, &config)?;
-//! server.run()?;   // until a Shutdown control request
-//! ```
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};

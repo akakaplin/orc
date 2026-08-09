@@ -42,16 +42,8 @@
 //! A frame stores key *values* with no count: the arity comes from the series'
 //! schema for the frame's `epoch`, which the frame names. So [`decode`] takes the
 //! expected key count from the caller, and the caller learns which schema to ask
-//! for by reading the cheap fixed prefix first:
-//!
-//! ```ignore
-//! while !rest.is_empty() {
-//!     let p = codec::validate_prefix(rest, max_record_bytes)?;   // ts, epoch, series, id
-//!     let n = schema_history.key_count(p.series, p.epoch)?;      // caller's lookup
-//!     let (rec, used) = codec::decode(rest, n, max_record_bytes, &mut keys, &mut extra)?;
-//!     rest = &rest[used..];
-//! }
-//! ```
+//! for by reading the cheap fixed prefix first: `validate_prefix` yields the
+//! series and epoch, the caller maps those to an arity, and `decode` takes it.
 //!
 //! The alternative — storing a key count in every frame — would let a decoder
 //! walk a frame with no schema at all, but it would also make the count a second

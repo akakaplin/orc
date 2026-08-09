@@ -2,12 +2,6 @@
 //!
 //! Wires the pieces together and owns the two things a caller must not have to
 //! think about — validation on the way in, and durability behind the scenes.
-//!
-//! ```ignore
-//! let engine = Engine::open(Config::load("./data/config.json")?)?;
-//! let trades = engine.series("trades")?;
-//! engine.append(&trades, &Row { ts, id, keys, extra, data })?;
-//! ```
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};

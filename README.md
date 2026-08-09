@@ -217,6 +217,4 @@ cargo fmt --all --check
 ./scripts/check-deps.sh                        # dependency budget
 ```
 
-Reader-compatibility tests shell out to a real `duckdb` binary and skip when it is absent. Set `ORC_REQUIRE_DUCKDB=1` to make a missing binary a failure instead.
-
 Toolchain: Rust 1.91, edition 2024. The first `--features net` build compiles libzmq from source, so it takes noticeably longer than later ones.

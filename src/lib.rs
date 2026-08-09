@@ -5,18 +5,6 @@
 //! directly. The engine is write-only: it owns the write path and leaves reading
 //! to those tools.
 //!
-//! ```ignore
-//! let engine = Engine::open(Config::load("./data/config.json")?)?;
-//! let trades = engine.series("trades")?;
-//! engine.append(trades, &Row {
-//!     ts:    1_786_147_200_000_000, // epoch microseconds, UTC
-//!     id:    "itch-8841203",        // (ts, id) is the dedup key; may be ""
-//!     keys:  &[Value::Str("AAPL"), Value::Str("XNAS")],
-//!     extra: &[("feed", "itch")],
-//!     data:  r#"{"px":193.4}"#,
-//! })?;
-//! ```
-//!
 //! Two invariants carry most of the design:
 //!
 //! - **Every frame is self-describing.** It names its own series and its own
