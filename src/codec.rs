@@ -11,7 +11,7 @@
 //! frame (identical in both):
 //!   len    u32   payload byte length -- everything after the crc field
 //!   crc32  u32   over len + payload
-//!   ts     i64   epoch microseconds, UTC
+//!   ts     u64   epoch microseconds, UTC
 //!   epoch  u32   the series' schema epoch, as of encoding
 //!   series u16 len + UTF-8 bytes
 //!   id     u16 len + UTF-8 bytes (may be zero-length)
@@ -385,7 +385,7 @@ fn put_value(out: &mut Vec<u8>, v: Value<'_>) -> Result<()> {
 /// The fixed prefix of a frame, plus how far the frame extends.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Prefix<'a> {
-    pub ts: i64,
+    pub ts: u64,
     pub epoch: u32,
     pub series: &'a str,
     pub id: &'a str,
@@ -410,7 +410,7 @@ pub struct Prefix<'a> {
 pub fn validate_prefix<'a>(buf: &'a [u8], max_record_bytes: usize) -> DecodeResult<Prefix<'a>> {
     let (payload, frame_len) = frame_payload(buf, max_record_bytes)?;
     let mut c = Cursor::new(payload);
-    let ts = c.i64()?;
+    let ts = c.u64()?;
     let epoch = c.u32()?;
     let series = c.str16()?;
     let id = c.str16()?;
@@ -448,7 +448,7 @@ pub fn decode<'a>(
     extra.clear();
 
     let mut c = Cursor::new(payload);
-    let ts = c.i64()?;
+    let ts = c.u64()?;
     let epoch = c.u32()?;
     let series = c.str16()?;
     let id = c.str16()?;
@@ -583,6 +583,10 @@ impl<'a> Cursor<'a> {
         Ok(i64::from_le_bytes(self.take(8)?.try_into().unwrap()))
     }
 
+    fn u64(&mut self) -> DecodeResult<u64> {
+        Ok(u64::from_le_bytes(self.take(8)?.try_into().unwrap()))
+    }
+
     fn str16(&mut self) -> DecodeResult<&'a str> {
         let n = self.u16()? as usize;
         self.utf8(n)
@@ -632,7 +636,7 @@ mod tests {
     }
 
     fn row<'a>(
-        ts: i64,
+        ts: u64,
         id: &'a str,
         keys: &'a [Value<'a>],
         extra: &'a [(&'a str, &'a str)],
@@ -990,7 +994,7 @@ mod tests {
     struct Case {
         series: &'static str,
         epoch: u32,
-        ts: i64,
+        ts: u64,
         id: &'static str,
         keys: Vec<Value<'static>>,
         extra: Vec<(&'static str, &'static str)>,
@@ -1031,7 +1035,10 @@ mod tests {
             Case {
                 series: "unicode-✓",
                 epoch: u32::MAX,
-                ts: i64::MIN,
+                // The extreme of the `ts` field's range. The codec carries eight
+                // bytes and asks no questions; the accept window is what decides
+                // which of them are plausible.
+                ts: u64::MAX,
                 id: "ünïcödé id",
                 keys: vec![
                     Value::Str(""),

@@ -15,8 +15,8 @@ use orc::record::{Row, Value};
 
 /// Epoch microseconds for 2026-08-08T13:00:00Z, inside the default accept
 /// window (which starts at 2000-01-01 and ends 24h after now).
-const T13: i64 = 1_786_194_000_000_000;
-const HOUR_US: i64 = 3_600_000_000;
+const T13: u64 = 1_786_194_000_000_000;
+const HOUR_US: u64 = 3_600_000_000;
 
 fn config_json(dir: &Path) -> String {
     // `interval_ms: 0` disables the flush timer, so every test below controls
@@ -42,7 +42,7 @@ fn open(dir: &Path) -> Engine {
     Engine::open(config).expect("engine opens")
 }
 
-fn push(engine: &Engine, series: &orc::config::SeriesHandle, ts: i64, id: &str) {
+fn push(engine: &Engine, series: &orc::config::SeriesHandle, ts: u64, id: &str) {
     engine
         .append(
             series,
@@ -99,7 +99,7 @@ fn append_flush_and_read_back() {
                 &Row {
                     ts: T13 + i,
                     id: &format!("id-{i}"),
-                    keys: &[Value::Str("AAPL"), Value::I64(i)],
+                    keys: &[Value::Str("AAPL"), Value::I64(i as i64)],
                     extra: &[("feed", "itch")],
                     data: r#"{"px":1.0}"#,
                 },
@@ -158,7 +158,7 @@ fn duplicates_collapse_and_hours_split() {
     let engine = open(dir.path());
     let trades = engine.series("trades").unwrap();
 
-    let push = |ts: i64, id: &str| {
+    let push = |ts: u64, id: &str| {
         engine
             .append(
                 &trades,
@@ -194,7 +194,7 @@ fn bad_timestamps_are_rejected_with_their_units_named() {
     let engine = open(dir.path());
     let trades = engine.series("trades").unwrap();
 
-    let attempt = |ts: i64| {
+    let attempt = |ts: u64| {
         engine.append(
             &trades,
             &Row {

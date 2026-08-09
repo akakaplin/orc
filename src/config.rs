@@ -83,7 +83,11 @@ pub struct LimitsConfig {
     /// [`LimitsConfig::ts_min_us`].
     pub ts_min: String,
     /// How far past `now` a timestamp may be before it is rejected.
-    pub ts_max_skew_ms: i64,
+    ///
+    /// Unsigned, so "past" cannot accidentally mean "before": a negative value
+    /// used to move the window's *upper* bound into the past and reject every
+    /// live record, which is now a parse error rather than a validation rule.
+    pub ts_max_skew_ms: u64,
     /// The one exception to "`serde_json` is never on the ingest path". Off by
     /// default because it costs latency on every record.
     pub validate_json: bool,
@@ -91,7 +95,7 @@ pub struct LimitsConfig {
     /// Cache for [`LimitsConfig::ts_min_us`]. Not serialized: it is derived
     /// from `ts_min`, and a second copy in the file could disagree with it.
     #[serde(skip)]
-    ts_min_us: OnceLock<i64>,
+    ts_min_us: OnceLock<u64>,
 }
 
 /// Write-ahead log durability and rolling.
@@ -250,7 +254,7 @@ impl LimitsConfig {
     /// would put a string parse on the hot path for a value that never changes.
     /// [`Config::validate`] calls this, so a validated config has already paid
     /// the parse.
-    pub fn ts_min_us(&self) -> Result<i64> {
+    pub fn ts_min_us(&self) -> Result<u64> {
         if let Some(us) = self.ts_min_us.get() {
             return Ok(*us);
         }
@@ -311,16 +315,8 @@ impl Config {
                 self.flush.interval_ms, MAX_FLUSH_INTERVAL_MS
             ));
         }
-        // Negative skew would move the accept window's *upper* bound into the
-        // past, so every live record fails `check_ts` -- a total ingest outage
-        // from a config field documented as "how far past `now`".
-        if self.limits.ts_max_skew_ms < 0 {
-            return bad(format!(
-                "limits.ts_max_skew_ms must not be negative (got {}); it is how far \
-                 past `now` a timestamp may be, so a negative value rejects all live data",
-                self.limits.ts_max_skew_ms
-            ));
-        }
+        // `limits.ts_max_skew_ms` needs no check: it is a `u64`, so the negative
+        // value that used to invert the accept window is a parse error now.
         if self.server.max_batch_bytes <= 0 {
             return bad(format!(
                 "server.max_batch_bytes must be greater than 0 (got {})",
@@ -712,6 +708,9 @@ mod tests {
                 r#"{"series":[{"name":"a","keys":[{"name":"k"}]}]}"#,
             ),
             (
+                // A `u64` field, so this is refused by the parser rather than
+                // by a validation rule -- but refused either way, which is what
+                // the caller cares about.
                 "negative ts_max_skew_ms",
                 r#"{"limits":{"ts_max_skew_ms":-1},"series":[]}"#,
             ),

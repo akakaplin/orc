@@ -26,12 +26,13 @@ use crate::wal::recovery::{self, DirLock};
 use crate::wal::writer::{WalOptions, WalWriter};
 
 /// Wall clock in epoch microseconds.
-fn now_us() -> i64 {
+fn now_us() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_micros() as i64)
-        // A clock before 1970 is not something to panic over; the accept window
-        // below will reject records against it and say so.
+        .map(|d| d.as_micros() as u64)
+        // A clock before 1970 is not something to panic over. It reads as 0,
+        // which is below any `ts_min`, and `ts_upper_bound` responds by
+        // suspending the window's upper bound until the clock is set.
         .unwrap_or(0)
 }
 
@@ -118,8 +119,8 @@ struct Inner {
     /// never overlap the next one.
     flush_lock: Mutex<()>,
     counters: Counters,
-    ts_min: i64,
-    ts_max_skew_us: i64,
+    ts_min: u64,
+    ts_max_skew_us: u64,
     /// Set by `close` to stop the flush timer. Paired with `wake` so shutdown
     /// does not wait out an hour-long interval.
     stop: Mutex<bool>,
@@ -319,13 +320,11 @@ fn flusher(inner: Arc<Inner>, interval: Duration) {
 
 impl Inner {
     fn flush_overdue(&self) -> bool {
-        // Saturating into i64, not `as i64`: `saturating_mul` saturates at
-        // `u64::MAX`, which `as` then wraps to -1 -- and "elapsed >= -1" is
-        // always true, so an absurd interval would mean "always overdue", the
-        // exact inverse of what it says. `Config::validate` bounds the value
-        // too; this makes the conversion safe on its own.
-        let interval =
-            i64::try_from(self.config.flush.interval_ms.saturating_mul(1_000)).unwrap_or(i64::MAX);
+        // No conversion: both sides are u64 microseconds. This used to cast a
+        // saturated u64 to i64, which wrapped to -1 -- and "elapsed >= -1" is
+        // always true, so an absurd interval meant "always overdue", the exact
+        // inverse of what it says.
+        let interval = self.config.flush.interval_ms.saturating_mul(1_000);
         match self.manifest.lock().ok().and_then(|m| m.last_flush_at) {
             // Never flushed: any pending segment is already overdue.
             None => true,
@@ -346,7 +345,7 @@ impl Inner {
     /// Suspended when the host clock reads before `ts_min`, which is the state a
     /// device that boots with an unset clock is in. Rejecting everything until
     /// NTP lands would be the worse failure.
-    fn ts_upper_bound(&self) -> Option<i64> {
+    fn ts_upper_bound(&self) -> Option<u64> {
         let now = now_us();
         if now < self.ts_min {
             None
@@ -355,14 +354,14 @@ impl Inner {
         }
     }
 
-    fn check_ts(&self, ts: i64) -> Result<()> {
+    fn check_ts(&self, ts: u64) -> Result<()> {
         let max = self.ts_upper_bound();
         if ts < self.ts_min || max.is_some_and(|m| ts > m) {
             self.counters.rejected_ts.fetch_add(1, Ordering::Relaxed);
             return Err(Error::TsOutOfRange {
                 ts,
                 min: self.ts_min,
-                max: max.unwrap_or(i64::MAX),
+                max: max.unwrap_or(u64::MAX),
             });
         }
         Ok(())

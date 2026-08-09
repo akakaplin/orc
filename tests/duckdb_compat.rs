@@ -19,8 +19,8 @@ use orc::config::Config;
 use orc::engine::Engine;
 use orc::record::{Row, Value};
 
-const T13: i64 = 1_786_194_000_000_000;
-const HOUR_US: i64 = 3_600_000_000;
+const T13: u64 = 1_786_194_000_000_000;
+const HOUR_US: u64 = 3_600_000_000;
 
 /// Whether to run, and whether a missing binary is fatal.
 ///
@@ -271,7 +271,7 @@ fn a_promoted_typed_key_still_compares_as_its_declared_type() {
                 .append(
                     &trades,
                     &Row {
-                        ts: T13 + i as i64,
+                        ts: T13 + i as u64,
                         id: &format!("e0-{i}"),
                         keys: &[Value::Str("AAPL")],
                         extra: &[("size", size)],

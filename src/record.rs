@@ -69,7 +69,12 @@ impl Value<'_> {
 #[derive(Debug, Clone, Copy)]
 pub struct Row<'a> {
     /// Epoch **microseconds**, UTC. Validated against the accept window.
-    pub ts: i64,
+    ///
+    /// Unsigned: the accept window starts in 2000 by default and can never
+    /// start before 1970, so a pre-epoch timestamp was never a value the engine
+    /// would store. Making that unrepresentable removes the sign handling from
+    /// every date calculation downstream rather than testing for it repeatedly.
+    pub ts: u64,
     /// Dedup key together with `ts`. May be empty.
     pub id: &'a str,
     /// Values for the declared key columns, in declaration order.
@@ -87,7 +92,7 @@ pub struct Row<'a> {
 /// vectors reach their high-water mark.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct RecordRef<'a> {
-    pub ts: i64,
+    pub ts: u64,
     /// The series' schema epoch this frame was encoded under.
     pub epoch: u32,
     pub series: &'a str,

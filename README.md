@@ -62,7 +62,7 @@ Nothing stops one process being both: embed the engine, and bind a server to it 
 
 | Field         | Type                              | Required   | Notes                                        |
 | ------------- | --------------------------------- | ---------- | -------------------------------------------- |
-| `ts`          | `i64` epoch **microseconds**, UTC | yes        | The sort key.                                |
+| `ts`          | `u64` epoch **microseconds**, UTC | yes        | The sort key. Unsigned — nothing before 1970. |
 | `id`          | UTF-8 text                        | no         | `(ts, id)` is the dedup key. May be empty.   |
 | `series`      | UTF-8 name                        | yes        | Must exist in `config.json`.                 |
 | declared keys | typed, positional                 | per config | Real Parquet columns.                        |
@@ -148,6 +148,7 @@ A few constraints are worth knowing before you hit them, all checked at load:
 
 - **`flush.interval_ms: 0` disables the timer**, leaving flushing entirely to explicit `Engine::flush()` calls and the control socket. Any other value spawns a background thread that flushes on that period. The WAL is not capped, so turning the timer off means owning the schedule yourself.
 - **A declared key may not be named `ts`, `id`, `extra` or `data`.** Every Parquet file already has those columns, and Parquet does not object to a duplicate field name — the resulting file reads back wrong rather than failing.
+- **`limits.ts_min` must be 1970 or later.** Timestamps are unsigned, so there is nothing before the epoch to represent.
 - **`server.max_batch_bytes` caps one ingest message.** `limits.max_record_bytes` bounds a single record; without this, nothing bounds the batch carrying them.
 
 **Endpoints default to loopback deliberately.** There is no authentication on the ingest socket — anything that can reach it can write records and consume disk. Before binding a real interface, put it on a private network or enable libzmq's built-in CURVE encryption and authentication.

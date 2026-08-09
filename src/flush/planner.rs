@@ -79,7 +79,7 @@ pub const REJECT_EXT: &str = "rej";
 pub const VIEW_FILE: &str = "view.sql";
 
 /// Microseconds in an hour — the width of one `hour=` partition.
-const US_PER_HOUR: i64 = 3_600_000_000;
+const US_PER_HOUR: u64 = 3_600_000_000;
 
 /// `<data_dir>/series/<name>`.
 pub fn series_dir(data_dir: impl AsRef<Path>, series: &str) -> PathBuf {
@@ -236,9 +236,9 @@ pub fn run(
         // two partitions, and every file is non-decreasing in `ts`.
         let mut start = 0;
         while start < rows.len() {
-            let bucket = rows[start].ts.div_euclid(US_PER_HOUR);
+            let bucket = rows[start].ts / US_PER_HOUR;
             let mut end = start + 1;
-            while end < rows.len() && rows[end].ts.div_euclid(US_PER_HOUR) == bucket {
+            while end < rows.len() && rows[end].ts / US_PER_HOUR == bucket {
                 end += 1;
             }
             outcome.files_written.push(sink.write_partition(
@@ -281,7 +281,7 @@ pub fn run(
 /// One row, still borrowing its strings from the segment it was decoded out of.
 #[derive(Debug)]
 struct DecodedRow<'a> {
-    ts: i64,
+    ts: u64,
     id: &'a str,
     keys: Vec<Value<'a>>,
     extra: Vec<(&'a str, &'a str)>,
@@ -685,11 +685,13 @@ fn regenerate_views(data_dir: &Path, manifest: &Manifest, series: &BTreeSet<&str
 /// Now, in epoch microseconds. Saturating rather than panicking: a wall clock
 /// far enough out of range to overflow is a reason to record an odd
 /// `last_flush_at`, not to fail a flush that has already written its data.
-fn now_us() -> i64 {
-    match SystemTime::now().duration_since(UNIX_EPOCH) {
-        Ok(d) => i64::try_from(d.as_micros()).unwrap_or(i64::MAX),
-        Err(e) => i64::try_from(e.duration().as_micros()).map_or(i64::MIN, |us| -us),
-    }
+///
+/// A clock reading before 1970 collapses to 0, which `flush_overdue` reads as
+/// "flushed at the epoch" and therefore always overdue — the safe direction.
+fn now_us() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_micros()).unwrap_or(u64::MAX))
 }
 
 // ---------------------------------------------------------------------------
@@ -783,7 +785,7 @@ mod tests {
     use crate::wal::FIRST_SEGMENT;
 
     /// 2026-08-08T13:00:00Z, the start of an hour.
-    const T13: i64 = 1_786_194_000_000_000;
+    const T13: u64 = 1_786_194_000_000_000;
 
     fn key(name: &str) -> KeyDef {
         KeyDef {
@@ -818,12 +820,12 @@ mod tests {
     struct Rec {
         series: &'static str,
         epoch: u32,
-        ts: i64,
+        ts: u64,
         id: &'static str,
         keys: Vec<Value<'static>>,
     }
 
-    fn rec(ts: i64, id: &'static str) -> Rec {
+    fn rec(ts: u64, id: &'static str) -> Rec {
         Rec {
             series: "trades",
             epoch: 0,
@@ -879,7 +881,7 @@ mod tests {
     }
 
     /// `(ts, id)` of every row in a Parquet file, in file order.
-    fn read_rows(path: &Path) -> Vec<(i64, String)> {
+    fn read_rows(path: &Path) -> Vec<(u64, String)> {
         crate::flush::read::read_ts_id(path).unwrap()
     }
 

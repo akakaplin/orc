@@ -59,7 +59,7 @@ pub struct Manifest {
     /// on an engine that restarts every few minutes, a timer reset on every
     /// start would mean the hourly flush never fires. `None` means "never
     /// flushed", which makes the first startup flush unconditional.
-    pub last_flush_at: Option<i64>,
+    pub last_flush_at: Option<u64>,
 }
 
 impl Manifest {
@@ -515,7 +515,7 @@ mod tests {
         Manifest::default().commit(dir.path()).unwrap();
         let second = Manifest {
             last_flushed_segment: 3,
-            last_flush_at: Some(-1),
+            last_flush_at: Some(1),
             ..Manifest::default()
         };
         second.commit(dir.path()).unwrap();

@@ -18,7 +18,7 @@ use orc::protocol::{ControlRequest, ControlResponse};
 use orc::record::{Row, Value};
 use orc::server::Server;
 
-const T13: i64 = 1_786_194_000_000_000;
+const T13: u64 = 1_786_194_000_000_000;
 
 fn config_json(dir: &Path) -> String {
     format!(
@@ -138,7 +138,7 @@ fn records_sent_over_the_wire_reach_parquet() {
                 &Row {
                     ts: T13 + i,
                     id: &format!("w-{i}"),
-                    keys: &[Value::Str("AAPL"), Value::I64(i)],
+                    keys: &[Value::Str("AAPL"), Value::I64(i as i64)],
                     extra: &[("feed", "itch")],
                     data: r#"{"px":1.5}"#,
                 },

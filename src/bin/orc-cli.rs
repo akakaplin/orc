@@ -152,7 +152,7 @@ fn send(client: &mut Client, series_name: &str) -> orc::Result<()> {
 
 #[derive(serde::Deserialize)]
 struct JsonRecord {
-    ts: i64,
+    ts: u64,
     #[serde(default)]
     id: String,
     #[serde(default)]

@@ -346,7 +346,7 @@ impl RowBuilder {
     /// short row.
     pub fn append(
         &mut self,
-        ts: i64,
+        ts: u64,
         id: &str,
         keys: &[Value<'_>],
         extra: &[(&str, &str)],
@@ -360,6 +360,18 @@ impl RowBuilder {
                 got: keys.len(),
             });
         }
+        // The one place the engine's unsigned `ts` has to narrow: Parquet's
+        // TIMESTAMP(MICROS) is a signed INT64, so the top half of the u64 range
+        // has no representation. The accept window puts every real timestamp
+        // eleven orders of magnitude below the boundary -- year 294247 -- so
+        // this is unreachable through `append`, and an error rather than a
+        // silent wrap for the callers that reach the builder directly.
+        let ts = i64::try_from(ts).map_err(|_| {
+            Error::Config(format!(
+                "ts {ts} is past the largest instant Parquet can record \
+                 (TIMESTAMP(MICROS) is a signed INT64)"
+            ))
+        })?;
         c.ts.push(ts);
         c.id.push(ByteArray::from(id.as_bytes().to_vec()));
         for (i, (column, value)) in std::iter::zip(&mut c.keys, keys).enumerate() {
@@ -871,7 +883,7 @@ mod tests {
         // Map cardinality cycles 0..3 so every possible offset within a row's
         // list of entries coincides with a group boundary somewhere.
         let mut expected: Vec<Vec<(String, String)>> = Vec::new();
-        for i in 0..40i64 {
+        for i in 0..40u64 {
             let pairs: Vec<(String, String)> = (0..(i % 4))
                 .map(|j| (format!("k{j}"), format!("v{i}-{j}")))
                 .collect();
@@ -894,7 +906,7 @@ mod tests {
         let rows = read_file(&path).unwrap();
         assert_eq!(rows.len(), 40);
         for (i, (row, want)) in std::iter::zip(&rows, &expected).enumerate() {
-            assert_eq!(row.ts, i as i64);
+            assert_eq!(row.ts, i as u64);
             assert_eq!(row.id, format!("id{i}"));
             assert_eq!(&row.extra, want, "row {i} map entries");
         }
@@ -908,13 +920,13 @@ mod tests {
         let path = dir.path().join("nulls.parquet");
         let keys = vec![keydef("a", KeyType::I64), keydef("b", KeyType::Str)];
         let mut b = RowBuilder::new("s", &keys, 30).unwrap();
-        for i in 0..30i64 {
+        for i in 0..30u64 {
             // Two columns with different null patterns, so a shared cursor or an
             // off-by-one in either would shift values onto the wrong rows.
             let a = if i % 3 == 0 {
                 Value::Null
             } else {
-                Value::I64(i)
+                Value::I64(i as i64)
             };
             let owned = format!("s{i}");
             let s = if i % 2 == 0 {

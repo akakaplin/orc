@@ -29,7 +29,10 @@ fn read_err(path: &Path, e: parquet::errors::ParquetError) -> Error {
 /// is positional, matching the series' declared key order.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReadRow {
-    pub ts: i64,
+    /// Unsigned, matching the engine's own `ts`. Parquet stores it signed, so
+    /// this narrows in the other direction — a negative value means the file was
+    /// not written by this engine.
+    pub ts: u64,
     pub id: String,
     pub keys: Vec<Option<String>>,
     /// Map entries in the order the file stores them.
@@ -67,11 +70,12 @@ fn field_text(f: &Field) -> Option<String> {
 
 /// The `ts` column, whose logical type makes the record reader hand back a
 /// timestamp rather than a plain i64.
-fn field_ts(f: &Field) -> Result<i64> {
-    match f {
-        Field::TimestampMicros(v) | Field::Long(v) => Ok(*v),
-        other => Err(Error::Config(format!("ts is not an integer: {other}"))),
-    }
+fn field_ts(f: &Field) -> Result<u64> {
+    let raw = match f {
+        Field::TimestampMicros(v) | Field::Long(v) => *v,
+        other => return Err(Error::Config(format!("ts is not an integer: {other}"))),
+    };
+    u64::try_from(raw).map_err(|_| Error::Config(format!("ts {raw} is before the epoch")))
 }
 
 fn row_from(row: &ParquetRow) -> Result<ReadRow> {
@@ -167,6 +171,6 @@ pub fn read_metadata(path: &Path) -> Result<FileMeta> {
 }
 
 /// `(ts, id)` of every row — the pair the flush sorts and deduplicates on.
-pub fn read_ts_id(path: &Path) -> Result<Vec<(i64, String)>> {
+pub fn read_ts_id(path: &Path) -> Result<Vec<(u64, String)>> {
     Ok(read_file(path)?.into_iter().map(|r| (r.ts, r.id)).collect())
 }

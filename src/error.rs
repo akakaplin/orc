@@ -33,9 +33,9 @@ pub enum Error {
     },
 
     TsOutOfRange {
-        ts: i64,
-        min: i64,
-        max: i64,
+        ts: u64,
+        min: u64,
+        max: u64,
     },
 
     RecordTooLarge {

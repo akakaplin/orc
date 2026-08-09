@@ -26,7 +26,7 @@ use orc::flush::parquet::{
 use orc::flush::read::{read_file, read_metadata};
 use orc::record::{KeyType, Value};
 
-const T13: i64 = 1_786_194_000_000_000;
+const T13: u64 = 1_786_194_000_000_000;
 
 fn kd(name: &str, ty: KeyType) -> KeyDef {
     KeyDef {
@@ -149,7 +149,7 @@ fn row_groups_split_exactly_at_the_configured_count() {
         let path = dir.path().join(format!("{rows}-{per_group}.parquet"));
         let mut b = RowBuilder::new("s", &[], rows).unwrap();
         for i in 0..rows {
-            b.append(T13 + i as i64, "", &[], &[], "").unwrap();
+            b.append(T13 + i as u64, "", &[], &[], "").unwrap();
         }
         write_file(
             &path,
@@ -202,7 +202,7 @@ fn every_value_stays_on_its_own_row_across_group_boundaries() {
             .collect();
 
         b.append(
-            T13 + i,
+            T13 + i as u64,
             &format!("id{i}"),
             &[
                 symbol.as_deref().map_or(Value::Null, Value::Str),
@@ -235,7 +235,7 @@ fn every_value_stays_on_its_own_row_across_group_boundaries() {
     let got = read_file(&path).unwrap();
     assert_eq!(got.len(), 200);
     for (i, (row, (id, keys, extra))) in std::iter::zip(&got, &want).enumerate() {
-        assert_eq!(row.ts, T13 + i as i64, "row {i} ts");
+        assert_eq!(row.ts, T13 + i as u64, "row {i} ts");
         assert_eq!(&row.id, id, "row {i} id");
         assert_eq!(&row.keys, keys, "row {i} keys");
         assert_eq!(&row.extra, extra, "row {i} extra");
@@ -314,7 +314,7 @@ fn edge_case_scalars_survive_verbatim() {
     .enumerate()
     {
         b.append(
-            T13 + n as i64,
+            T13 + n as u64,
             "\u{1F600}",
             &[Value::I64(i), Value::F64(f)],
             &[("\u{00E9}", "\u{2603}")],
