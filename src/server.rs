@@ -72,6 +72,12 @@ impl Server {
         // size default is unlimited -- so one hostile message would be allocated
         // in full before a frame inside it was looked at, then written to a
         // single segment for the flush to read whole.
+        //
+        // Enforced below the application: over TCP libzmq drops the *connection*,
+        // not just the message, so anything else that peer had in flight goes
+        // with it and neither end gets a diagnostic. That is why the limit is
+        // reported in the schema handshake — a client bounding its own batches is
+        // the only place the refusal can carry a reason.
         ingest
             .set_maxmsgsize(config.server.max_batch_bytes)
             .map_err(zmq_err)?;
@@ -108,7 +114,7 @@ impl Server {
 
     /// Serve until a `Shutdown` request or a `stop_handle` flip.
     ///
-    /// A socket error ends the loop but never skips [`Server::shutdown`]: a `?`
+    /// A socket error ends the loop but never skips the shutdown drain: a `?`
     /// straight out of the loop body would take the drain and the engine close
     /// with it, discarding whatever ZeroMQ had buffered. The loop's error is
     /// still what the caller gets; shutdown's only surfaces if there is no
@@ -250,23 +256,10 @@ impl Server {
             ControlRequest::Ping => ControlResponse::Pong {
                 version: env!("CARGO_PKG_VERSION").to_string(),
             },
-            ControlRequest::Stats => {
-                let s = self.engine.stats();
-                ControlResponse::Stats(Box::new(StatsPayload {
-                    appended: s.appended,
-                    rejected_ts: s.rejected_ts,
-                    rejected_size: s.rejected_size,
-                    rejected_series: s.rejected_series,
-                    rejected_frames: s.rejected_frames,
-                    flush_failures: s.flush_failures,
-                    rows_flushed: s.rows_flushed,
-                    rows_deduplicated: s.rows_deduplicated,
-                    wal_bytes: s.wal_bytes,
-                    wal_total_bytes: s.wal_total_bytes,
-                    segment: s.segment,
-                    batches_received: self.batches.load(Ordering::Relaxed),
-                }))
-            }
+            ControlRequest::Stats => ControlResponse::Stats(Box::new(StatsPayload {
+                engine: self.engine.stats(),
+                batches_received: self.batches.load(Ordering::Relaxed),
+            })),
             ControlRequest::Flush => match self.engine.flush() {
                 Ok(o) => ControlResponse::Flushed(FlushPayload {
                     segments_consumed: o.segments_consumed,

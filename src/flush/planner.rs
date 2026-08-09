@@ -14,9 +14,15 @@
 //!
 //! A crash anywhere leaves either the old manifest — the segments are still on
 //! disk, so the flush re-runs — or the new one, whose orphan segments startup
-//! deletes on `id <= last_flushed_segment`. No window loses data or
-//! double-writes: [`output_file_name`] is a function of the *consumed segment
-//! range*, so a re-run writes the same paths with the same bytes.
+//! deletes on `id <= last_flushed_segment`.
+//!
+//! Nothing loses data, and a re-run over the *same* segment list writes the same
+//! paths with the same bytes: [`output_file_name`] is a function of the consumed
+//! range. But a re-run is not guaranteed to see the same list — ingest carries on
+//! between attempts, so the retry covers a wider range and therefore a different
+//! filename, leaving step 3's output from the failed attempt beside it where both
+//! match the reader's glob. [`sweep_uncommitted`] is what removes it, and it has
+//! to run before the retry as well as at startup.
 //!
 //! # A bad frame costs one record, never the flush
 //!
@@ -49,9 +55,8 @@ use crate::flush::parquet::{
 use crate::flush::view::view_sql;
 use crate::manifest::Manifest;
 use crate::record::Value;
-use crate::time::hour_partition;
+use crate::time::{US_PER_HOUR, hour_partition};
 use crate::wal::reader::{FrameFault, SegmentReader, read_segment};
-use crate::wal::recovery::CORRUPT_EXT;
 use crate::wal::{SEGMENT_ID_DIGITS, fsync_dir, segment_path, wal_dir};
 
 /// Where flushed Parquet lands, relative to `data_dir`.
@@ -70,9 +75,6 @@ pub const REJECT_EXT: &str = "rej";
 
 /// The generated DuckDB view, one per series directory.
 pub const VIEW_FILE: &str = "view.sql";
-
-/// Microseconds in an hour — the width of one `hour=` partition.
-const US_PER_HOUR: u64 = 3_600_000_000;
 
 /// `<data_dir>/series/<name>`.
 pub fn series_dir(data_dir: impl AsRef<Path>, series: &str) -> PathBuf {
@@ -142,15 +144,13 @@ pub fn run(
     let mut rejects = RejectSink::new(data_dir, config.limits.reject_max_bytes);
     let mut decoded = decode_segments(data_dir, &ids, &bufs, manifest, &mut rejects);
 
-    // Dropping an unreadable segment from `ids` is what keeps the commit below
-    // from advancing the watermark over it and `delete_segments` from unlinking
-    // it. `unreadable`, not `quarantined`: the two differ when the rename fails,
-    // and it is the failed *read* that makes a segment unsafe to call durable.
-    ids.retain(|id| !decoded.unreadable.contains(id));
+    narrow_to_committable(&mut ids, &mut decoded);
     if ids.is_empty() {
-        // Every segment offered was unreadable. There is nothing to write, and
-        // above all nothing to commit: advancing the watermark here would be the
-        // engine asserting that unreadable segments are durable in Parquet.
+        // Nothing left to consume: every segment offered was either unreadable
+        // itself or sits above one that could not be moved aside. There is
+        // nothing to write, and above all nothing to commit -- advancing the
+        // watermark here would be the engine asserting that segments it could
+        // not read are durable in Parquet.
         return Ok(FlushOutcome {
             frames_rejected: decoded.frames_rejected,
             bytes_skipped: decoded.bytes_skipped,
@@ -188,57 +188,14 @@ pub fn run(
             .map(Vec::as_slice)
             .unwrap_or(&[]);
 
-        // The last thing that can disagree with the schema: `decode` took arity
-        // from the manifest, but the codec reads whatever type tag it finds, so
-        // a hand-rolled client's i64 in a string column gets this far. Left
-        // alone it would fail the whole flush inside a column builder.
-        let mut rejected = 0;
-        rows.retain(|row| {
-            if matches_schema(keys, &row.keys) {
-                return true;
-            }
-            rejected += 1;
-            tracing::warn!(
-                series,
-                epoch,
-                segment = row.arrival.0,
-                offset = row.arrival.1,
-                "rejecting a frame whose key values disagree with the schema its epoch names"
-            );
-            rejects.append(row.arrival.0, row.frame);
-            false
-        });
-        outcome.frames_rejected += rejected;
+        outcome.frames_rejected += reject_mistyped(series, epoch, keys, rows, &mut rejects);
+        outcome.rows_deduplicated += sort_and_dedup(rows);
 
-        // Total, because `arrival` is unique: the same segments sort the same way
-        // on every replay, which is what makes a re-run byte-identical.
-        rows.sort_by(|a, b| (a.ts, a.id, a.arrival).cmp(&(b.ts, b.id, b.arrival)));
-
-        let before = rows.len();
-        // Duplicates are adjacent after that sort, and the survivor is the first
-        // arrival. An empty id dedups like any other value -- `(100, "")` twice
-        // is one row -- so a producer emitting distinct events at one microsecond
-        // must set `id`.
-        rows.dedup_by(|later, first| later.ts == first.ts && later.id == first.id);
-        outcome.rows_deduplicated += before - rows.len();
-
-        // Sorted by `ts`, so the rows of one hour are contiguous: no file spans
-        // two partitions, and every file is non-decreasing in `ts`.
-        let mut start = 0;
-        while start < rows.len() {
-            let bucket = rows[start].ts / US_PER_HOUR;
-            let mut end = start + 1;
-            while end < rows.len() && rows[end].ts / US_PER_HOUR == bucket {
-                end += 1;
-            }
-            outcome.files_written.push(sink.write_partition(
-                series,
-                epoch,
-                keys,
-                &rows[start..end],
-            )?);
-            outcome.rows_written += end - start;
-            start = end;
+        for run in hour_runs(rows) {
+            outcome.rows_written += run.len();
+            outcome
+                .files_written
+                .push(sink.write_partition(series, epoch, keys, &rows[run])?);
         }
     }
 
@@ -314,6 +271,114 @@ struct Decoded<'a> {
     /// The subset of `unreadable` that [`quarantine_segment`] managed to rename.
     /// Reported to the caller so a failed move is visible as the difference.
     quarantined: Vec<u64>,
+}
+
+/// Drop everything this flush must not commit, from `ids` and from the rows.
+///
+/// Two rules, and the second is not implied by the first:
+///
+/// - **A segment whose header would not parse was never read**, so it cannot be
+///   called durable, and `delete_segments` must not unlink it.
+/// - **Nor may anything above one that is still in `wal/` under its own name.**
+///   The watermark is the *highest* id consumed, so an unreadable segment with a
+///   readable one above it would be jumped straight over — and recovery deletes
+///   every id at or below the watermark, unlinking a file it never read one
+///   restart later.
+///
+/// Rows go with the ids. Left in place they would be written under a filename
+/// spanning only the narrowed range while their segments stayed in the log, and
+/// the next flush — covering a wider range, so a different name — would write
+/// them again beside it.
+fn narrow_to_committable(ids: &mut Vec<u64>, decoded: &mut Decoded<'_>) {
+    ids.retain(|id| !decoded.unreadable.contains(id));
+
+    // Quarantining *succeeded* means the file is no longer a segment, so the
+    // watermark may pass it. Quarantining *failed* means it is still there under
+    // its own name, where the next start's `id <= last_flushed_segment` rule
+    // would delete it.
+    let stuck = decoded
+        .unreadable
+        .iter()
+        .filter(|id| !decoded.quarantined.contains(id))
+        .min()
+        .copied();
+    let Some(lowest) = stuck else {
+        return;
+    };
+
+    ids.retain(|&id| id < lowest);
+    for rows in decoded.groups.values_mut() {
+        rows.retain(|row| row.arrival.0 < lowest);
+    }
+}
+
+/// Drop rows whose key values disagree with the schema their epoch names, copy
+/// them to `rejects/`, and report how many.
+///
+/// The last thing that can disagree: `decode` took arity from the manifest, but
+/// the codec reads whatever type tag it finds, so a hand-rolled client's i64 in
+/// a string column gets this far. Left alone it would fail the whole flush
+/// inside a column builder.
+fn reject_mistyped(
+    series: &str,
+    epoch: u32,
+    keys: &[KeyDef],
+    rows: &mut Vec<DecodedRow<'_>>,
+    rejects: &mut RejectSink,
+) -> usize {
+    let mut rejected = 0;
+    rows.retain(|row| {
+        if matches_schema(keys, &row.keys) {
+            return true;
+        }
+        rejected += 1;
+        tracing::warn!(
+            series,
+            epoch,
+            segment = row.arrival.0,
+            offset = row.arrival.1,
+            "rejecting a frame whose key values disagree with the schema its epoch names"
+        );
+        rejects.append(row.arrival.0, row.frame);
+        false
+    });
+    rejected
+}
+
+/// Put a group into its final order and collapse `(ts, id)` duplicates,
+/// reporting how many rows went.
+///
+/// The sort is total, because `arrival` is unique: the same segments sort the
+/// same way on every replay, which is what makes a re-run byte-identical.
+/// Duplicates are adjacent afterwards and the survivor is the first arrival. An
+/// empty id dedups like any other value — `(100, "")` twice is one row — so a
+/// producer emitting distinct events at one microsecond must set `id`.
+fn sort_and_dedup(rows: &mut Vec<DecodedRow<'_>>) -> usize {
+    rows.sort_by(|a, b| (a.ts, a.id, a.arrival).cmp(&(b.ts, b.id, b.arrival)));
+    let before = rows.len();
+    rows.dedup_by(|later, first| later.ts == first.ts && later.id == first.id);
+    before - rows.len()
+}
+
+/// Split sorted rows into one run per `hour=` partition.
+///
+/// They are sorted by `ts`, so an hour's rows are contiguous — which is what
+/// guarantees no file spans two partitions and every file is non-decreasing in
+/// `ts`. The Parquet writer declares `ts` a sorting column on the strength of
+/// exactly that.
+fn hour_runs(rows: &[DecodedRow<'_>]) -> Vec<std::ops::Range<usize>> {
+    let mut runs = Vec::new();
+    let mut start = 0;
+    while start < rows.len() {
+        let hour = rows[start].ts / US_PER_HOUR;
+        let mut end = start + 1;
+        while end < rows.len() && rows[end].ts / US_PER_HOUR == hour {
+            end += 1;
+        }
+        runs.push(start..end);
+        start = end;
+    }
+    runs
 }
 
 fn decode_segments<'a>(
@@ -527,32 +592,34 @@ impl Sink<'_> {
 /// file's range runs past it and this deletes the whole dataset.
 /// [`require_manifest_for_output`] is what stops that reaching here.
 ///
-/// Runs at open, under the directory lock, so no flush can be in flight.
+/// Called at open, and again before a flush that follows a failed one — the
+/// interval timer means a server can run for months without a restart, so open
+/// alone would leave the duplicate visible for exactly that long. Both callers
+/// hold the flush lock or the directory lock, which is what makes deleting on
+/// the watermark safe: no flush can be part-way through renaming its output in.
 pub fn sweep_uncommitted(data_dir: &Path, last_flushed_segment: u64) -> Result<()> {
-    let tmp = tmp_dir(data_dir);
-    if let Ok(entries) = std::fs::read_dir(&tmp) {
-        let mut files = 0u64;
-        let mut bytes = 0u64;
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if !path.is_file() {
-                continue;
-            }
-            bytes += entry.metadata().map(|m| m.len()).unwrap_or(0);
-            match std::fs::remove_file(&path) {
-                Ok(()) => files += 1,
-                Err(e) => {
-                    tracing::warn!(error = %e, path = %path.display(), "could not remove a stale staged file")
+    // Staged files are uncommitted by definition, so `tmp/` empties whole.
+    let (files, bytes) = std::fs::read_dir(tmp_dir(data_dir))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| e.path().is_file())
+        .fold((0u64, 0u64), |(files, bytes), e| {
+            let size = e.metadata().map(|m| m.len()).unwrap_or(0);
+            match std::fs::remove_file(e.path()) {
+                Ok(()) => (files + 1, bytes + size),
+                Err(err) => {
+                    tracing::warn!(error = %err, path = %e.path().display(), "could not remove a stale staged file");
+                    (files, bytes)
                 }
             }
-        }
-        if files > 0 {
-            tracing::info!(
-                files,
-                bytes,
-                "removed staged files from an uncommitted flush"
-            );
-        }
+        });
+    if files > 0 {
+        tracing::info!(
+            files,
+            bytes,
+            "removed staged files from an uncommitted flush"
+        );
     }
 
     let mut removed = Vec::new();
@@ -561,17 +628,12 @@ pub fn sweep_uncommitted(data_dir: &Path, last_flushed_segment: u64) -> Result<(
         if last <= last_flushed_segment {
             continue;
         }
-        match std::fs::remove_file(&path) {
-            Ok(()) => {
-                if let Some(hour) = path.parent() {
-                    emptied.insert(hour.to_path_buf());
-                }
-                removed.push(path);
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, path = %path.display(), "could not remove an orphan parquet file");
-            }
+        if let Err(e) = std::fs::remove_file(&path) {
+            tracing::warn!(error = %e, path = %path.display(), "could not remove an orphan parquet file");
+            continue;
         }
+        emptied.extend(path.parent().map(Path::to_path_buf));
+        removed.push(path);
     }
     if !removed.is_empty() {
         // Loud on purpose. Nothing is lost -- the segments these came from were
@@ -640,26 +702,14 @@ pub fn require_manifest_for_output(data_dir: &Path) -> Result<()> {
 /// skipped rather than reported — this walks a tree the README invites people to
 /// prune, so racing a `find -delete` must not fail startup.
 fn output_files(data_dir: &Path) -> Vec<(PathBuf, (u64, u64, u32))> {
-    let mut out = Vec::new();
-    let Ok(series) = std::fs::read_dir(data_dir.join(SERIES_DIR)) else {
-        return out;
-    };
-    for s in series.flatten() {
-        let Ok(hours) = std::fs::read_dir(s.path()) else {
-            continue;
-        };
-        for hour in hours.flatten() {
-            let Ok(files) = std::fs::read_dir(hour.path()) else {
-                continue;
-            };
-            for f in files.flatten() {
-                let name = f.file_name();
-                if let Some(parsed) = name.to_str().and_then(parse_output_file_name) {
-                    out.push((f.path(), parsed));
-                }
-            }
-        }
-    }
+    // `series/<name>/hour=…/<file>`: an unreadable level yields nothing rather
+    // than failing, which is what makes racing an external prune harmless.
+    let entries = |dir: PathBuf| std::fs::read_dir(dir).into_iter().flatten().flatten();
+    let mut out: Vec<_> = entries(data_dir.join(SERIES_DIR))
+        .flat_map(|series| entries(series.path()))
+        .flat_map(|hour| entries(hour.path()))
+        .filter_map(|f| Some((f.path(), parse_output_file_name(f.file_name().to_str()?)?)))
+        .collect();
     out.sort();
     out
 }
@@ -676,16 +726,13 @@ fn output_files(data_dir: &Path) -> Vec<(PathBuf, (u64, u64, u32))> {
 /// caller records the segment as unreadable either way, so it stays out of the
 /// consumed set and the commit never claims it is durable.
 fn quarantine_segment(data_dir: &Path, id: u64) -> bool {
-    let from = segment_path(data_dir, id);
-    let to = from.with_extension(CORRUPT_EXT);
-    match std::fs::rename(&from, &to) {
-        Ok(()) => {
+    match crate::wal::quarantine_segment(data_dir, id) {
+        Ok(to) => {
             tracing::error!(
                 segment = id,
                 path = %to.display(),
                 "quarantined an unreadable wal segment; its records are NOT in the dataset"
             );
-            let _ = fsync_dir(&wal_dir(data_dir));
             true
         }
         Err(e) => {
@@ -823,10 +870,10 @@ mod tests {
     use super::*;
     use std::fs;
 
-    use crate::codec::{encode, encode_segment_header};
+    use crate::codec::{encode, encode_segment_header, reseal};
     use crate::config::SeriesConfig;
     use crate::record::{KeyType, Row};
-    use crate::wal::FIRST_SEGMENT;
+    use crate::wal::{CORRUPT_EXT, FIRST_SEGMENT};
 
     /// 2026-08-08T13:00:00Z, the start of an hour.
     const T13: u64 = 1_786_194_000_000_000;
@@ -991,6 +1038,73 @@ mod tests {
             "the segment must still be on disk, in full"
         );
         assert_eq!(fs::read(segment_path(dir.path(), 2)).unwrap(), bad);
+    }
+
+    /// The watermark is the *highest* id consumed, so an unreadable segment with
+    /// a readable one above it was jumped straight over — and recovery deletes
+    /// every id at or below the watermark, so the file it never read was
+    /// unlinked one restart later. Dropping it from the consumed set is not
+    /// enough on its own.
+    #[test]
+    fn an_unquarantinable_segment_blocks_the_watermark_and_survives_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cfg, mut m) = trades();
+        let mut bad = write_segment(dir.path(), 1, &[rec(T13, "a"), rec(T13 + 1, "b")]);
+        write_segment(dir.path(), 2, &[rec(T13 + 2, "c")]);
+        write_segment(dir.path(), 3, &[rec(T13 + 3, "d")]);
+        bad[0] ^= 0xff; // ruin segment 1's magic; every frame behind it is intact
+        fs::write(segment_path(dir.path(), 1), &bad).unwrap();
+
+        // Block the rename, so the segment stays in the log under its own name.
+        let blocked = segment_path(dir.path(), 1).with_extension(CORRUPT_EXT);
+        fs::create_dir_all(&blocked).unwrap();
+        fs::write(blocked.join("occupied"), b"x").unwrap();
+
+        let out = run(dir.path(), &cfg, &mut m, &[1, 2, 3]).unwrap();
+        assert!(
+            out.segments_consumed.is_empty(),
+            "nothing above it may be consumed: {:?}",
+            out.segments_consumed
+        );
+        assert_eq!(m.last_flushed_segment, 0, "so the watermark cannot move");
+        assert!(
+            parquet_files(dir.path()).is_empty(),
+            "and 2 and 3's rows must not be written under a range that excludes them"
+        );
+
+        // The point of all of it: a restart must leave the segment alone.
+        let rec = crate::wal::recovery::recover(dir.path(), m.last_flushed_segment).unwrap();
+        assert!(rec.deleted.is_empty(), "recovery deleted {:?}", rec.deleted);
+        assert_eq!(fs::read(segment_path(dir.path(), 1)).unwrap(), bad);
+        for id in [2, 3] {
+            assert!(
+                segment_path(dir.path(), id).exists(),
+                "segment {id} is still pending"
+            );
+        }
+    }
+
+    /// The other direction, so the block above cannot become a permanent stall:
+    /// a segment that *was* moved aside is no longer in the log, so the watermark
+    /// is free to pass it and the segments above it flush normally.
+    #[test]
+    fn a_quarantined_segment_does_not_block_the_ones_above_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cfg, mut m) = trades();
+        let mut bad = write_segment(dir.path(), 1, &[rec(T13, "a")]);
+        write_segment(dir.path(), 2, &[rec(T13 + 2, "c")]);
+        bad[0] ^= 0xff;
+        fs::write(segment_path(dir.path(), 1), &bad).unwrap();
+
+        let out = run(dir.path(), &cfg, &mut m, &[1, 2]).unwrap();
+        assert_eq!(out.segments_consumed, vec![2]);
+        assert_eq!(m.last_flushed_segment, 2);
+        assert_eq!(out.rows_written, 1);
+        assert!(
+            segment_path(dir.path(), 1)
+                .with_extension(CORRUPT_EXT)
+                .exists()
+        );
     }
 
     /// Frames larger than the *current* `limits.max_record_bytes` used to stop a
@@ -1466,14 +1580,5 @@ mod tests {
         fs::write(hour.join(output_file_name(1, 9_999, 0)), b"x").unwrap();
         sweep_uncommitted(solo.path(), 0).unwrap();
         assert!(!hour.exists(), "an emptied partition is removed");
-    }
-
-    /// Recompute a frame's CRC after forging its bytes, so a test can build a
-    /// frame that is intact but structurally wrong.
-    fn reseal(frame: &mut [u8]) {
-        let mut h = crc32fast::Hasher::new();
-        h.update(&frame[..4]);
-        h.update(&frame[8..]);
-        frame[4..8].copy_from_slice(&h.finalize().to_le_bytes());
     }
 }

@@ -595,6 +595,20 @@ impl<'a> Cursor<'a> {
     }
 }
 
+/// Recompute a frame's CRC after a test has forged its bytes.
+///
+/// Lets a test build a frame that passes the integrity check and still fails to
+/// decode — the "poison frame" an ill-behaved client can get past `append_raw`,
+/// which three modules need to manufacture. Shared, because three copies of the
+/// CRC layout is three places to miss when it changes.
+#[cfg(test)]
+pub(crate) fn reseal(frame: &mut [u8]) {
+    let mut h = crc32fast::Hasher::new();
+    h.update(&frame[..4]);
+    h.update(&frame[FRAME_HEADER_BYTES..]);
+    frame[4..8].copy_from_slice(&h.finalize().to_le_bytes());
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -880,15 +894,6 @@ mod tests {
         let mut bad = buf.clone();
         *bad.last_mut().unwrap() ^= 0x01;
         assert!(validate_prefix(&bad, MAX).unwrap_err().is_corrupt());
-    }
-
-    /// Recompute a mutated frame's CRC, so a test can forge bytes that are
-    /// structurally wrong but pass the integrity check.
-    fn reseal(frame: &mut [u8]) {
-        let mut h = crc32fast::Hasher::new();
-        h.update(&frame[..4]);
-        h.update(&frame[FRAME_HEADER_BYTES..]);
-        frame[4..8].copy_from_slice(&h.finalize().to_le_bytes());
     }
 
     #[test]

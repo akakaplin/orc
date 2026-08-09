@@ -77,7 +77,16 @@ struct Counters {
 }
 
 /// A snapshot of engine counters.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Serialized directly into the control socket's `stats` reply — see
+/// [`StatsPayload`](crate::protocol::StatsPayload), which flattens this and adds
+/// the one counter the engine cannot know. Keeping one struct is what stops the
+/// two drifting: a counter added here reaches the wire without a second edit.
+///
+/// `#[serde(default)]` so a counter added later reads as 0 from an older
+/// server's reply rather than failing the parse.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct Stats {
     pub appended: u64,
     pub rejected_ts: u64,
@@ -118,7 +127,7 @@ pub struct RawIngest {
 
 /// The embeddable engine.
 ///
-/// Everything the engine *is* lives in [`Inner`], behind an `Arc` the flush timer
+/// Everything the engine *is* lives in `Inner`, behind an `Arc` the flush timer
 /// shares; the timer's `JoinHandle` stays out here. That placement is
 /// load-bearing: the thread holds a strong reference, so a handle stored beside
 /// it could see the last `Arc` dropped *by the timer itself*, and `Drop` would
@@ -364,14 +373,6 @@ impl Inner {
         }
     }
 
-    /// Resolve a series name to a handle. Do this once, outside the hot loop.
-    pub fn series(&self, name: &str) -> Result<Arc<SeriesHandle>> {
-        self.handles
-            .get(name)
-            .cloned()
-            .ok_or_else(|| Error::UnknownSeries(name.to_string()))
-    }
-
     /// The accept window's upper bound right now.
     ///
     /// Suspended when the host clock reads before `ts_min` — the state of a
@@ -435,16 +436,97 @@ impl Inner {
         Ok(())
     }
 
+    /// Seal the active segment and turn every sealed one into Parquet.
+    ///
+    /// Single-flight: a concurrent caller waits rather than starting a second
+    /// flush over the same segments.
+    pub fn flush(&self) -> Result<FlushOutcome> {
+        let _guard = self.flush_lock.lock().unwrap_or_else(|e| e.into_inner());
+
+        self.wal.seal()?;
+        let pending = crate::wal::list_segments(&self.data_dir)?;
+        let mut manifest = self.manifest.lock().unwrap_or_else(|e| e.into_inner());
+
+        // Never the segment the writer is appending to, and never one the
+        // manifest already calls durable -- the rule startup applies too. Without
+        // the second half, a `delete_segments` that fails after the commit leaves
+        // a segment the next flush rewrites under a wider name, and both files
+        // match the reader's glob.
+        let active = self.wal.segment();
+        let floor = manifest.last_flushed_segment;
+
+        // Debris from a flush that renamed files into `series/` and then failed
+        // before the commit. Startup sweeps it -- but the interval timer means a
+        // server runs for months without one, and this flush is about to write
+        // those same rows again under a wider segment range, so a different
+        // filename. Both would match the reader's glob and every row in the
+        // overlap would come back twice, once per failed attempt.
+        //
+        // Only after a failure: a flush that committed left nothing behind, and
+        // the sweep walks every `hour=` partition in the dataset.
+        if self.counters.flush_failures.load(Ordering::Relaxed) > 0 {
+            planner::sweep_uncommitted(&self.data_dir, floor)?;
+        }
+
+        let consumable: Vec<u64> = pending
+            .into_iter()
+            .filter(|id| *id < active && *id > floor)
+            .collect();
+
+        match planner::run(&self.data_dir, &self.config, &mut manifest, &consumable) {
+            Ok(outcome) => {
+                self.counters.flush_failures.store(0, Ordering::Relaxed);
+                self.counters
+                    .rows_flushed
+                    .fetch_add(outcome.rows_written as u64, Ordering::Relaxed);
+                self.counters
+                    .rows_deduplicated
+                    .fetch_add(outcome.rows_deduplicated as u64, Ordering::Relaxed);
+                Ok(outcome)
+            }
+            Err(e) => {
+                // The WAL is uncapped, so a failing flush costs disk rather than
+                // availability: ingest keeps working, and the counter makes the
+                // stall visible.
+                self.counters.flush_failures.fetch_add(1, Ordering::Relaxed);
+                tracing::error!(error = %e, "flush failed; ingest continues and the wal grows");
+                Err(e)
+            }
+        }
+    }
+
+    /// Stop the committer and fsync. The directory lock goes with `Inner`.
+    fn close(&self) -> Result<()> {
+        self.wal.close()
+    }
+}
+
+/// The public surface. Everything it touches lives in `Inner`, which the
+/// flush timer holds a second reference to — the split exists only so that
+/// thread can reach the state without reaching the handle that joins it.
+impl Engine {
+    /// Resolve a series name to a handle. Do this once, outside the hot loop.
+    pub fn series(&self, name: &str) -> Result<Arc<SeriesHandle>> {
+        self.inner
+            .handles
+            .get(name)
+            .cloned()
+            .ok_or_else(|| Error::UnknownSeries(name.to_string()))
+    }
+
     /// Append one record.
     ///
     /// Entirely on the caller's thread: validate, encode into thread-local
     /// scratch, copy into the WAL under a short lock. No disk I/O — the committer
     /// owns that.
     pub fn append(&self, handle: &SeriesHandle, row: &Row<'_>) -> Result<()> {
-        self.check_row(handle, row)?;
-        let limit = self.config.limits.max_record_bytes;
+        self.inner.check_row(handle, row)?;
+        let limit = self.inner.config.limits.max_record_bytes;
         if let Some(size) = oversize(row, limit) {
-            self.counters.rejected_size.fetch_add(1, Ordering::Relaxed);
+            self.inner
+                .counters
+                .rejected_size
+                .fetch_add(1, Ordering::Relaxed);
             return Err(Error::RecordTooLarge { size, limit });
         }
         SCRATCH.with(|cell| {
@@ -452,24 +534,30 @@ impl Inner {
             buf.clear();
             enc.encode(buf, handle.name(), handle.epoch(), row)?;
             if buf.len() > limit {
-                self.counters.rejected_size.fetch_add(1, Ordering::Relaxed);
+                self.inner
+                    .counters
+                    .rejected_size
+                    .fetch_add(1, Ordering::Relaxed);
                 let size = buf.len();
                 shrink_scratch(buf, limit);
                 return Err(Error::RecordTooLarge { size, limit });
             }
-            self.wal.append(buf)
+            self.inner.wal.append(buf)
         })?;
-        self.counters.appended.fetch_add(1, Ordering::Relaxed);
+        self.inner.counters.appended.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
     /// Append many records under a single WAL lock acquisition.
     pub fn append_batch(&self, handle: &SeriesHandle, rows: &[Row<'_>]) -> Result<()> {
-        let limit = self.config.limits.max_record_bytes;
+        let limit = self.inner.config.limits.max_record_bytes;
         for row in rows {
-            self.check_row(handle, row)?;
+            self.inner.check_row(handle, row)?;
             if let Some(size) = oversize(row, limit) {
-                self.counters.rejected_size.fetch_add(1, Ordering::Relaxed);
+                self.inner
+                    .counters
+                    .rejected_size
+                    .fetch_add(1, Ordering::Relaxed);
                 return Err(Error::RecordTooLarge { size, limit });
             }
         }
@@ -480,15 +568,19 @@ impl Inner {
                 let start = buf.len();
                 enc.encode(buf, handle.name(), handle.epoch(), row)?;
                 if buf.len() - start > limit {
-                    self.counters.rejected_size.fetch_add(1, Ordering::Relaxed);
+                    self.inner
+                        .counters
+                        .rejected_size
+                        .fetch_add(1, Ordering::Relaxed);
                     let size = buf.len() - start;
                     shrink_scratch(buf, limit);
                     return Err(Error::RecordTooLarge { size, limit });
                 }
             }
-            self.wal.append_batch(buf)
+            self.inner.wal.append_batch(buf)
         })?;
-        self.counters
+        self.inner
+            .counters
             .appended
             .fetch_add(rows.len() as u64, Ordering::Relaxed);
         Ok(())
@@ -506,7 +598,7 @@ impl Inner {
     /// no client to return an error to, and one bad frame must not cost a
     /// batch.
     pub fn append_raw(&self, mut bytes: &[u8]) -> Result<RawIngest> {
-        let limit = self.config.limits.max_record_bytes;
+        let limit = self.inner.config.limits.max_record_bytes;
         let mut out = RawIngest::default();
         // Grown as frames are accepted, never reserved from the message length:
         // that length is attacker-supplied, and reserving it up front paid for a
@@ -536,16 +628,18 @@ impl Inner {
             let (frame, rest) = bytes.split_at(prefix.frame_len);
             bytes = rest;
 
-            if self.check_ts(prefix.ts).is_err() {
+            if self.inner.check_ts(prefix.ts).is_err() {
                 out.rejected += 1;
                 continue;
             }
             let known = self
+                .inner
                 .handles
                 .get(prefix.series)
                 .is_some_and(|h| h.epoch() >= prefix.epoch);
             if !known {
-                self.counters
+                self.inner
+                    .counters
                     .rejected_series
                     .fetch_add(1, Ordering::Relaxed);
                 out.rejected += 1;
@@ -556,73 +650,30 @@ impl Inner {
         }
 
         if !good.is_empty() {
-            self.wal.append_batch(&good)?;
-            self.counters
+            self.inner.wal.append_batch(&good)?;
+            self.inner
+                .counters
                 .appended
                 .fetch_add(out.accepted as u64, Ordering::Relaxed);
         }
         if out.rejected > 0 {
-            self.counters
+            self.inner
+                .counters
                 .rejected_frames
                 .fetch_add(out.rejected as u64, Ordering::Relaxed);
         }
         Ok(out)
     }
 
-    /// Seal the active segment and turn every sealed one into Parquet.
-    ///
-    /// Single-flight: a concurrent caller waits rather than starting a second
-    /// flush over the same segments.
-    pub fn flush(&self) -> Result<FlushOutcome> {
-        let _guard = self.flush_lock.lock().unwrap_or_else(|e| e.into_inner());
-
-        self.wal.seal()?;
-        let pending = crate::wal::list_segments(&self.data_dir)?;
-        let mut manifest = self.manifest.lock().unwrap_or_else(|e| e.into_inner());
-
-        // Never the segment the writer is appending to, and never one the
-        // manifest already calls durable -- the rule startup applies too. Without
-        // the second half, a `delete_segments` that fails after the commit leaves
-        // a segment the next flush rewrites under a wider name, and both files
-        // match the reader's glob.
-        let active = self.wal.segment();
-        let floor = manifest.last_flushed_segment;
-        let consumable: Vec<u64> = pending
-            .into_iter()
-            .filter(|id| *id < active && *id > floor)
-            .collect();
-
-        match planner::run(&self.data_dir, &self.config, &mut manifest, &consumable) {
-            Ok(outcome) => {
-                self.counters.flush_failures.store(0, Ordering::Relaxed);
-                self.counters
-                    .rows_flushed
-                    .fetch_add(outcome.rows_written as u64, Ordering::Relaxed);
-                self.counters
-                    .rows_deduplicated
-                    .fetch_add(outcome.rows_deduplicated as u64, Ordering::Relaxed);
-                Ok(outcome)
-            }
-            Err(e) => {
-                // The WAL is uncapped, so a failing flush costs disk rather than
-                // availability: ingest keeps working, and the counter makes the
-                // stall visible.
-                self.counters.flush_failures.fetch_add(1, Ordering::Relaxed);
-                tracing::error!(error = %e, "flush failed; ingest continues and the wal grows");
-                Err(e)
-            }
-        }
-    }
-
     /// Counter snapshot.
     pub fn stats(&self) -> Stats {
-        let w = self.wal.stats();
-        let c = &self.counters;
+        let w = self.inner.wal.stats();
+        let c = &self.inner.counters;
         // A listing plus a stat per segment: fine at the rate `stats` is
         // scraped, and the writer only knows the segment it holds open. On
         // failure fall back to that lower bound -- reporting 0 would read as
         // "the backlog drained", the one wrong direction for a stall gauge.
-        let wal_total_bytes = match crate::wal::total_bytes(&self.data_dir) {
+        let wal_total_bytes = match crate::wal::total_bytes(&self.inner.data_dir) {
             Ok(n) => n,
             Err(e) => {
                 tracing::warn!(error = %e, "could not measure total wal bytes");
@@ -648,78 +699,29 @@ impl Inner {
     /// handshake is built from these: a client encodes keys positionally, so it
     /// needs each series' epoch and key order before it can build a frame.
     pub fn series_handles(&self) -> impl Iterator<Item = &Arc<SeriesHandle>> {
-        self.handles.values()
+        self.inner.handles.values()
     }
 
     /// The data directory this engine owns.
     pub fn data_dir(&self) -> &Path {
-        &self.data_dir
+        &self.inner.data_dir
     }
 
     /// Human-readable accept window, for diagnostics.
     pub fn accept_window(&self) -> (String, Option<String>) {
         (
-            format_rfc3339_utc(self.ts_min),
-            self.ts_upper_bound().map(format_rfc3339_utc),
+            format_rfc3339_utc(self.inner.ts_min),
+            self.inner.ts_upper_bound().map(format_rfc3339_utc),
         )
-    }
-
-    /// Stop the committer and fsync. The directory lock goes with `Inner`.
-    fn close(&self) -> Result<()> {
-        self.wal.close()
-    }
-}
-
-/// Everything below forwards to [`Inner`]. The split exists only so the flush
-/// timer can hold the state without the handle that joins it.
-impl Engine {
-    /// Resolve a series name to a handle. Do this once, outside the hot loop.
-    pub fn series(&self, name: &str) -> Result<Arc<SeriesHandle>> {
-        self.inner.series(name)
-    }
-
-    /// Append one record.
-    pub fn append(&self, handle: &SeriesHandle, row: &Row<'_>) -> Result<()> {
-        self.inner.append(handle, row)
-    }
-
-    /// Append many records under a single WAL lock acquisition.
-    pub fn append_batch(&self, handle: &SeriesHandle, rows: &[Row<'_>]) -> Result<()> {
-        self.inner.append_batch(handle, rows)
-    }
-
-    /// Append frames a client already encoded, without re-encoding them.
-    pub fn append_raw(&self, bytes: &[u8]) -> Result<RawIngest> {
-        self.inner.append_raw(bytes)
     }
 
     /// Seal the active segment and turn every sealed one into Parquet.
     ///
     /// Single-flight with the interval timer and the control socket: a
-    /// concurrent caller waits rather than starting a second flush over the same
-    /// segments.
+    /// concurrent caller waits rather than starting a second flush over the
+    /// same segments.
     pub fn flush(&self) -> Result<FlushOutcome> {
         self.inner.flush()
-    }
-
-    /// Counter snapshot.
-    pub fn stats(&self) -> Stats {
-        self.inner.stats()
-    }
-
-    /// Every resolved series handle, in arbitrary order.
-    pub fn series_handles(&self) -> impl Iterator<Item = &Arc<SeriesHandle>> {
-        self.inner.series_handles()
-    }
-
-    /// The data directory this engine owns.
-    pub fn data_dir(&self) -> &Path {
-        self.inner.data_dir()
-    }
-
-    /// Human-readable accept window, for diagnostics.
-    pub fn accept_window(&self) -> (String, Option<String>) {
-        self.inner.accept_window()
     }
 }
 
@@ -789,7 +791,7 @@ mod tests {
     #[test]
     fn stats_report_the_whole_wal_not_just_the_active_segment() {
         let dir = tempfile::tempdir().unwrap();
-        let config = Config {
+        let mut config = Config {
             data_dir: dir.path().to_path_buf(),
             wal: crate::config::WalConfig {
                 segment_max_bytes: 2048,
@@ -802,6 +804,12 @@ mod tests {
             }],
             ..Config::default()
         };
+        // Small segments need a proportionally small record cap: a segment that
+        // cannot hold one maximum-size record is a config error. Set here rather
+        // than in the literal above because `ts_min_us` is private to `config`,
+        // so `..Config::default().limits` will not compile from out here.
+        config.limits.max_record_bytes = 512;
+
         let e = Engine::open(config).unwrap();
         let trades = e.series("trades").unwrap();
 

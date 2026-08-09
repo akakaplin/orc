@@ -24,7 +24,7 @@
 //! holds: the `write` returned before the lock was dropped, so the fsync covers
 //! at least the bytes counted, and covering more is free.
 //!
-//! **A segment roll is the exception.** [`Shared::roll`] fsyncs the outgoing
+//! **A segment roll is the exception.** A roll fsyncs the outgoing
 //! segment, then creates the incoming one — a second fsync plus a directory
 //! fsync — with the append lock held for all three. Not an oversight: recovery
 //! scans only the tail, and may do so *because* a sealed segment is fully durable
@@ -230,10 +230,10 @@ impl WalWriter {
         let shared = Arc::new(Shared {
             dir,
             // Clamped in one place, so both the appender and the committer read
-            // the same numbers. A zero here is a degenerate config rather than a
-            // wish: `fsync_bytes: 0` would leave the committer's wait predicate
-            // permanently false and spin a core, and a `segment_max_bytes` below
-            // one header would roll a fresh empty segment every tick, forever.
+            // the same numbers. `Config::validate` rejects all three degenerate
+            // values, so this is unreachable through `Engine::open` — but this
+            // type is public and takes a `WalConfig` directly, and a zero
+            // reaching the committer spins a core rather than failing.
             cfg: WalConfig {
                 fsync_interval_ms: opts.wal.fsync_interval_ms.max(1),
                 fsync_bytes: opts.wal.fsync_bytes.max(1),

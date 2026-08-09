@@ -149,11 +149,83 @@ A few constraints are worth knowing before you hit them, all checked at load:
 - **`flush.interval_ms: 0` disables the timer**, leaving flushing entirely to explicit `Engine::flush()` calls and the control socket. Any other value spawns a background thread that flushes on that period. The WAL is not capped, so turning the timer off means owning the schedule yourself.
 - **A declared key may not be named `ts`, `id`, `extra` or `data`.** Every Parquet file already has those columns, and Parquet does not object to a duplicate field name — the resulting file reads back wrong rather than failing.
 - **`limits.ts_min` must be 1970 or later.** Timestamps are unsigned, so there is nothing before the epoch to represent.
+- **`wal.segment_max_bytes` must be at least `limits.max_record_bytes`.** A segment that cannot hold one maximum-size record rolls on every record, so a busy hour becomes millions of files — all of which the flush reads into memory at once. `wal.fsync_interval_ms` and `wal.fsync_bytes` must both be non-zero for the same class of reason: zero leaves the committer's wait predicate permanently false and spins a core.
 - **`server.max_batch_bytes` caps one ingest message**, and must be at least `limits.max_record_bytes`. libzmq discards an oversized message below the application, where neither side can log it, so the client learns this value in the handshake and splits its batches to fit — and refuses, loudly, a record too large to ever be delivered.
 
 **Endpoints default to loopback deliberately.** There is no authentication on the ingest socket — anything that can reach it can write records and consume disk. Before binding a real interface, put it on a private network or enable libzmq's built-in CURVE encryption and authentication.
 
-`orc-server --data DIR` overrides the config file's `data_dir`; without the flag the file decides, so `--config /etc/orc/config.json` alone writes where that file says. `orc-cli --control` likewise defaults to the ingest port + 1 rather than to localhost, so pointing `--ingest` at a remote host takes the handshake with it.
+## Command line
+
+Both binaries need `--features cli`:
+
+```sh
+cargo build --release --features cli      # target/release/orc-server, target/release/orc-cli
+```
+
+### `orc-server`
+
+Runs the engine behind the two sockets `config.json` names, and serves until it is told to stop.
+
+```sh
+orc-server                                   # reads ./data/config.json
+orc-server --data /var/lib/orc               # reads /var/lib/orc/config.json
+orc-server --config /etc/orc/config.json     # writes wherever that file's data_dir says
+orc-server --data /var/lib/orc --force-unlock
+```
+
+| Flag | Meaning |
+| --- | --- |
+| `--data <DIR>` | Data directory, and where `config.json` is looked for. **Also overrides the config file's own `data_dir`.** |
+| `--config <FILE>` | Config path. Defaults to `<data>/config.json`. |
+| `--force-unlock` | Take the directory lock even if a live engine holds it. |
+| `-V, --version` / `-h, --help` | |
+
+Neither path flag has a default value, which is what makes "not passed" different from "passed the default": `--config /etc/orc/config.json` on its own honours that file's `data_dir` instead of silently redirecting to `./data`.
+
+**Logging** goes to stderr. `RUST_LOG` takes a bare level — `error`, `warn`, `info` (the default), `debug`, `trace` — not the per-target directives `EnvFilter` accepts, which would cost five crates for a binary with one target worth filtering. An unrecognised value is reported and treated as `info` rather than silently disabling logging.
+
+**Stopping.** `orc-cli shutdown` is the clean path: the loop stops polling, drains what ZeroMQ still holds for up to five seconds, and closes the engine, which fsyncs the WAL. `kill -9` is also safe — the WAL is crash-safe by construction and recovery amends the torn tail on the next start — but it costs whatever was still queued in the socket.
+
+**One engine per directory.** A second `orc-server` on a live directory refuses to start with a `Locked` error, and logs the holder's pid and the lock's age at `error` level. A lock whose heartbeat is more than ten seconds stale is taken over automatically, so a `kill -9` needs no manual cleanup. `--force-unlock` is for a process that is stuck but alive; it is also the only way to get two engines onto one directory, which will corrupt it.
+
+### `orc-cli`
+
+Drives a running server over the control socket, and pipes records into the ingest socket.
+
+```sh
+orc-cli ping                          # liveness, and the server's version
+orc-cli stats                         # counters, as JSON
+orc-cli schema                        # every series' epoch and key order
+orc-cli flush                         # flush now, synchronously
+orc-cli shutdown                      # drain and exit
+orc-cli send trades < records.ndjson  # ingest
+```
+
+| Flag | Meaning |
+| --- | --- |
+| `--ingest <ENDPOINT>` | PUSH → the server's PULL. Default `tcp://127.0.0.1:5555`. |
+| `--control <ENDPOINT>` | REQ → the server's REP. Defaults to **the ingest port + 1**, not to localhost. |
+| `send --batch <N>` | Records per message. Default 1024. |
+
+`--control` derives from `--ingest` rather than defaulting on its own, so `--ingest tcp://prod:5555` takes the handshake to prod with it. Getting that wrong is not a connection error: keys travel positionally, so handshaking against one host while writing to another silently swaps columns.
+
+`send` reads newline-delimited JSON on stdin, one record per line:
+
+```json
+{"ts": 1786194000000000, "id": "a1", "keys": ["AAPL", 100], "extra": {"feed": "itch"}, "data": "{\"px\":193.4}"}
+```
+
+- `ts` is required, epoch **microseconds** UTC.
+- `keys` is **positional**, in the order `orc-cli schema` reports — a list, not a map. Undeclared keys go in `extra`.
+- `id`, `extra` and `data` all default to empty.
+- A line that does not parse is reported on stderr and skipped; the rest of the stream still goes. Arrays and objects are refused as key values rather than coerced.
+
+```sh
+printf '{"ts":%d,"id":"a1","keys":["AAPL",100]}\n' $(( $(date +%s) * 1000000 )) \
+  | orc-cli send trades
+```
+
+Exit status is 0 on success and 1 on any error, with the message on stderr. `stats` is the one to scrape — see below for which counters matter.
 
 ## When something is wrong
 
@@ -181,7 +253,7 @@ A **missing `manifest.json` refuses to start**, naming the directory. It is the 
 
 ## Dependencies
 
-Parquet, ZeroMQ and JSON are the sanctioned surface. Everything else is hand-rolled: the record codec, the error types, the civil-date helper, the lock file, the benchmark harness.
+Parquet, ZeroMQ and JSON are the sanctioned surface. Everything else is hand-rolled: the record codec, the error types, the civil-date helper, the lock file.
 
 | Crate                        | Where   | Why                                                                                             |
 | ---------------------------- | ------- | ----------------------------------------------------------------------------------------------- |

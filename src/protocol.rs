@@ -11,6 +11,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::config::KeyDef;
+use crate::engine::Stats;
 
 /// A request on the control socket.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -59,9 +60,6 @@ pub enum ControlResponse {
         #[serde(default)]
         max_batch_bytes: Option<u64>,
     },
-    Reloaded {
-        changed: Vec<String>,
-    },
     ShuttingDown,
     Error {
         message: String,
@@ -78,28 +76,16 @@ pub struct SeriesSchema {
     pub keys: Vec<KeyDef>,
 }
 
-/// Counters, mirroring `Engine::stats`.
+/// Counters, as the control socket reports them.
 ///
-/// `#[serde(default)]` so a counter added later reads as 0 from an older
-/// server's reply rather than failing the parse.
+/// [`Stats`] flattened — so the JSON stays one flat object — plus the one
+/// counter the engine cannot know, because it belongs to the socket rather than
+/// to the log.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct StatsPayload {
-    pub appended: u64,
-    pub rejected_ts: u64,
-    pub rejected_size: u64,
-    pub rejected_series: u64,
-    pub rejected_frames: u64,
-    pub flush_failures: u64,
-    pub rows_flushed: u64,
-    pub rows_deduplicated: u64,
-    /// Bytes in the *active* segment only: a sawtooth that resets on every roll.
-    pub wal_bytes: u64,
-    /// Every byte of WAL on disk. This is the one to alert on — the log is
-    /// uncapped, so a stalled flush shows up here as steady growth long before
-    /// the volume fills.
-    pub wal_total_bytes: u64,
-    pub segment: u64,
+    #[serde(flatten)]
+    pub engine: Stats,
     /// Batches received on the ingest socket. Compared against a client's own
     /// send count, this is the only way to observe fire-and-forget loss.
     pub batches_received: u64,
@@ -202,8 +188,11 @@ mod tests {
         let stats = ControlResponse::from_bytes(br#"{"status":"stats","appended":5}"#).unwrap();
         match stats {
             ControlResponse::Stats(s) => {
-                assert_eq!(s.appended, 5);
-                assert_eq!(s.wal_total_bytes, 0, "absent reads as zero, not an error");
+                assert_eq!(s.engine.appended, 5);
+                assert_eq!(
+                    s.engine.wal_total_bytes, 0,
+                    "absent reads as zero, not an error"
+                );
             }
             other => panic!("expected stats, got {other:?}"),
         }

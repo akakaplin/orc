@@ -16,7 +16,8 @@
 use crate::error::{Error, Result};
 
 const US_PER_SEC: u64 = 1_000_000;
-const US_PER_HOUR: u64 = 3_600 * US_PER_SEC;
+/// Also the width of one `hour=` partition, which is why the flush shares it.
+pub(crate) const US_PER_HOUR: u64 = 3_600 * US_PER_SEC;
 const US_PER_DAY: u64 = 24 * US_PER_HOUR;
 
 /// Years [`parse_rfc3339_utc`] will accept.

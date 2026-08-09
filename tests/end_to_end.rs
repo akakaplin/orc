@@ -489,3 +489,45 @@ fn flush_is_a_noop_when_there_is_nothing_to_do() {
     );
     assert!(parquet_files(dir.path(), "trades").is_empty());
 }
+
+/// A flush that renamed one partition into `series/` and then failed on the next
+/// leaves a real Parquet file the manifest never committed. Startup sweeps it —
+/// but the interval timer means a server runs for months without a restart, and
+/// the next flush covers a wider segment range, so it writes those same rows
+/// again under a different name. Both match the reader's glob.
+#[test]
+fn a_flush_that_failed_part_way_does_not_leave_duplicates_behind() {
+    let dir = tempfile::tempdir().unwrap();
+    let e = open(dir.path());
+    let trades = e.series("trades").unwrap();
+    push(&e, &trades, T13, "a");
+    push(&e, &trades, T13 + HOUR_US, "b");
+
+    // Fail the *second* partition: rows are sorted by ts, so the first hour has
+    // already been renamed into place by the time this one is reached.
+    let blocked = series_dir(dir.path(), "trades").join(orc::time::hour_partition(T13 + HOUR_US));
+    std::fs::create_dir_all(blocked.parent().unwrap()).unwrap();
+    std::fs::write(&blocked, b"not a directory").unwrap();
+
+    assert!(e.flush().is_err(), "the second partition must fail");
+    assert_eq!(
+        parquet_files(dir.path(), "trades").len(),
+        1,
+        "the first partition is already on disk, uncommitted"
+    );
+
+    // Ingest carries on, so the next flush spans a wider segment range.
+    std::fs::remove_file(&blocked).unwrap();
+    push(&e, &trades, T13 + 1, "c");
+    e.flush().unwrap();
+
+    let mut seen: Vec<(u64, String)> = Vec::new();
+    for f in parquet_files(dir.path(), "trades") {
+        seen.extend(orc::flush::read::read_ts_id(&f).unwrap());
+    }
+    seen.sort();
+    let mut distinct = seen.clone();
+    distinct.dedup();
+    assert_eq!(seen, distinct, "a row is visible twice: {seen:?}");
+    assert_eq!(parquet_rows(dir.path(), "trades"), 3);
+}

@@ -123,7 +123,15 @@ fn send(client: &mut Client, series_name: &str) -> orc::Result<()> {
                 continue;
             }
         };
-        let keys: Vec<Value<'_>> = parsed.keys.iter().map(json_to_value).collect();
+        // One bad line must not abandon the rest of the stream, same as a parse
+        // failure above.
+        let keys: Vec<Value<'_>> = match parsed.keys.iter().map(json_to_value).collect() {
+            Ok(keys) => keys,
+            Err(why) => {
+                eprintln!("orc-cli: line {line_no}: {why}");
+                continue;
+            }
+        };
         let extra: Vec<(&str, &str)> = parsed
             .extra
             .iter()
@@ -162,18 +170,21 @@ struct JsonRecord {
     data: String,
 }
 
-fn json_to_value(v: &serde_json::Value) -> Value<'_> {
-    match v {
+/// One JSON scalar as a key value.
+///
+/// Arrays and objects have no declared-key representation and are named as
+/// errors rather than coerced. They used to become `Value::Str("")` on the
+/// theory that the server would reject the type — but `""` is a perfectly good
+/// value for a `string` column, so an object in a string key was stored as an
+/// empty string the producer never wrote.
+fn json_to_value(v: &serde_json::Value) -> Result<Value<'_>, &'static str> {
+    Ok(match v {
         serde_json::Value::Null => Value::Null,
         serde_json::Value::Bool(b) => Value::Bool(*b),
         serde_json::Value::Number(n) if n.is_i64() => Value::I64(n.as_i64().unwrap_or_default()),
         serde_json::Value::Number(n) => Value::F64(n.as_f64().unwrap_or_default()),
         serde_json::Value::String(s) => Value::Str(s),
-        // Arrays and objects have no declared-key representation; the server
-        // will reject the type, which is a clearer failure than guessing.
-        other => Value::Str(match other {
-            serde_json::Value::String(s) => s,
-            _ => "",
-        }),
-    }
+        serde_json::Value::Array(_) => return Err("a key value may not be an array"),
+        serde_json::Value::Object(_) => return Err("a key value may not be an object"),
+    })
 }

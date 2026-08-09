@@ -80,6 +80,38 @@ pub fn parse_segment_name(name: &str) -> Option<u64> {
     digits.parse().ok()
 }
 
+/// Extension given to a segment whose header would not parse:
+/// `<id>.wal.corrupt`.
+///
+/// Deliberately not a `.wal` name, so [`list_segments`] stops seeing it and the
+/// writer is free to move past the id — while the bytes stay where an operator
+/// can find them.
+pub const CORRUPT_EXT: &str = "wal.corrupt";
+
+/// `<data_dir>/wal/<id>.wal.corrupt` — where a quarantined segment goes.
+pub fn corrupt_path(data_dir: impl AsRef<Path>, id: u64) -> PathBuf {
+    segment_path(data_dir, id).with_extension(CORRUPT_EXT)
+}
+
+/// Move a segment out of the log without destroying it.
+///
+/// An unreadable header says nothing about the frames behind it, so the file has
+/// to leave the log without ceasing to exist: [`list_segments`] stops seeing it,
+/// the writer is free to move past the id, and every byte stays on disk to be
+/// recovered by hand.
+///
+/// Startup recovery and the flush both need exactly this and differ only in what
+/// they do when it fails — recovery refuses to start, the flush carries on
+/// without consuming the segment — so the failure is returned rather than
+/// decided here.
+pub fn quarantine_segment(data_dir: impl AsRef<Path>, id: u64) -> std::io::Result<PathBuf> {
+    let data_dir = data_dir.as_ref();
+    let to = corrupt_path(data_dir, id);
+    std::fs::rename(segment_path(data_dir, id), &to)?;
+    fsync_dir(&wal_dir(data_dir))?;
+    Ok(to)
+}
+
 /// Every segment id present in `wal/`, ascending.
 ///
 /// A missing directory is what an unopened data directory looks like, not an

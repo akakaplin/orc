@@ -52,11 +52,6 @@ pub enum Error {
         limit: usize,
     },
 
-    UnknownEpoch {
-        series: String,
-        epoch: u32,
-    },
-
     Config(String),
 
     Locked(String),
@@ -101,10 +96,6 @@ impl std::fmt::Display for Error {
                 f,
                 "batch is {size} bytes, over the server's {limit}-byte max_batch_bytes; \
                  sending it would have it silently discarded by zeromq"
-            ),
-            Error::UnknownEpoch { series, epoch } => write!(
-                f,
-                "frame declares schema epoch {epoch} for series {series:?}, which is not in the manifest history"
             ),
             Error::Config(msg) => write!(f, "config: {msg}"),
             Error::Locked(dir) => write!(
@@ -196,14 +187,6 @@ mod tests {
                     limit: 64,
                 },
                 "silently discarded",
-                false,
-            ),
-            (
-                Error::UnknownEpoch {
-                    series: "t".into(),
-                    epoch: 9,
-                },
-                "epoch 9",
                 false,
             ),
             (Error::Config("bad".into()), "config: bad", false),

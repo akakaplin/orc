@@ -110,7 +110,7 @@ fn eventually(what: &str, mut cond: impl FnMut() -> bool) {
 
 fn appended(client: &Client) -> u64 {
     match client.control(ControlRequest::Stats) {
-        Ok(ControlResponse::Stats(s)) => s.appended,
+        Ok(ControlResponse::Stats(s)) => s.engine.appended,
         other => panic!("unexpected stats reply: {other:?}"),
     }
 }

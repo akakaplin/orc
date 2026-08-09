@@ -20,7 +20,7 @@ use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
 
-use crate::codec::BATCH_HEADER_BYTES;
+use crate::codec::{BATCH_HEADER_BYTES, SEGMENT_HEADER_BYTES};
 use crate::error::{Error, Result};
 use crate::record::KeyType;
 use crate::time::parse_rfc3339_utc;
@@ -87,8 +87,10 @@ pub struct LimitsConfig {
     /// would move the window's *upper* bound backwards and reject every live
     /// record, which the type makes a parse error.
     pub ts_max_skew_ms: u64,
-    /// The one exception to "`serde_json` is never on the ingest path". Off by
-    /// default because it costs latency on every record.
+    /// **Accepted but not yet consulted.** Intended as the one exception to
+    /// "`serde_json` is never on the ingest path"; nothing reads it today, so
+    /// setting it has no effect. Kept in the schema because `deny_unknown_fields`
+    /// would otherwise reject a config that already carries it.
     pub validate_json: bool,
 
     /// Cache for [`LimitsConfig::ts_min_us`]. Not serialized: it is derived
@@ -133,8 +135,11 @@ pub struct FlushConfig {
     /// Rows per Parquet row group, which is also the granularity readers prune
     /// `ts` at.
     pub row_group_rows: usize,
-    /// Maximum sorted runs merged in one pass. An hour at 100k rec/s is ~560
-    /// runs, which would blow past macOS's 256-descriptor default in one pass.
+    /// **Accepted and range-checked, but not yet consulted.** For the bounded
+    /// fan-in k-way merge that replaces today's hold-it-all-in-memory flush: an
+    /// hour at 100k rec/s is ~560 sorted runs, which would blow past macOS's
+    /// 256-descriptor default in one pass. The flush does not merge yet, so the
+    /// value goes nowhere.
     pub merge_fan_in: usize,
 }
 
@@ -287,14 +292,25 @@ impl Config {
     /// `data_dir`, and a `ts_min` that only fails on the first record turns a
     /// typo into an ingest outage an hour after startup.
     pub fn validate(&self) -> Result<()> {
-        let bad = |msg: String| Err(Error::Config(msg));
-
         // Parses and caches, so the ingest path never sees the string form.
         self.limits.ts_min_us()?;
+        self.check_bounds()?;
+        self.check_series()
+    }
+
+    /// The numeric tunables, each against the invariant that makes it usable.
+    ///
+    /// Every one of these is a value the engine would otherwise clamp, saturate
+    /// or trip over an hour later; failing at load names the field instead.
+    fn check_bounds(&self) -> Result<()> {
+        let bad = |msg: String| Err(Error::Config(msg));
 
         if self.limits.max_record_bytes == 0 {
             return bad("limits.max_record_bytes must be greater than 0".into());
         }
+        // Checked even though nothing reads it yet: a config that would be
+        // rejected the day the merge lands is better rejected now than silently
+        // carried for months.
         if self.flush.merge_fan_in < 2 {
             return bad(
                 "flush.merge_fan_in must be at least 2, or a merge cannot make progress".into(),
@@ -310,6 +326,33 @@ impl Config {
                 "flush.interval_ms {} is out of range; the maximum is {} (~100 years), \
                  and 0 disables the timer",
                 self.flush.interval_ms, MAX_FLUSH_INTERVAL_MS
+            ));
+        }
+        if self.wal.fsync_interval_ms == 0 {
+            return bad(
+                "wal.fsync_interval_ms must be greater than 0; it is the group-commit window, \
+                 and 0 would mean the committer never parks"
+                    .into(),
+            );
+        }
+        if self.wal.fsync_bytes == 0 {
+            return bad(
+                "wal.fsync_bytes must be greater than 0; 0 leaves the committer's wait \
+                 predicate permanently false, which spins a core"
+                    .into(),
+            );
+        }
+        // The same shape as the batch check below, one layer down: a segment
+        // that cannot hold one maximum-size record rolls on every record, so a
+        // busy hour becomes millions of files and the flush reads all of them
+        // into memory at once. The writer clamps this to something survivable,
+        // but a clamp is not an answer to a config that cannot mean what it says.
+        let smallest_segment = self.limits.max_record_bytes as u64 + SEGMENT_HEADER_BYTES as u64;
+        if self.wal.segment_max_bytes < smallest_segment {
+            return bad(format!(
+                "wal.segment_max_bytes {} cannot hold one limits.max_record_bytes record \
+                 ({} plus a {}-byte segment header): every record would roll its own segment",
+                self.wal.segment_max_bytes, self.limits.max_record_bytes, SEGMENT_HEADER_BYTES
             ));
         }
         // `limits.ts_max_skew_ms` needs no check: it is a `u64`, so the negative
@@ -339,6 +382,14 @@ impl Config {
                 SUPPORTED_COMPRESSION.join(", ")
             ));
         }
+
+        Ok(())
+    }
+
+    /// The declared series: names that have to survive being directory
+    /// components, and key lists that have to produce a readable Parquet schema.
+    fn check_series(&self) -> Result<()> {
+        let bad = |msg: String| Err(Error::Config(msg));
 
         let mut seen_series = BTreeSet::new();
         // Folded, because the collision that matters is the one the *filesystem*
@@ -437,10 +488,10 @@ fn check_series_name(name: &str) -> Result<()> {
 
 /// A series resolved for the ingest hot path.
 ///
-/// The frame carries the series *name*, not an id, so without a handle every
-/// `append` would re-encode the same length prefix and UTF-8 bytes. This
-/// pre-encodes them once and the hot path `memcpy`s
-/// [`SeriesHandle::encoded_name`] — no hashing, no comparison, no allocation.
+/// Resolving a name to its schema is a hash lookup, and doing it per record
+/// would put one on the hot path for something that cannot change: a caller
+/// resolves once, outside its loop, and every `append` after that passes the
+/// schema by reference.
 ///
 /// It also pins the `epoch` it was resolved under, so a handle held across a
 /// `reload-config` keeps encoding under the layout it was built for.
@@ -449,26 +500,16 @@ pub struct SeriesHandle {
     name: String,
     keys: Vec<KeyDef>,
     epoch: u32,
-    encoded_name: Vec<u8>,
 }
 
 impl SeriesHandle {
     /// Resolve a series definition at a given schema epoch.
     pub fn new(series: &SeriesConfig, epoch: u32) -> Result<Self> {
         check_series_name(&series.name)?;
-        // u16 little-endian length prefix + UTF-8 bytes: byte-for-byte the
-        // frame's `series` field, so the encoder copies this verbatim. It must
-        // stay in step with the codec's field layout.
-        let len = u16::try_from(series.name.len()).expect("checked above");
-        let mut encoded_name = Vec::with_capacity(2 + series.name.len());
-        encoded_name.extend_from_slice(&len.to_le_bytes());
-        encoded_name.extend_from_slice(series.name.as_bytes());
-
         Ok(Self {
             name: series.name.clone(),
             keys: series.keys.clone(),
             epoch,
-            encoded_name,
         })
     }
 
@@ -489,18 +530,6 @@ impl SeriesHandle {
     /// Number of positional key values a frame for this series must carry.
     pub fn arity(&self) -> usize {
         self.keys.len()
-    }
-
-    /// The pre-encoded `series` field: `u16` little-endian length, then UTF-8.
-    pub fn encoded_name(&self) -> &[u8] {
-        &self.encoded_name
-    }
-
-    /// Position of a declared key. Linear because key lists are short and this
-    /// is deliberately not on the hot path — positional `keys` exists to avoid
-    /// it.
-    pub fn key_index(&self, name: &str) -> Option<usize> {
-        self.keys.iter().position(|k| k.name == name)
     }
 }
 
@@ -730,6 +759,26 @@ mod tests {
                 r#"{"server":{"max_batch_bytes":100},
                     "limits":{"max_record_bytes":16384},"series":[]}"#,
             ),
+            (
+                "zero fsync_interval_ms",
+                r#"{"wal":{"fsync_interval_ms":0},"series":[]}"#,
+            ),
+            (
+                "zero fsync_bytes",
+                r#"{"wal":{"fsync_bytes":0},"series":[]}"#,
+            ),
+            (
+                // A segment that cannot hold one record rolls on every record:
+                // millions of files an hour, all of them read into memory at
+                // once by the flush.
+                "segment_max_bytes below max_record_bytes",
+                r#"{"wal":{"segment_max_bytes":100},
+                    "limits":{"max_record_bytes":16384},"series":[]}"#,
+            ),
+            (
+                "zero segment_max_bytes",
+                r#"{"wal":{"segment_max_bytes":0},"series":[]}"#,
+            ),
         ];
         for (what, json) in cases {
             assert!(parse(json).is_err(), "should have rejected {what}: {json}");
@@ -756,6 +805,38 @@ mod tests {
         // collisions produce a duplicate column.
         assert!(
             parse(r#"{"series":[{"name":"a","keys":[{"name":"ts_local","type":"i64"}]}]}"#).is_ok()
+        );
+    }
+
+    /// The segment bound is relative, not absolute: small segments are a
+    /// legitimate choice — the tests here run on them — as long as the record
+    /// cap comes down with them.
+    #[test]
+    fn small_segments_are_fine_when_the_record_cap_matches() {
+        let cfg = parse(
+            r#"{"wal":{"segment_max_bytes":2048},
+                "limits":{"max_record_bytes":512},"series":[]}"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.wal.segment_max_bytes, 2048);
+
+        // Exactly one maximum-size record plus the header is the boundary, and
+        // the boundary itself is allowed.
+        let exact = 512 + SEGMENT_HEADER_BYTES;
+        assert!(
+            parse(&format!(
+                r#"{{"wal":{{"segment_max_bytes":{exact}}},
+                    "limits":{{"max_record_bytes":512}},"series":[]}}"#
+            ))
+            .is_ok()
+        );
+        assert!(
+            parse(&format!(
+                r#"{{"wal":{{"segment_max_bytes":{}}},
+                    "limits":{{"max_record_bytes":512}},"series":[]}}"#,
+                exact - 1
+            ))
+            .is_err()
         );
     }
 
@@ -791,29 +872,24 @@ mod tests {
     }
 
     #[test]
-    fn handle_pre_encodes_the_series_name() {
+    fn a_handle_carries_the_schema_and_the_epoch_it_resolved_at() {
         let cfg = parse(MINIMAL).unwrap();
         let h = SeriesHandle::new(cfg.find_series("trades").unwrap(), 7).unwrap();
 
-        // u16 little-endian length, then the UTF-8 bytes -- exactly the frame's
-        // `series` field, which the hot path copies verbatim.
-        assert_eq!(h.encoded_name(), b"\x06\x00trades");
         assert_eq!(h.name(), "trades");
-        assert_eq!(h.epoch(), 7);
+        assert_eq!(h.epoch(), 7, "pinned, so a later reload cannot move it");
         assert_eq!(h.arity(), 1);
-        assert_eq!(h.key_index("symbol"), Some(0));
-        assert_eq!(h.key_index("nope"), None);
+        assert_eq!(h.keys()[0].name, "symbol");
     }
 
+    /// The handle is where a bad series name is caught for an embedder who
+    /// builds a `SeriesConfig` by hand rather than going through `validate`.
     #[test]
-    fn handle_encodes_multibyte_names_by_byte_length() {
-        // The length prefix counts bytes, not characters: a two-byte 'é' must
-        // not make the decoder read one byte short.
+    fn a_handle_refuses_a_name_that_would_escape_the_data_directory() {
         let s = SeriesConfig {
-            name: "café".into(),
+            name: "../etc".into(),
             keys: vec![],
         };
-        let h = SeriesHandle::new(&s, 0).unwrap();
-        assert_eq!(h.encoded_name(), b"\x05\x00caf\xc3\xa9");
+        assert!(SeriesHandle::new(&s, 0).is_err());
     }
 }

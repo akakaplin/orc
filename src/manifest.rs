@@ -224,9 +224,12 @@ impl Manifest {
 
     /// The key list a frame stamped with `epoch` must be decoded against.
     ///
-    /// `None` becomes [`Error::UnknownEpoch`]: old epochs are never removed, so
-    /// a frame naming one that is absent can only come from a truncated or
-    /// hand-edited manifest.
+    /// `None` becomes a [`FrameFault::UnknownSchema`] at the reader, which the
+    /// flush counts and skips: old epochs are never removed, so a frame naming
+    /// one that is absent can only come from a truncated or hand-edited
+    /// manifest.
+    ///
+    /// [`FrameFault::UnknownSchema`]: crate::wal::reader::FrameFault::UnknownSchema
     pub fn schema(&self, series: &str, epoch: u32) -> Option<&[KeyDef]> {
         self.series
             .get(series)?

@@ -18,13 +18,12 @@
 //! `ARROW:schema` blob in every file.
 //!
 //! All it does for us is compute definition and repetition levels, which for
-//! this schema is the twenty lines in [`Columns::write_group`].
+//! this schema is the twenty lines in `MapLevels::for_rows`.
 //!
 //! The switch changed nothing structural: schema, data, row-group boundaries and
 //! statistics all compared identical against `ArrowWriter` output, and
 //! `tests/parquet_reference.rs` pins that.
 
-use std::collections::HashMap;
 use std::fs::File;
 use std::path::Path;
 use std::sync::Arc;
@@ -39,7 +38,7 @@ use parquet::file::properties::WriterProperties;
 use parquet::file::writer::SerializedFileWriter;
 use parquet::schema::types::{Type, TypePtr};
 
-use crate::config::{KeyDef, key_type_name};
+use crate::config::KeyDef;
 use crate::error::{Error, Result};
 use crate::record::{KeyType, Value};
 use crate::wal::SEGMENT_ID_DIGITS;
@@ -161,100 +160,70 @@ fn utf8(name: &str, rep: Repetition) -> Result<Type> {
 /// `defs` has an entry per row (1 present, 0 null); `vals` has one per *present*
 /// row. That asymmetry is the encoding — Parquet stores only the values that
 /// exist and reconstructs nulls from the levels.
+///
+/// The levels are the same shape whatever the column holds, so only the values
+/// are typed — which is what keeps each method below to one match instead of
+/// four parallel ones.
 #[derive(Debug)]
-enum KeyColumn {
-    Bool {
-        vals: Vec<bool>,
-        defs: Vec<i16>,
-    },
-    I64 {
-        vals: Vec<i64>,
-        defs: Vec<i16>,
-    },
-    F64 {
-        vals: Vec<f64>,
-        defs: Vec<i16>,
-    },
-    Str {
-        vals: Vec<ByteArray>,
-        defs: Vec<i16>,
-    },
+struct KeyColumn {
+    vals: Values,
+    defs: Vec<i16>,
+}
+
+/// The present values of one key column, in its declared type.
+#[derive(Debug)]
+enum Values {
+    Bool(Vec<bool>),
+    I64(Vec<i64>),
+    F64(Vec<f64>),
+    Str(Vec<ByteArray>),
 }
 
 impl KeyColumn {
     fn new(ty: KeyType, cap: usize) -> Self {
-        match ty {
-            KeyType::Bool => KeyColumn::Bool {
-                vals: Vec::with_capacity(cap),
-                defs: Vec::with_capacity(cap),
+        KeyColumn {
+            vals: match ty {
+                KeyType::Bool => Values::Bool(Vec::with_capacity(cap)),
+                KeyType::I64 => Values::I64(Vec::with_capacity(cap)),
+                KeyType::F64 => Values::F64(Vec::with_capacity(cap)),
+                KeyType::Str => Values::Str(Vec::with_capacity(cap)),
             },
-            KeyType::I64 => KeyColumn::I64 {
-                vals: Vec::with_capacity(cap),
-                defs: Vec::with_capacity(cap),
-            },
-            KeyType::F64 => KeyColumn::F64 {
-                vals: Vec::with_capacity(cap),
-                defs: Vec::with_capacity(cap),
-            },
-            KeyType::Str => KeyColumn::Str {
-                vals: Vec::with_capacity(cap),
-                defs: Vec::with_capacity(cap),
-            },
+            defs: Vec::with_capacity(cap),
         }
     }
 
     fn key_type(&self) -> KeyType {
-        match self {
-            KeyColumn::Bool { .. } => KeyType::Bool,
-            KeyColumn::I64 { .. } => KeyType::I64,
-            KeyColumn::F64 { .. } => KeyType::F64,
-            KeyColumn::Str { .. } => KeyType::Str,
-        }
-    }
-
-    fn defs(&self) -> &[i16] {
-        match self {
-            KeyColumn::Bool { defs, .. }
-            | KeyColumn::I64 { defs, .. }
-            | KeyColumn::F64 { defs, .. }
-            | KeyColumn::Str { defs, .. } => defs,
+        match self.vals {
+            Values::Bool(_) => KeyType::Bool,
+            Values::I64(_) => KeyType::I64,
+            Values::F64(_) => KeyType::F64,
+            Values::Str(_) => KeyType::Str,
         }
     }
 
     fn append(&mut self, v: &Value<'_>, series: &str, key: &str) -> Result<()> {
-        // Read the expected type before the match borrows `self` mutably.
+        // Null satisfies any column: a level, and no value to go with it.
+        if matches!(v, Value::Null) {
+            self.defs.push(0);
+            return Ok(());
+        }
+        // Read the expected type before the match borrows the values mutably.
         let expected = self.key_type();
-        let got = v.key_type();
-        match (self, v) {
-            (KeyColumn::Bool { vals, defs }, Value::Bool(x)) => {
-                vals.push(*x);
-                defs.push(1);
-            }
-            (KeyColumn::I64 { vals, defs }, Value::I64(x)) => {
-                vals.push(*x);
-                defs.push(1);
-            }
-            (KeyColumn::F64 { vals, defs }, Value::F64(x)) => {
-                vals.push(*x);
-                defs.push(1);
-            }
-            (KeyColumn::Str { vals, defs }, Value::Str(x)) => {
-                vals.push(ByteArray::from(x.as_bytes().to_vec()));
-                defs.push(1);
-            }
-            (KeyColumn::Bool { defs, .. }, Value::Null)
-            | (KeyColumn::I64 { defs, .. }, Value::Null)
-            | (KeyColumn::F64 { defs, .. }, Value::Null)
-            | (KeyColumn::Str { defs, .. }, Value::Null) => defs.push(0),
+        match (&mut self.vals, v) {
+            (Values::Bool(xs), Value::Bool(x)) => xs.push(*x),
+            (Values::I64(xs), Value::I64(x)) => xs.push(*x),
+            (Values::F64(xs), Value::F64(x)) => xs.push(*x),
+            (Values::Str(xs), Value::Str(x)) => xs.push(ByteArray::from(x.as_bytes().to_vec())),
             _ => {
                 return Err(Error::TypeMismatch {
                     series: series.to_string(),
                     key: key.to_string(),
                     expected,
-                    got,
+                    got: v.key_type(),
                 });
             }
         }
+        self.defs.push(1);
         Ok(())
     }
 }
@@ -423,6 +392,93 @@ impl RowBuilder {
     }
 }
 
+/// Definition and repetition levels for one row group's `extra` map — the only
+/// place in this schema where levels are not trivially all-present.
+///
+/// This is the twenty lines of arithmetic that reaching for `ArrowWriter` would
+/// have bought, so it is worth stating exactly. `key` sits inside a REPEATED
+/// group under a REQUIRED one, so its maximum definition level is 1 and its
+/// maximum repetition level is 1. `value` is OPTIONAL inside that group, so its
+/// maximum definition level is 2.
+///
+/// ```text
+/// empty map    -> def 0,   rep 0   one slot standing for "no entries"
+/// entry 0      -> def 1/2, rep 0   rep 0 opens a new row
+/// entry i > 0  -> def 1/2, rep 1   rep 1 continues this row's list
+/// ```
+///
+/// A row's entries are always emitted together, so a row group boundary can
+/// never land inside a list and the first record of every group is guaranteed
+/// rep 0 — which is what the format requires.
+#[derive(Debug)]
+struct MapLevels {
+    key_defs: Vec<i16>,
+    value_defs: Vec<i16>,
+    reps: Vec<i16>,
+    /// Present entries across these rows: how far to advance the value cursor,
+    /// and how many values the writer will consume.
+    entries: usize,
+}
+
+impl MapLevels {
+    fn for_rows(counts: &[u32]) -> Self {
+        let entries: usize = counts.iter().map(|&n| n as usize).sum();
+        // An empty map still occupies one slot, so the level arrays are longer
+        // than the value arrays by the number of rows with no entries.
+        let slots = entries + counts.iter().filter(|&&n| n == 0).count();
+
+        let mut out = MapLevels {
+            key_defs: Vec::with_capacity(slots),
+            value_defs: Vec::with_capacity(slots),
+            reps: Vec::with_capacity(slots),
+            entries,
+        };
+        for &count in counts {
+            if count == 0 {
+                out.key_defs.push(0);
+                out.value_defs.push(0);
+                out.reps.push(0);
+                continue;
+            }
+            for i in 0..count {
+                out.key_defs.push(1);
+                // A null value is never appended, so a present entry is always
+                // at the maximum definition level.
+                out.value_defs.push(2);
+                out.reps.push(if i == 0 { 0 } else { 1 });
+            }
+        }
+        out
+    }
+}
+
+fn io_err(e: parquet::errors::ParquetError) -> Error {
+    Error::Config(format!("writing parquet: {e}"))
+}
+
+/// Write one BYTE_ARRAY column and close it.
+///
+/// Four of the seven leaves are byte arrays — `id`, both halves of the map, and
+/// `data` — and the open/match/close around each is identical. Only the levels
+/// differ, so they are the parameters.
+fn write_bytes<W: std::io::Write + Send>(
+    rg: &mut parquet::file::writer::SerializedRowGroupWriter<'_, W>,
+    what: &'static str,
+    vals: &[ByteArray],
+    defs: Option<&[i16]>,
+    reps: Option<&[i16]>,
+) -> Result<()> {
+    let mut c = rg.next_column().map_err(io_err)?.expect(what);
+    match c.untyped() {
+        ColumnWriter::ByteArrayColumnWriter(w) => {
+            w.write_batch(vals, defs, reps).map_err(io_err)?
+        }
+        _ => unreachable!("{what} is BYTE_ARRAY"),
+    };
+    c.close().map_err(io_err)?;
+    Ok(())
+}
+
 impl Columns {
     pub fn num_rows(&self) -> usize {
         self.rows
@@ -443,31 +499,22 @@ impl Columns {
         end: usize,
         cursors: &mut Cursors,
     ) -> Result<()> {
-        let io = |e: parquet::errors::ParquetError| Error::Config(format!("writing parquet: {e}"));
-
         // -- ts: REQUIRED, so no levels are needed at all ---------------------
-        let mut c = rg.next_column().map_err(io)?.expect("ts column");
+        let mut c = rg.next_column().map_err(io_err)?.expect("ts column");
         match c.untyped() {
             ColumnWriter::Int64ColumnWriter(w) => w
                 .write_batch(&self.ts[start..end], None, None)
-                .map_err(io)?,
+                .map_err(io_err)?,
             _ => unreachable!("ts is INT64"),
         };
-        c.close().map_err(io)?;
+        c.close().map_err(io_err)?;
 
         // -- id: REQUIRED -----------------------------------------------------
-        let mut c = rg.next_column().map_err(io)?.expect("id column");
-        match c.untyped() {
-            ColumnWriter::ByteArrayColumnWriter(w) => w
-                .write_batch(&self.id[start..end], None, None)
-                .map_err(io)?,
-            _ => unreachable!("id is BYTE_ARRAY"),
-        };
-        c.close().map_err(io)?;
+        write_bytes(rg, "id", &self.id[start..end], None, None)?;
 
         // -- declared keys: OPTIONAL, def level 1 present / 0 null ------------
         for (i, column) in self.keys.iter().enumerate() {
-            let defs = &column.defs()[start..end];
+            let defs = &column.defs[start..end];
             // Only present rows contributed a value, so the slice of values this
             // group owns is as long as the number of 1s in its levels.
             let present = defs.iter().filter(|&&d| d == 1).count();
@@ -475,98 +522,40 @@ impl Columns {
             let to = from + present;
             cursors.keys[i] = to;
 
-            let mut c = rg.next_column().map_err(io)?.expect("key column");
-            match (c.untyped(), column) {
-                (ColumnWriter::BoolColumnWriter(w), KeyColumn::Bool { vals, .. }) => w
-                    .write_batch(&vals[from..to], Some(defs), None)
-                    .map_err(io)?,
-                (ColumnWriter::Int64ColumnWriter(w), KeyColumn::I64 { vals, .. }) => w
-                    .write_batch(&vals[from..to], Some(defs), None)
-                    .map_err(io)?,
-                (ColumnWriter::DoubleColumnWriter(w), KeyColumn::F64 { vals, .. }) => w
-                    .write_batch(&vals[from..to], Some(defs), None)
-                    .map_err(io)?,
-                (ColumnWriter::ByteArrayColumnWriter(w), KeyColumn::Str { vals, .. }) => w
-                    .write_batch(&vals[from..to], Some(defs), None)
-                    .map_err(io)?,
+            let mut c = rg.next_column().map_err(io_err)?.expect("key column");
+            match (c.untyped(), &column.vals) {
+                (ColumnWriter::BoolColumnWriter(w), Values::Bool(v)) => w
+                    .write_batch(&v[from..to], Some(defs), None)
+                    .map_err(io_err)?,
+                (ColumnWriter::Int64ColumnWriter(w), Values::I64(v)) => w
+                    .write_batch(&v[from..to], Some(defs), None)
+                    .map_err(io_err)?,
+                (ColumnWriter::DoubleColumnWriter(w), Values::F64(v)) => w
+                    .write_batch(&v[from..to], Some(defs), None)
+                    .map_err(io_err)?,
+                (ColumnWriter::ByteArrayColumnWriter(w), Values::Str(v)) => w
+                    .write_batch(&v[from..to], Some(defs), None)
+                    .map_err(io_err)?,
                 _ => unreachable!("column writer disagrees with the schema we built"),
             };
-            c.close().map_err(io)?;
+            c.close().map_err(io_err)?;
         }
 
         // -- extra: the only place levels are non-trivial ---------------------
-        //
-        // `key` sits inside a REPEATED group under a REQUIRED one, so its max
-        // definition level is 1 and its max repetition level is 1. `value` is
-        // OPTIONAL inside that group, so its max definition level is 2.
-        //
-        //   empty map   -> def 0, rep 0   (one slot standing for "no entries")
-        //   entry 0     -> def 1/2, rep 0 (rep 0 opens a new row)
-        //   entry i > 0 -> def 1/2, rep 1 (rep 1 continues this row's list)
-        //
-        // A row's entries are always written together, so a row group boundary
-        // can never land inside a list and the first record of every group is
-        // guaranteed rep 0 — which is what the format requires.
-        let entries: usize = self.extra_counts[start..end]
-            .iter()
-            .map(|&n| n as usize)
-            .sum();
-        let slots = entries
-            + self.extra_counts[start..end]
-                .iter()
-                .filter(|&&n| n == 0)
-                .count();
-
-        let mut key_defs: Vec<i16> = Vec::with_capacity(slots);
-        let mut value_defs: Vec<i16> = Vec::with_capacity(slots);
-        let mut reps: Vec<i16> = Vec::with_capacity(slots);
-        for &count in &self.extra_counts[start..end] {
-            if count == 0 {
-                key_defs.push(0);
-                value_defs.push(0);
-                reps.push(0);
-                continue;
-            }
-            for i in 0..count {
-                key_defs.push(1);
-                // We never append a null value, so a present entry is always at
-                // the maximum definition level.
-                value_defs.push(2);
-                reps.push(if i == 0 { 0 } else { 1 });
-            }
-        }
+        let levels = MapLevels::for_rows(&self.extra_counts[start..end]);
 
         let from = cursors.extra;
-        let to = from + entries;
+        let to = from + levels.entries;
         cursors.extra = to;
 
-        let mut c = rg.next_column().map_err(io)?.expect("extra.key column");
-        match c.untyped() {
-            ColumnWriter::ByteArrayColumnWriter(w) => w
-                .write_batch(&self.extra_keys[from..to], Some(&key_defs), Some(&reps))
-                .map_err(io)?,
-            _ => unreachable!("extra.key is BYTE_ARRAY"),
-        };
-        c.close().map_err(io)?;
-
-        let mut c = rg.next_column().map_err(io)?.expect("extra.value column");
-        match c.untyped() {
-            ColumnWriter::ByteArrayColumnWriter(w) => w
-                .write_batch(&self.extra_values[from..to], Some(&value_defs), Some(&reps))
-                .map_err(io)?,
-            _ => unreachable!("extra.value is BYTE_ARRAY"),
-        };
-        c.close().map_err(io)?;
+        let keys = &self.extra_keys[from..to];
+        let values = &self.extra_values[from..to];
+        let reps = Some(levels.reps.as_slice());
+        write_bytes(rg, "extra.key", keys, Some(&levels.key_defs), reps)?;
+        write_bytes(rg, "extra.value", values, Some(&levels.value_defs), reps)?;
 
         // -- data: REQUIRED ---------------------------------------------------
-        let mut c = rg.next_column().map_err(io)?.expect("data column");
-        match c.untyped() {
-            ColumnWriter::ByteArrayColumnWriter(w) => w
-                .write_batch(&self.data[start..end], None, None)
-                .map_err(io)?,
-            _ => unreachable!("data is BYTE_ARRAY"),
-        };
-        c.close().map_err(io)?;
+        write_bytes(rg, "data", &self.data[start..end], None, None)?;
 
         Ok(())
     }
@@ -709,22 +698,6 @@ pub struct WrittenFile {
     pub epoch: u32,
     pub hour: String,
     pub rows: usize,
-}
-
-/// Column names in schema order — useful for generating `view.sql`.
-pub fn column_names(keys: &[KeyDef]) -> Vec<String> {
-    let mut v = vec!["ts".to_string(), "id".to_string()];
-    v.extend(keys.iter().map(|k| k.name.clone()));
-    v.push("extra".to_string());
-    v.push("data".to_string());
-    v
-}
-
-/// Declared key types as config spells them, for diagnostics.
-pub fn key_type_names(keys: &[KeyDef]) -> HashMap<String, &'static str> {
-    keys.iter()
-        .map(|k| (k.name.clone(), key_type_name(k.ty)))
-        .collect()
 }
 
 #[cfg(test)]

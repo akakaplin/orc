@@ -39,7 +39,7 @@ use std::time::{Duration, SystemTime};
 
 use crate::codec::{self, SEGMENT_HEADER_BYTES};
 use crate::error::{Error, Result};
-use crate::wal::{fsync_dir, list_segments, segment_path, wal_dir};
+use crate::wal::{fsync_dir, list_segments, quarantine_segment, segment_path, wal_dir};
 
 /// The lockfile, in `data_dir`. Holds the pid of the engine that owns the
 /// directory.
@@ -54,13 +54,6 @@ pub const LOCK_STALE_MS: u64 = 10_000;
 /// [`LOCK_STALE_MS`], because the cost of being late is another process
 /// deciding you are dead.
 pub const LOCK_HEARTBEAT_MS: u64 = 1_000;
-
-/// Extension given to a segment whose header would not parse: `<id>.wal.corrupt`.
-///
-/// Deliberately not a `.wal` name, so [`list_segments`] stops seeing it and the
-/// writer is free to move past the id — while the bytes stay where an operator
-/// can find them.
-pub const CORRUPT_EXT: &str = "wal.corrupt";
 
 /// Is this `Corrupt` reason "the wrong binary" rather than "damaged bytes"?
 fn version_mismatch(reason: &str) -> bool {
@@ -139,11 +132,6 @@ impl DirLock {
     /// takes as its heartbeat path.
     pub fn path(&self) -> &Path {
         &self.path
-    }
-
-    /// The pid recorded in the lock: this process.
-    pub fn pid(&self) -> u32 {
-        self.pid
     }
 
     /// Prove the owner is still alive. The WAL committer calls this about once a
@@ -302,9 +290,7 @@ pub fn recover(data_dir: impl AsRef<Path>, last_flushed_segment: u64) -> Result<
             // are not replayed, and the name is free for the writer to reuse)
             // while leaving every byte on disk to be recovered by hand.
             TailHeader::Corrupt(reason) if !version_mismatch(reason) => {
-                let quarantined = path.with_extension(CORRUPT_EXT);
-                std::fs::rename(&path, &quarantined)?;
-                fsync_dir(&dir)?;
+                let quarantined = quarantine_segment(data_dir, tail)?;
                 ids.pop();
                 out.quarantined.push(tail);
                 tracing::error!(
@@ -435,7 +421,7 @@ mod tests {
     use super::*;
     use crate::codec::{encode, encode_segment_header};
     use crate::record::{Row, Value};
-    use crate::wal::{FIRST_SEGMENT, segment_name};
+    use crate::wal::{CORRUPT_EXT, FIRST_SEGMENT, segment_name};
 
     const MAX: usize = 16 * 1024;
 

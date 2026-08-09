@@ -202,8 +202,11 @@ where
     }
 
     /// Offset of the next frame — also, after iteration ends, the offset of the
-    /// first byte the reader could not use. That is exactly where recovery
-    /// truncates.
+    /// first byte the reader could not use.
+    ///
+    /// The same offset startup recovery truncates at, though it computes it with
+    /// its own scan: this one needs a schema for every frame, and recovery
+    /// deliberately runs before it has one.
     pub fn offset(&self) -> usize {
         self.at
     }
@@ -286,7 +289,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::codec::{encode, encode_segment_header};
+    use crate::codec::{encode, encode_segment_header, reseal};
     use crate::record::Row;
 
     const MAX: usize = 16 * 1024;
@@ -496,14 +499,5 @@ mod tests {
         let buf = segment(3, &[("s", 0, "x", 1)]);
         std::fs::write(&path, &buf).unwrap();
         assert_eq!(read_segment(&path).unwrap(), buf);
-    }
-
-    /// Recompute a frame's CRC after forging its bytes, so a test can build a
-    /// frame that is intact but structurally wrong.
-    fn reseal(frame: &mut [u8]) {
-        let mut h = crc32fast::Hasher::new();
-        h.update(&frame[..4]);
-        h.update(&frame[8..]);
-        frame[4..8].copy_from_slice(&h.finalize().to_le_bytes());
     }
 }
