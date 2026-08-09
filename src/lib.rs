@@ -1,4 +1,4 @@
-//! `orc-core` — an embeddable time-series storage engine.
+//! `orc` — an embeddable time-series storage engine.
 //!
 //! Records are appended to a write-ahead log at sub-microsecond latency and
 //! periodically flushed to sorted Parquet that DuckDB, polars and Spark can read

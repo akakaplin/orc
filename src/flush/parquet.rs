@@ -22,9 +22,11 @@
 //! The only thing it actually does for us is compute definition and repetition
 //! levels, which for this schema is the twenty lines in [`Columns::write_group`].
 //!
-//! Everything a reader can observe is unchanged, and
-//! `tests/parquet_reference.rs` pins that: identical physical schema, identical
-//! data, identical row-group boundaries, identical statistics.
+//! The switch changed nothing about the file's *structure*: schema, data,
+//! row-group boundaries and statistics all compared identical against
+//! `ArrowWriter` output, and `tests/parquet_reference.rs` pins that. Two things
+//! did change, both deliberately and both since: the `ARROW:schema` blob is
+//! gone, and the compression codec is now LZ4_RAW rather than zstd.
 
 use std::collections::HashMap;
 use std::fs::File;

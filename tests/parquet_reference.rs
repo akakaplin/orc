@@ -1,15 +1,21 @@
 //! The observable Parquet contract, pinned.
 //!
-//! Every assertion here was verified byte-for-byte against output from
-//! `ArrowWriter` before the writer was rewritten to use the low-level API: the
-//! same three fixtures were produced by both, and 2244 lines of dumped schema,
-//! row-group boundaries, statistics, key-value metadata, data and per-row map
-//! cardinality compared identical.
+//! Every assertion here was checked against `ArrowWriter` output before the
+//! writer was rewritten to use the low-level API: the same three fixtures were
+//! produced by both, and 2244 lines of dumped schema, row-group boundaries,
+//! statistics, key-value metadata, data and per-row map cardinality compared
+//! identical. Not a byte comparison — page layout and compression framing are
+//! free to differ — but everything a reader can actually observe.
 //!
 //! That comparison cannot live in the repository, because it needs the Arrow
 //! writer that was removed. What it established can, and this is it. If any of
 //! these change, files this engine writes stop looking like files it used to
 //! write — which readers, and the `view.sql` union across epochs, both depend on.
+//!
+//! The fixtures were zstd-compressed when the comparison ran; the tests below
+//! write LZ4_RAW, which the engine switched to afterwards. Nothing here depends
+//! on the codec — that is the point of comparing observable structure rather
+//! than bytes.
 
 use std::path::Path;
 

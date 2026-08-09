@@ -1,9 +1,9 @@
 //! Civil date arithmetic, in place of a direct `chrono` dependency.
 //!
-//! `chrono` is present transitively (both `parquet` and `arrow-array` require
-//! it), so this module saves no compile time. What it avoids is a *direct*
-//! dependency on a crate whose presence is an implementation detail of something
-//! else — if `parquet` ever drops it, nothing here breaks.
+//! `chrono` is present transitively — `parquet` requires it unconditionally, at
+//! any feature set — so this module saves no compile time. What it avoids is a
+//! *direct* dependency on a crate whose presence is an implementation detail of
+//! something else: if `parquet` ever drops it, nothing here breaks.
 //!
 //! All timestamps in the engine are `i64` epoch **microseconds**, UTC.
 //!

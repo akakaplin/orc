@@ -6,9 +6,9 @@
 //! path, so legibility wins: an operator can drive the whole surface with
 //! `nc`, and a stuck server can be diagnosed without a decoder.
 //!
-//! Lives in `orc-core` rather than in either networked crate so the two cannot
-//! drift apart. It brings no ZeroMQ dependency with it — these are plain serde
-//! types, and the sockets that carry them are somebody else's problem.
+//! Compiled unconditionally, outside the `net` feature that gates the sockets:
+//! these are plain serde types, so a program that speaks the protocol without
+//! using our client — or that only wants to render a reply — needs no ZeroMQ.
 
 use serde::{Deserialize, Serialize};
 

@@ -8,8 +8,9 @@ polars and Spark read directly.
 is the trade it makes — no query engine to build or maintain, and your data is in an
 open format from the moment it lands.
 
-> **Status: v0.1.** Works end to end — append, durable WAL, crash recovery, hourly
-> flush to sorted Parquet, and a ZeroMQ server and client. See [Roadmap](#roadmap).
+> **Status: 0.1.0, unreleased.** Works end to end — append, durable WAL, crash
+> recovery, hourly flush to sorted Parquet, and a ZeroMQ server and client.
+> Nothing is published to crates.io yet. See [Roadmap](#roadmap).
 
 ## Design in one screen
 
@@ -36,17 +37,18 @@ open format from the moment it lands.
 
 ## Three ways to use it
 
-One crate, one dependency. ZeroMQ lives behind the optional `net` feature, so the
-embedded case never compiles a C++ toolchain.
+One crate, three feature levels. ZeroMQ lives behind the optional `net` feature, so
+the embedded case builds with rustc alone — no C or C++ toolchain anywhere in the
+default tree.
 
 ```toml
-orc = "0.1"                                   # embedded engine only — 46 crates
-orc = { version = "0.1", features = ["net"] } # + client and server — 77
-orc = { version = "0.1", features = ["cli"] } # + the two binaries — 95
+orc = "0.1"                                   # embedded engine only — 39 crates
+orc = { version = "0.1", features = ["net"] } # + client and server — 75
+orc = { version = "0.1", features = ["cli"] } # + the two binaries — 93
 ```
 
 `cli` is separate from `net` on purpose: argument parsing and log formatting are
-28 crates that a program embedding the client has no use for.
+18 crates that a program embedding the client has no use for.
 
 **Embedded** — the engine in your process:
 
@@ -182,11 +184,16 @@ high-water mark by default rather than dropping silently.
 Deliberately minimal: Parquet, ZeroMQ and JSON are the sanctioned surface, plus two
 small approved conveniences. Everything else is hand-rolled.
 
+Of the 39 crates in a default build, **26 are `parquet`'s own** — it pulls `chrono`,
+`ahash`, `half`, `bytes`, `num-*`, `twox-hash` and the rest at *any* feature set,
+including none. The 13 we add are `serde` + `serde_json` (7), `lz4_flex` (1),
+`crc32fast` (1, free as above) and `tracing` (4).
+
 | Crate | Where | Why |
 | --- | --- | --- |
 | `parquet` | default | Output format. **Without the `arrow` feature** — see below. Codec is `lz4` (pure Rust, 1 crate), not `zstd` (8 crates and a C compiler). |
 | `serde`, `serde_json` | default | Config, manifest and control protocol — never the ingest path. |
-| `crc32fast`, `tracing` | default | Approved conveniences. |
+| `crc32fast`, `tracing` | default | Approved conveniences. `crc32fast` is free — parquet's `crc` feature pulls it regardless. |
 | `zmq` | **`net`** | Transport. Always builds libzmq and libsodium from C source — `zmq-sys` has no system-library path — so this is the one that needs cmake and a C++ compiler. |
 | `clap`, `tracing-subscriber` | **`cli`** | The two binaries only, and `tracing-subscriber` without `env-filter`: per-target filtering costs five crates and one binary has no targets to filter between. Set `RUST_LOG` to a bare level. |
 
@@ -206,7 +213,7 @@ blob:
 | brotli | +4 | pure Rust | 11.3 MB | 0.26s | 27 ms |
 | gzip | +4 | pure Rust | 11.3 MB | 0.91s | 21 ms |
 
-zstd compresses 55% better, so the trade is real: **files are larger in exchange for a
+LZ4_RAW files are 55% larger, so the trade is real: **more disk in exchange for a
 pure-Rust build with no C compiler anywhere in the default tree.** LZ4_RAW reads
 fastest of the six, which matters for a write-only engine whose whole output exists to
 be queried. It is codec 7 (Parquet 2.9) — never the deprecated codec 5 `LZ4`, whose
@@ -237,7 +244,7 @@ see it. The network tests reach ZeroMQ through the `orc::zmq` re-export instead.
 
 ## Roadmap
 
-- [x] **M0** — workspace, pinned dependencies
+- [x] **M0** — single crate, pinned dependencies
 - [x] **M1** — config, manifest, per-series schema history
 - [x] **M2** — frame codec + WAL writer, committer thread
 - [x] **M3** — recovery: truncate-and-amend, heartbeated lock
@@ -249,10 +256,10 @@ see it. The network tests reach ZeroMQ through the `orc::zmq` re-export instead.
 ## Development
 
 ```sh
-cargo build                                    # engine only, no C++ toolchain
-cargo test                                     # 136 tests, still no libzmq
+cargo build                                    # engine only, pure Rust, no C toolchain
+cargo test                                     # 138 tests, still no libzmq
 cargo build --features cli                     # + ZeroMQ and binaries (builds libzmq)
-cargo test --features cli                      # 141 tests
+cargo test --features cli                      # 143 tests
 cargo clippy --all-targets --features cli -- -D warnings
 cargo fmt --all --check
 ./scripts/check-deps.sh                        # dependency budget

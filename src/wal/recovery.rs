@@ -13,9 +13,12 @@
 //! older than [`LOCK_STALE_MS`] is treated as abandoned and taken over, with a
 //! warning naming the dead pid. The common case self-heals while two live
 //! engines still cannot share one directory. (`flock` would give this for free
-//! from the OS, but only via a `libc` dependency `orc-core` does not otherwise
-//! need.) `--force-unlock` remains for the pathological case of a process that
-//! is genuinely stuck but alive.
+//! from the OS, but only via a *direct* `libc` dependency. `libc` is in the tree
+//! transitively — `parquet` reaches it through `ahash` and `getrandom` — so the
+//! cost would be the direct dependency and the `unsafe` call, not a new crate.
+//! Worth revisiting if the heartbeat ever proves fragile.) `--force-unlock`
+//! remains for the pathological case of a process that is genuinely stuck but
+//! alive.
 //!
 //! # Only the tail segment is scanned
 //!
