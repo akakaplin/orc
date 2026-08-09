@@ -57,6 +57,14 @@ pub struct ServerConfig {
     pub control_endpoint: String,
     /// Receive high-water mark, in messages.
     pub rcv_hwm: i32,
+    /// Largest ingest message libzmq will accept, in bytes.
+    ///
+    /// `limits.max_record_bytes` bounds one *frame*; without this, nothing bounds
+    /// the *batch* that carries them. libzmq's own default is unlimited, so a
+    /// single hostile message would be allocated in full before the first frame
+    /// inside it is looked at, and `append_batch` would write it to one segment
+    /// whatever `wal.segment_max_bytes` says.
+    pub max_batch_bytes: i64,
 }
 
 /// The ways bad input can hurt the engine, each with a bound.
@@ -106,6 +114,12 @@ pub struct WalConfig {
 pub struct FlushConfig {
     /// How often to dump. Also the delay before ingested data becomes visible
     /// to readers, since the engine is write-only.
+    ///
+    /// `0` disables the timer entirely, leaving flushing to explicit
+    /// [`Engine::flush`](crate::engine::Engine::flush) calls and the control
+    /// socket. That is a real choice for an embedding application that wants to
+    /// own the schedule — but it means nothing else ever will, and the WAL is
+    /// not capped.
     pub interval_ms: u64,
     /// Flush at startup *if more than `interval_ms` has already elapsed* since
     /// the manifest's `last_flush_at` — not unconditionally, which on an engine
@@ -177,6 +191,10 @@ impl Default for ServerConfig {
             ingest_endpoint: "tcp://127.0.0.1:5555".into(),
             control_endpoint: "tcp://127.0.0.1:5556".into(),
             rcv_hwm: 100_000,
+            // Comfortably above any sane batch (the client's default batch is
+            // 1024 records) and far below anything that threatens the flush,
+            // which holds every consumed segment in memory at once.
+            max_batch_bytes: 8_388_608, // 8 MiB
         }
     }
 }
@@ -283,6 +301,32 @@ impl Config {
         if self.flush.row_group_rows == 0 {
             return bad("flush.row_group_rows must be greater than 0".into());
         }
+        // The timer converts this to microseconds as an i64. Bounding it here
+        // keeps that conversion honest and rejects a value that can only be a
+        // typo -- a century is not a flush interval.
+        if self.flush.interval_ms > MAX_FLUSH_INTERVAL_MS {
+            return bad(format!(
+                "flush.interval_ms {} is out of range; the maximum is {} (~100 years), \
+                 and 0 disables the timer",
+                self.flush.interval_ms, MAX_FLUSH_INTERVAL_MS
+            ));
+        }
+        // Negative skew would move the accept window's *upper* bound into the
+        // past, so every live record fails `check_ts` -- a total ingest outage
+        // from a config field documented as "how far past `now`".
+        if self.limits.ts_max_skew_ms < 0 {
+            return bad(format!(
+                "limits.ts_max_skew_ms must not be negative (got {}); it is how far \
+                 past `now` a timestamp may be, so a negative value rejects all live data",
+                self.limits.ts_max_skew_ms
+            ));
+        }
+        if self.server.max_batch_bytes <= 0 {
+            return bad(format!(
+                "server.max_batch_bytes must be greater than 0 (got {})",
+                self.server.max_batch_bytes
+            ));
+        }
         if !SUPPORTED_COMPRESSION.contains(&self.flush.compression.as_str()) {
             return bad(format!(
                 "flush.compression {:?} is not compiled in; supported: {}",
@@ -320,6 +364,18 @@ impl Config {
                 if k.name.is_empty() {
                     return bad(format!("series {:?} has a key with an empty name", s.name));
                 }
+                if RESERVED_KEY_NAMES.contains(&k.name.as_str()) {
+                    return bad(format!(
+                        "series {:?} declares a key named {:?}, which collides with a column \
+                         every Parquet file already has; the reserved names are {}. \
+                         Parquet does not reject a duplicate field name, so this would write \
+                         files with two columns of one name -- unreadable by the generated \
+                         view.sql and mis-parsed by anything that goes by column name.",
+                        s.name,
+                        k.name,
+                        RESERVED_KEY_NAMES.join(", ")
+                    ));
+                }
                 if !seen_keys.insert(k.name.as_str()) {
                     return bad(format!(
                         "series {:?} declares key {:?} twice; keys are positional, so a \
@@ -337,6 +393,24 @@ impl Config {
         self.series.iter().find(|s| s.name == name)
     }
 }
+
+/// Column names every Parquet file carries, which a declared key may not reuse.
+///
+/// `parquet_schema` emits `ts, id, <keys...>, extra, data`, and parquet's group
+/// builder does not check for duplicate field names — so a key called `ts` writes
+/// a perfectly valid-looking file with two `ts` columns. Nothing downstream
+/// survives that: `view.sql` becomes invalid SQL, and both `flush::read` and any
+/// external reader dispatch on the name.
+///
+/// Kept next to [`Config::validate`] rather than in `flush::parquet` because the
+/// check has to happen at load. The alternative is discovering it at the first
+/// flush an hour later, with a WAL that has nowhere to go — the same reasoning
+/// that puts the compression check here.
+pub const RESERVED_KEY_NAMES: [&str; 4] = ["ts", "id", "extra", "data"];
+
+/// Upper bound on `flush.interval_ms`: ~100 years, comfortably past any real
+/// schedule and comfortably short of overflowing the microsecond conversion.
+const MAX_FLUSH_INTERVAL_MS: u64 = 100 * 365 * 24 * 60 * 60 * 1_000;
 
 /// Series names become path components under `series/` and are carried in every
 /// frame with a `u16` length, so they are constrained beyond "non-empty".
@@ -637,10 +711,53 @@ mod tests {
                 "key with no type",
                 r#"{"series":[{"name":"a","keys":[{"name":"k"}]}]}"#,
             ),
+            (
+                "negative ts_max_skew_ms",
+                r#"{"limits":{"ts_max_skew_ms":-1},"series":[]}"#,
+            ),
+            (
+                "absurd flush interval",
+                r#"{"flush":{"interval_ms":18446744073709551615},"series":[]}"#,
+            ),
+            (
+                "zero max_batch_bytes",
+                r#"{"server":{"max_batch_bytes":0},"series":[]}"#,
+            ),
         ];
         for (what, json) in cases {
             assert!(parse(json).is_err(), "should have rejected {what}: {json}");
         }
+    }
+
+    /// A key named after one of the four fixed columns would write a Parquet
+    /// file with two fields of that name. Parquet's own builder does not object,
+    /// so nothing downstream catches it: this check is the only thing standing
+    /// between that config and an unreadable dataset.
+    #[test]
+    fn a_key_may_not_be_named_after_a_fixed_column() {
+        for reserved in RESERVED_KEY_NAMES {
+            let json = format!(
+                r#"{{"series":[{{"name":"trades","keys":[{{"name":"{reserved}","type":"i64"}}]}}]}}"#
+            );
+            let err = parse(&json).unwrap_err().to_string();
+            assert!(
+                err.contains(reserved),
+                "rejecting {reserved:?} should name it: {err}"
+            );
+        }
+        // A name that merely contains a reserved word is fine -- only exact
+        // collisions produce a duplicate column.
+        assert!(
+            parse(r#"{"series":[{"name":"a","keys":[{"name":"ts_local","type":"i64"}]}]}"#).is_ok()
+        );
+    }
+
+    /// `0` is the documented "no timer, caller drives the flush" setting, so it
+    /// must survive validation even though every other bound rejects zero.
+    #[test]
+    fn a_zero_flush_interval_is_allowed_and_means_no_timer() {
+        let cfg = parse(r#"{"flush":{"interval_ms":0},"series":[]}"#).unwrap();
+        assert_eq!(cfg.flush.interval_ms, 0);
     }
 
     #[test]

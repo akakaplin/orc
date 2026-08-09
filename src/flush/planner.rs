@@ -50,12 +50,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::config::{Config, KeyDef};
 use crate::error::Result;
-use crate::flush::parquet::{RowBuilder, WrittenFile, output_file_name, write_file};
+use crate::flush::parquet::{
+    RowBuilder, WrittenFile, output_file_name, parse_output_file_name, write_file,
+};
 use crate::flush::view::view_sql;
 use crate::manifest::Manifest;
 use crate::record::Value;
 use crate::time::hour_partition;
 use crate::wal::reader::{FrameFault, SegmentReader, read_segment};
+use crate::wal::recovery::CORRUPT_EXT;
 use crate::wal::{SEGMENT_ID_DIGITS, fsync_dir, segment_path, wal_dir};
 
 /// Where flushed Parquet lands, relative to `data_dir`.
@@ -105,6 +108,14 @@ pub struct FlushOutcome {
     pub rows_deduplicated: usize,
     /// Frames that could not be decoded, copied to `rejects/`.
     pub frames_rejected: usize,
+    /// Bytes of sealed segment that were never scanned, because a frame with an
+    /// undecodable length made everything after it unlocatable.
+    ///
+    /// Distinct from `frames_rejected`, which counts records: nobody knows how
+    /// many records are in here, only how many bytes. Non-zero means the storage
+    /// damaged data that was already acknowledged. The bytes go to `rejects/`
+    /// rather than being dropped on the floor.
+    pub bytes_skipped: u64,
 }
 
 /// Turn `segments` into Parquet, commit, and delete them.
@@ -137,16 +148,25 @@ pub fn run(
     }
 
     let mut rejects = RejectSink::new(data_dir, config.limits.reject_max_bytes);
-    let mut decoded = decode_segments(
-        &ids,
-        &bufs,
-        manifest,
-        config.limits.max_record_bytes,
-        &mut rejects,
-    );
+    let mut decoded = decode_segments(data_dir, &ids, &bufs, manifest, &mut rejects);
+
+    // A quarantined segment was renamed out of `wal/`, so it is neither consumed
+    // nor left to be re-read. Dropping it from `ids` keeps the outcome honest
+    // about what this flush actually turned into Parquet.
+    ids.retain(|id| !decoded.quarantined.contains(id));
+    if ids.is_empty() {
+        // Every segment offered was quarantined. There is nothing to write, and
+        // above all nothing to commit: advancing the watermark here would be the
+        // engine asserting that unreadable segments are durable in Parquet.
+        return Ok(FlushOutcome {
+            frames_rejected: decoded.frames_rejected,
+            bytes_skipped: decoded.bytes_skipped,
+            ..FlushOutcome::default()
+        });
+    }
 
     let rows_decoded: usize = decoded.groups.values().map(Vec::len).sum();
-    if rows_decoded == 0 && decoded.frames_rejected == 0 {
+    if rows_decoded == 0 && decoded.frames_rejected == 0 && decoded.bytes_skipped == 0 {
         // The genuine no-op: no empty Parquet file, no manifest write, and the
         // segments stay put. They cost one cheap re-scan on the next flush.
         return Ok(FlushOutcome::default());
@@ -154,6 +174,7 @@ pub fn run(
 
     let mut outcome = FlushOutcome {
         frames_rejected: decoded.frames_rejected,
+        bytes_skipped: decoded.bytes_skipped,
         ..FlushOutcome::default()
     };
 
@@ -247,6 +268,7 @@ pub fn run(
         rows = outcome.rows_written,
         deduplicated = outcome.rows_deduplicated,
         rejected = outcome.frames_rejected,
+        bytes_skipped = outcome.bytes_skipped,
         "flush committed"
     );
     Ok(outcome)
@@ -297,13 +319,17 @@ struct Decoded<'a> {
     groups: BTreeMap<(&'a str, u32), Vec<DecodedRow<'a>>>,
     schemas: BTreeMap<(String, u32), Vec<KeyDef>>,
     frames_rejected: usize,
+    bytes_skipped: u64,
+    /// Segments moved aside because their header would not parse. They are not
+    /// consumed and must not be deleted — see [`quarantine_segment`].
+    quarantined: Vec<u64>,
 }
 
 fn decode_segments<'a>(
+    data_dir: &Path,
     ids: &[u64],
     bufs: &'a [Vec<u8>],
     manifest: &Manifest,
-    max_record_bytes: usize,
     rejects: &mut RejectSink,
 ) -> Decoded<'a> {
     let mut out = Decoded::default();
@@ -328,14 +354,25 @@ fn decode_segments<'a>(
             arity
         };
 
-        let mut reader = match SegmentReader::new(buf, max_record_bytes, key_count) {
+        // The frame-length cap is the segment's own size, not the configured
+        // `limits.max_record_bytes`. That cap exists to stop a corrupt length
+        // prefix becoming a huge allocation, and nothing here allocates from a
+        // length -- the whole segment is already in memory. Applying it would
+        // mean lowering the config truncates every sealed segment at its first
+        // record above the new limit, silently discarding data that was durable
+        // before the edit.
+        let mut reader = match SegmentReader::new(buf, buf.len(), key_count) {
             Ok(r) => r,
             Err(err) => {
-                // A sealed segment with no readable header holds no locatable
-                // frames at all. Counting it and moving on is the only choice
-                // that keeps the flush able to finish.
-                out.frames_rejected += 1;
-                tracing::error!(segment = segment_id, %err, "skipping a wal segment with an unreadable header");
+                // No readable header means no locatable frames -- but the bytes
+                // behind it may be entirely intact, so the one thing that must
+                // not happen is what used to: skipping it here while the commit
+                // below advances the watermark past it and deletes it.
+                tracing::error!(segment = segment_id, %err, "wal segment header is unreadable");
+                if quarantine_segment(data_dir, segment_id) {
+                    out.quarantined.push(segment_id);
+                }
+                out.bytes_skipped += buf.len() as u64;
                 continue;
             }
         };
@@ -363,12 +400,26 @@ fn decode_segments<'a>(
                             rejects.append(segment_id, &buf[offset..offset + len]);
                         }
                         // Unknown length means the bytes cannot be delimited, so
-                        // there is nothing well-defined to copy and nothing
-                        // after this point can be found. Recovery amends the
-                        // *tail* segment, so reaching this in a sealed one means
-                        // the storage damaged bytes that were already acked.
-                        FrameFault::Undecodable { .. } => {
-                            tracing::error!(segment = segment_id, %fault, "stopping this segment's scan");
+                        // no frame after this point can be found. Recovery
+                        // amends the *tail* segment, so reaching this in a
+                        // sealed one means the storage damaged bytes that were
+                        // already acked.
+                        //
+                        // The rest of the segment is lost to the dataset either
+                        // way, but it is not nothing: copy it verbatim so it can
+                        // be examined, and count the bytes. Reporting one
+                        // rejected "frame" for a possibly enormous tail was the
+                        // part that made this invisible.
+                        FrameFault::Undecodable { offset, .. } => {
+                            let tail = &buf[offset..];
+                            out.bytes_skipped += tail.len() as u64;
+                            tracing::error!(
+                                segment = segment_id,
+                                %fault,
+                                bytes_skipped = tail.len(),
+                                "stopping this segment's scan; the remainder goes to rejects/"
+                            );
+                            rejects.append(segment_id, tail);
                         }
                     }
                     continue;
@@ -464,6 +515,136 @@ impl Sink<'_> {
             hour,
             rows: rows.len(),
         })
+    }
+}
+
+/// Remove everything an interrupted flush left behind.
+///
+/// Two kinds of debris, both from a flush that wrote files and then failed
+/// before [`Manifest::commit`]:
+///
+/// - **Staged files in `tmp/`.** A crash between `write_file` and the rename
+///   leaves a full-size Parquet file there. Nothing ever overwrote it, because
+///   the staging name embeds the segment range and the next flush covers a wider
+///   one. Staged files are uncommitted by definition, so the directory is emptied
+///   unconditionally.
+/// - **Orphan Parquet in `series/`.** Files are renamed into place *before* the
+///   commit, so a failure between the two leaves a real file describing rows that
+///   the next flush — now covering a wider segment range, hence a different name
+///   — writes again under a name of its own. Both then match the reader's glob
+///   and every row in the overlap is returned twice.
+///
+/// The rule for the second is exact: a committed file's `last_segment` is at most
+/// `last_flushed_segment`, because the commit that made it visible set the
+/// watermark to at least that. So a file whose range reaches *past* the watermark
+/// can only come from a flush that never committed. Anything whose name does not
+/// parse is left alone — this is the only place the engine deletes from
+/// `series/`, and it has no claim on files it did not write.
+///
+/// Runs at open, under the directory lock, so no flush can be in flight.
+pub fn sweep_uncommitted(data_dir: &Path, last_flushed_segment: u64) -> Result<()> {
+    let tmp = tmp_dir(data_dir);
+    if let Ok(entries) = std::fs::read_dir(&tmp) {
+        let mut files = 0u64;
+        let mut bytes = 0u64;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            bytes += entry.metadata().map(|m| m.len()).unwrap_or(0);
+            match std::fs::remove_file(&path) {
+                Ok(()) => files += 1,
+                Err(e) => {
+                    tracing::warn!(error = %e, path = %path.display(), "could not remove a stale staged file")
+                }
+            }
+        }
+        if files > 0 {
+            tracing::info!(
+                files,
+                bytes,
+                "removed staged files from an uncommitted flush"
+            );
+        }
+    }
+
+    let root = data_dir.join(SERIES_DIR);
+    let Ok(series) = std::fs::read_dir(&root) else {
+        return Ok(());
+    };
+    let mut removed = Vec::new();
+    for s in series.flatten() {
+        let Ok(hours) = std::fs::read_dir(s.path()) else {
+            continue;
+        };
+        for hour in hours.flatten() {
+            let Ok(files) = std::fs::read_dir(hour.path()) else {
+                continue;
+            };
+            for f in files.flatten() {
+                let name = f.file_name();
+                let Some((_, last, _)) = name.to_str().and_then(parse_output_file_name) else {
+                    continue;
+                };
+                if last <= last_flushed_segment {
+                    continue;
+                }
+                let path = f.path();
+                match std::fs::remove_file(&path) {
+                    Ok(()) => removed.push(path),
+                    Err(e) => {
+                        tracing::warn!(error = %e, path = %path.display(), "could not remove an orphan parquet file");
+                    }
+                }
+            }
+        }
+    }
+    if !removed.is_empty() {
+        // Loud on purpose. Nothing is lost -- the segments these came from were
+        // never consumed, so their rows are still in the WAL and the next flush
+        // writes them again -- but the engine deleting from `series/` at all is
+        // rare enough to be worth seeing.
+        tracing::warn!(
+            files = removed.len(),
+            last_flushed_segment,
+            "removed parquet files from a flush that never committed; their rows are still in the wal"
+        );
+        for path in &removed {
+            tracing::info!(path = %path.display(), "removed orphan parquet");
+        }
+    }
+    Ok(())
+}
+
+/// Move a segment out of `wal/` without destroying it.
+///
+/// The counterpart of the same move in recovery, for the same reason: an
+/// unreadable header says nothing about the frames behind it, so the file has to
+/// stop being part of the log without ceasing to exist. Renaming does both —
+/// [`list_segments`](crate::wal::list_segments) no longer sees it, and every byte
+/// stays where an operator can get at it.
+///
+/// Returns whether the rename happened. A failure is logged and swallowed: it
+/// leaves the segment where it is, which costs a repeated error on the next
+/// flush and loses nothing.
+fn quarantine_segment(data_dir: &Path, id: u64) -> bool {
+    let from = segment_path(data_dir, id);
+    let to = from.with_extension(CORRUPT_EXT);
+    match std::fs::rename(&from, &to) {
+        Ok(()) => {
+            tracing::error!(
+                segment = id,
+                path = %to.display(),
+                "quarantined an unreadable wal segment; its records are NOT in the dataset"
+            );
+            let _ = fsync_dir(&wal_dir(data_dir));
+            true
+        }
+        Err(e) => {
+            tracing::error!(error = %e, segment = id, "could not quarantine an unreadable wal segment");
+            false
+        }
     }
 }
 
@@ -712,6 +893,53 @@ mod tests {
         assert_eq!(out, FlushOutcome::default());
         assert_eq!(m, before, "a no-op must not touch the manifest");
         assert!(!dir.path().join("manifest.json").exists());
+    }
+
+    /// An unreadable header says nothing about the frames behind it. Skipping
+    /// the segment while the commit advanced the watermark past it meant the
+    /// deletion below removed a file that might have been entirely recoverable.
+    #[test]
+    fn a_segment_with_an_unreadable_header_is_quarantined_and_never_deleted() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cfg, mut m) = trades();
+        write_segment(dir.path(), 1, &[rec(T13, "a")]);
+        let mut bad = write_segment(dir.path(), 2, &[rec(T13 + 1, "b")]);
+        bad[0] ^= 0xff; // ruin the magic; every frame behind it is intact
+        fs::write(segment_path(dir.path(), 2), &bad).unwrap();
+
+        let out = run(dir.path(), &cfg, &mut m, &[1, 2]).unwrap();
+
+        assert_eq!(out.rows_written, 1, "the readable segment still flushes");
+        assert_eq!(out.segments_consumed, vec![1], "2 was not consumed");
+        assert!(out.bytes_skipped >= bad.len() as u64, "and is counted");
+
+        let aside = segment_path(dir.path(), 2).with_extension(CORRUPT_EXT);
+        assert!(!segment_path(dir.path(), 2).exists());
+        assert_eq!(fs::read(&aside).unwrap(), bad, "every byte survives");
+    }
+
+    /// Frames larger than the *current* `limits.max_record_bytes` used to stop a
+    /// sealed segment's scan dead, discarding everything after them and then
+    /// deleting the file. Lowering a config value must not destroy records that
+    /// were durable before the edit.
+    #[test]
+    fn lowering_max_record_bytes_does_not_discard_durable_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut cfg, mut m) = trades();
+        write_segment(
+            dir.path(),
+            1,
+            &[rec(T13, "a"), rec(T13 + 1, "b"), rec(T13 + 2, "c")],
+        );
+
+        // Far below one frame: the old code passed this straight to the decoder,
+        // which rejected the first frame's length and stopped the scan there.
+        cfg.limits.max_record_bytes = 8;
+
+        let out = run(dir.path(), &cfg, &mut m, &[1]).unwrap();
+        assert_eq!(out.rows_written, 3, "every durable record still flushes");
+        assert_eq!(out.frames_rejected, 0);
+        assert_eq!(out.bytes_skipped, 0);
     }
 
     #[test]
@@ -1087,7 +1315,10 @@ mod tests {
         let sql = fs::read_to_string(series_dir(dir.path(), "trades").join(VIEW_FILE)).unwrap();
         assert!(sql.contains("CREATE OR REPLACE VIEW \"trades\""), "{sql}");
         // `venue` was undeclared at epoch 0, so its old values are in `extra`.
-        assert!(sql.contains("coalesce(\"venue\", extra['venue'])"), "{sql}");
+        assert!(
+            sql.contains("coalesce(\"venue\", try_cast(extra['venue'] AS VARCHAR))"),
+            "{sql}"
+        );
         // A series with no rows in this flush is not touched, and gets no view.
         assert!(!series_dir(dir.path(), "quotes").join(VIEW_FILE).exists());
     }

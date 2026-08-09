@@ -46,6 +46,7 @@ use parquet::schema::types::{Type, TypePtr};
 use crate::config::{KeyDef, key_type_name};
 use crate::error::{Error, Result};
 use crate::record::{KeyType, Value};
+use crate::wal::SEGMENT_ID_DIGITS;
 
 /// Parquet key-value metadata key recording which schema epoch wrote a file.
 ///
@@ -364,14 +365,26 @@ impl RowBuilder {
         for (i, (column, value)) in std::iter::zip(&mut c.keys, keys).enumerate() {
             column.append(value, &c.series, &c.key_names[i])?;
         }
-        for (k, v) in extra {
+        // A repeated key makes the MAP malformed, and a reader rejects the whole
+        // file over it rather than the one row. The codec already collapses
+        // duplicates into its canonical order, so this is the backstop for
+        // frames it did not produce -- a hand-rolled client's, arriving through
+        // `append_raw`, which validates only the fixed prefix. Adjacent-only,
+        // because sorted-by-name is the frame layout's contract; a producer that
+        // breaks that has already left the format behind.
+        let mut kept = 0u32;
+        for (i, (k, v)) in extra.iter().enumerate() {
+            if i > 0 && *k == extra[i - 1].0 {
+                continue;
+            }
             c.extra_keys.push(ByteArray::from(k.as_bytes().to_vec()));
             c.extra_values.push(ByteArray::from(v.as_bytes().to_vec()));
+            kept += 1;
         }
         // A row with no undeclared keys gets a count of 0, which encodes as an
         // *empty* map rather than a null one. The two are different values to a
         // reader, and "this record had no undeclared keys" is the former.
-        c.extra_counts.push(extra.len() as u32);
+        c.extra_counts.push(kept);
         c.data.push(ByteArray::from(data.as_bytes().to_vec()));
         c.rows += 1;
         Ok(())
@@ -630,6 +643,44 @@ pub fn output_file_name(first_segment: u64, last_segment: u64, epoch: u32) -> St
     format!("{first_segment:010}-{last_segment:010}.e{epoch}.parquet")
 }
 
+/// The `(first_segment, last_segment, epoch)` a flush output name encodes, or
+/// `None` if the name is not one this engine wrote.
+///
+/// Exact inverse of [`output_file_name`]. The startup sweep uses it to tell a
+/// committed file from one an interrupted flush left behind, so it must be strict:
+/// anything it fails to parse is left alone, which is the safe direction — the
+/// engine has no claim on a file it did not write, and `series/` is the one place
+/// it deletes from.
+pub fn parse_output_file_name(name: &str) -> Option<(u64, u64, u32)> {
+    let rest = name.strip_suffix(".parquet")?;
+    let (range, epoch) = rest.rsplit_once(".e")?;
+    let (first, last) = range.split_once('-')?;
+    if !epoch.bytes().all(|b| b.is_ascii_digit()) || epoch.is_empty() {
+        return None;
+    }
+    Some((
+        parse_segment_field(first)?,
+        parse_segment_field(last)?,
+        epoch.parse().ok()?,
+    ))
+}
+
+/// One zero-padded segment id from a file name.
+///
+/// The width rule is `parse_segment_name`'s, for its reason: `{:010}` pads to ten
+/// digits but does not truncate, so the one spelling of an id is ten digits, or
+/// more with no leading zero. Accepting `041` as well as `0000000041` would mean
+/// two names for one range.
+fn parse_segment_field(s: &str) -> Option<u64> {
+    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    if s.len() < SEGMENT_ID_DIGITS || (s.len() != SEGMENT_ID_DIGITS && s.starts_with('0')) {
+        return None;
+    }
+    s.parse().ok()
+}
+
 /// Human-readable summary of a written file, for logs and `stats`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WrittenFile {
@@ -885,6 +936,65 @@ mod tests {
             assert_eq!(row.keys[0], want_a, "row {i} column a");
             assert_eq!(row.keys[1], want_b, "row {i} column b");
         }
+    }
+
+    /// The startup sweep deletes from `series/` on the strength of this parse,
+    /// so a name it misreads is a file wrongly kept or wrongly removed.
+    #[test]
+    fn output_file_names_round_trip_and_reject_everything_else() {
+        for (first, last, epoch) in [(1u64, 2u64, 0u32), (41, 42, 7), (0, u64::MAX, u32::MAX)] {
+            let name = output_file_name(first, last, epoch);
+            assert_eq!(
+                parse_output_file_name(&name),
+                Some((first, last, epoch)),
+                "{name}"
+            );
+        }
+
+        for bad in [
+            "0000000041-0000000042.e3.txt",     // not parquet
+            "0000000041-0000000042.parquet",    // no epoch tag
+            "41-42.e3.parquet",                 // unpadded
+            "000000041-0000000042.e3.parquet",  // nine digits
+            "0000000041.e3.parquet",            // no range
+            "0000000041-0000000042.ex.parquet", // non-numeric epoch
+            "0000000041-0000000042.e.parquet",  // empty epoch
+            "view.sql",
+            "",
+        ] {
+            assert!(
+                parse_output_file_name(bad).is_none(),
+                "should not have parsed {bad:?}"
+            );
+        }
+    }
+
+    /// The codec collapses duplicates on its way in, but `append_raw` validates
+    /// only a frame's fixed prefix — so a hand-rolled client's frame reaches the
+    /// builder unexamined. A repeated MAP key is not a value a reader can make
+    /// sense of, and it costs the whole file, not the row.
+    #[test]
+    fn a_repeated_extra_key_cannot_reach_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dupes.parquet");
+        let mut b = RowBuilder::new("s", &[], 2).unwrap();
+        b.append(1, "a", &[], &[("k", "1"), ("k", "2"), ("z", "9")], "")
+            .unwrap();
+        // The row after it must stay aligned: the map columns are flattened, so
+        // dropping an entry has to be reflected in this row's count or every
+        // later row reads someone else's entries.
+        b.append(2, "b", &[], &[("k", "3")], "").unwrap();
+        write_file(&path, &b.finish().unwrap(), "s", 0, "uncompressed", 1024).unwrap();
+
+        let rows = read_file(&path).unwrap();
+        assert_eq!(
+            rows[0].extra,
+            [
+                ("k".to_string(), "1".to_string()),
+                ("z".to_string(), "9".to_string())
+            ]
+        );
+        assert_eq!(rows[1].extra, [("k".to_string(), "3".to_string())]);
     }
 
     #[test]

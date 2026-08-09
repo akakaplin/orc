@@ -37,10 +37,16 @@ use crate::record::{RecordRef, Value};
 
 /// Read a whole segment file into memory.
 ///
-/// Reading the segment whole rather than streaming it is deliberate and is what
-/// bounds flush memory *by construction*: a segment is at most
-/// `wal.segment_max_bytes` (64 MiB by default), and the flush sorts an index of
-/// offsets pointing into this buffer rather than decoded rows.
+/// Reading the segment whole rather than streaming it is deliberate: the flush
+/// sorts an index of offsets pointing into this buffer rather than decoded rows,
+/// so a segment costs its own size and nothing per record.
+///
+/// It bounds flush memory only as well as segment size is itself bounded, which
+/// is *approximately* `wal.segment_max_bytes` (64 MiB by default) and not exactly
+/// it: a segment rolls once it is over the limit, so one `append_batch` larger
+/// than the limit produces one segment larger than the limit. The batch sizes
+/// that reach the writer are capped upstream — `server.max_batch_bytes` on the
+/// network path — which is what keeps the overshoot to one batch.
 pub fn read_segment(path: impl AsRef<Path>) -> Result<Vec<u8>> {
     Ok(std::fs::read(path)?)
 }

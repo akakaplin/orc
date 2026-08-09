@@ -19,9 +19,16 @@ struct Args {
     #[arg(long, default_value = "tcp://127.0.0.1:5555")]
     ingest: String,
 
-    /// Control endpoint (REQ -> server REP).
-    #[arg(long, default_value = "tcp://127.0.0.1:5556")]
-    control: String,
+    /// Control endpoint (REQ -> server REP). Defaults to the ingest port + 1.
+    ///
+    /// `Option`, not a `default_value`: a default is always present, so it
+    /// unconditionally suppressed the client's port+1 derivation and
+    /// `--ingest tcp://prod:5555` would hand records to prod while doing its
+    /// schema handshake against localhost. The client encodes keys positionally
+    /// against whatever schema it was given, so two hosts declaring the same
+    /// series in a different key order is silently swapped columns.
+    #[arg(long)]
+    control: Option<String>,
 
     #[command(subcommand)]
     cmd: Cmd,
@@ -66,12 +73,14 @@ fn run() -> orc::Result<()> {
         Cmd::Send { batch, .. } => batch,
         _ => 1,
     };
-    let mut client = Client::builder()
+    let mut builder = Client::builder()
         .ingest(&args.ingest)
-        .control(&args.control)
         .batch(batch)
-        .on_full(OnFull::Block)
-        .connect()?;
+        .on_full(OnFull::Block);
+    if let Some(control) = &args.control {
+        builder = builder.control(control);
+    }
+    let mut client = builder.connect()?;
 
     match args.cmd {
         Cmd::Ping => print_reply(client.control(ControlRequest::Ping)?),

@@ -61,6 +61,18 @@ pub const LOCK_STALE_MS: u64 = 10_000;
 /// deciding you are dead.
 pub const LOCK_HEARTBEAT_MS: u64 = 1_000;
 
+/// Extension given to a segment whose header would not parse: `<id>.wal.corrupt`.
+///
+/// Deliberately not a `.wal` name, so [`list_segments`] stops seeing it and the
+/// writer is free to move past the id — while the bytes stay where an operator
+/// can find them.
+pub const CORRUPT_EXT: &str = "wal.corrupt";
+
+/// Is this `Corrupt` reason "the wrong binary" rather than "damaged bytes"?
+fn version_mismatch(reason: &str) -> bool {
+    reason == codec::UNSUPPORTED_VERSION
+}
+
 /// Ownership of a data directory, for as long as this value lives.
 ///
 /// Advisory: it stops a second `orc` from opening the same directory, not a text
@@ -213,6 +225,11 @@ pub struct Recovery {
     /// Bytes chopped off the tail: at most one torn record, unless the storage
     /// itself damaged the file.
     pub discarded_bytes: u64,
+    /// Segments moved aside as `<id>.wal.corrupt` because their header did not
+    /// parse. Their frames are **not** in the dataset and never will be without
+    /// manual work — but every byte is still on disk, which is the difference
+    /// between a recoverable incident and silent data loss.
+    pub quarantined: Vec<u64>,
     /// The id the writer must open. Always greater than every id ever seen in
     /// this directory, so a segment is never reused or overwritten.
     pub next_segment: u64,
@@ -222,18 +239,17 @@ pub struct Recovery {
 ///
 /// Takes `last_flushed_segment` rather than the whole manifest, because that
 /// single number is all recovery uses: the engine reads the manifest (which also
-/// discards a stale `manifest.json.tmp`) and passes it in. `max_record_bytes`
-/// bounds what the scan will believe about a frame's length — the same cap the
-/// decoder applies, so a corrupt length prefix is rejected instead of trusted.
+/// discards a stale `manifest.json.tmp`) and passes it in.
 ///
 /// This does not re-validate records. A record that was accepted once stays
-/// accepted even if `limits.ts_min` has since been tightened, because rejecting
-/// it would mean discarding durable data on a config edit.
-pub fn recover(
-    data_dir: impl AsRef<Path>,
-    last_flushed_segment: u64,
-    max_record_bytes: usize,
-) -> Result<Recovery> {
+/// accepted even if the config has since been tightened, because rejecting it
+/// would mean discarding durable data on a config edit — which is also why the
+/// scan bounds frame lengths by the segment's own size rather than by
+/// `limits.max_record_bytes`. That cap exists to stop a corrupt length prefix
+/// becoming a huge allocation; the scan has the file in memory already and
+/// allocates nothing from the length, so applying it here would buy nothing and
+/// cost every record above a freshly lowered limit.
+pub fn recover(data_dir: impl AsRef<Path>, last_flushed_segment: u64) -> Result<Recovery> {
     let data_dir = data_dir.as_ref();
     let dir = wal_dir(data_dir);
     std::fs::create_dir_all(&dir)?;
@@ -265,22 +281,57 @@ pub fn recover(
     // Only the tail. See the module docs: this is what bounds startup cost.
     if let Some(&tail) = ids.last() {
         let path = segment_path(data_dir, tail);
-        match scan_tail(&path, max_record_bytes)? {
-            Some(scan) => {
+        match scan_tail(&path)? {
+            TailHeader::Scanned(scan) => {
                 out.tail = Some(tail);
                 out.tail_frames = scan.frames;
                 out.discarded_bytes = scan.discarded;
             }
-            None => {
+            TailHeader::Absent => {
                 // The header never made it to disk, so the file can hold no
                 // frames at all -- there is nothing to amend, only to remove.
+                let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
                 std::fs::remove_file(&path)?;
                 fsync_dir(&dir)?;
                 ids.pop();
+                out.deleted.push(tail);
+                out.discarded_bytes += size;
                 tracing::warn!(
                     segment = tail,
-                    "discarded a wal segment with no readable header"
+                    bytes = size,
+                    "discarded a wal segment too short to hold a header"
                 );
+            }
+            // A header that is present but wrong says nothing about the frames
+            // behind it, which may be entirely intact -- so this must never
+            // unlink the file. Quarantining takes it out of the log (its records
+            // are not replayed, and the name is free for the writer to reuse)
+            // while leaving every byte on disk to be recovered by hand.
+            TailHeader::Corrupt(reason) if !version_mismatch(reason) => {
+                let quarantined = path.with_extension(CORRUPT_EXT);
+                std::fs::rename(&path, &quarantined)?;
+                fsync_dir(&dir)?;
+                ids.pop();
+                out.quarantined.push(tail);
+                tracing::error!(
+                    segment = tail,
+                    reason,
+                    path = %quarantined.display(),
+                    "wal segment header is corrupt; quarantined rather than deleted -- \
+                     its frames may still be readable and are NOT in the dataset"
+                );
+            }
+            // A format-version mismatch is not damage, it is the wrong binary.
+            // Starting anyway would quarantine a whole WAL that the right binary
+            // would read perfectly, so refuse instead.
+            TailHeader::Corrupt(reason) => {
+                return Err(Error::Config(format!(
+                    "wal segment {tail} was written in a format this build cannot read \
+                     ({reason}). Refusing to start: it holds durable records, and \
+                     starting would strand them. Run the version of orc that wrote \
+                     them and flush, or move {} aside deliberately.",
+                    dir.display()
+                )));
             }
         }
     }
@@ -289,6 +340,7 @@ pub fn recover(
     tracing::info!(
         pending = out.pending.len(),
         deleted = out.deleted.len(),
+        quarantined = ?out.quarantined,
         tail = ?out.tail,
         tail_frames = out.tail_frames,
         discarded_bytes = out.discarded_bytes,
@@ -303,15 +355,34 @@ struct TailScan {
     discarded: u64,
 }
 
+/// What the tail segment's header turned out to be.
+///
+/// The three cases call for three different answers, and collapsing them is how
+/// a version bump or a single flipped bit used to unlink a segment full of
+/// perfectly good records. `parse_segment_header` reports them distinctly for
+/// exactly this caller — it is the one whose response has to differ.
+enum TailHeader {
+    /// A usable header; the frames after it were scanned and amended.
+    Scanned(TailScan),
+    /// Shorter than a header. The file cannot hold a single locatable frame, so
+    /// there is genuinely nothing in it to keep.
+    Absent,
+    /// A header is present but wrong. The bytes after it may be entirely
+    /// recoverable by hand, so they are quarantined rather than deleted.
+    Corrupt(&'static str),
+}
+
 /// Validate the tail's frames and truncate it at the last good offset.
 ///
-/// Returns `None` if the segment has no usable header, which is the one case
-/// where amending is meaningless.
+/// The scan checks exactly what can be checked without a schema: that each frame
+/// is delimited by the buffer, and the CRC. Whether the *contents* decode is the
+/// flush's question, asked once an hour instead of on every startup.
 ///
-/// The scan checks exactly what can be checked without a schema: `len` against
-/// `max_record_bytes`, and the CRC. Whether the *contents* decode is the flush's
-/// question, asked once an hour instead of on every startup.
-fn scan_tail(path: &Path, max_record_bytes: usize) -> Result<Option<TailScan>> {
+/// The frame-length cap is the buffer's own length, not `limits.max_record_bytes`
+/// — see [`recover`] on why a config edit must never invalidate a record that was
+/// accepted when it was written. Nothing here reserves memory from the length, so
+/// the cap that exists to bound allocation has no work to do.
+fn scan_tail(path: &Path) -> Result<TailHeader> {
     let bytes = std::fs::read(path)?;
     let size = bytes.len() as u64;
 
@@ -327,9 +398,12 @@ fn scan_tail(path: &Path, max_record_bytes: usize) -> Result<Option<TailScan>> {
                 tracing::warn!(path = %path.display(), header_id = id, "segment header disagrees with its file name");
             }
         }
-        Err(_) => return Ok(None),
+        Err(e) if e.is_truncated() => return Ok(TailHeader::Absent),
+        Err(codec::DecodeError::Corrupt { reason }) => return Ok(TailHeader::Corrupt(reason)),
+        Err(_) => unreachable!("parse_segment_header returns only Truncated or Corrupt"),
     }
 
+    let max_record_bytes = bytes.len();
     let mut at = SEGMENT_HEADER_BYTES;
     let mut frames = 0;
     let stopped_by = loop {
@@ -364,7 +438,7 @@ fn scan_tail(path: &Path, max_record_bytes: usize) -> Result<Option<TailScan>> {
         f.sync_all()?;
     }
 
-    Ok(Some(TailScan { frames, discarded }))
+    Ok(TailHeader::Scanned(TailScan { frames, discarded }))
 }
 
 #[cfg(test)]
@@ -414,7 +488,7 @@ mod tests {
     #[test]
     fn a_fresh_directory_starts_at_the_first_segment() {
         let dir = tempfile::tempdir().unwrap();
-        let r = recover(dir.path(), 0, MAX).unwrap();
+        let r = recover(dir.path(), 0).unwrap();
 
         assert_eq!(r.next_segment, FIRST_SEGMENT);
         assert!(r.pending.is_empty());
@@ -428,7 +502,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let bytes = write_segment(dir.path(), 3, 5);
 
-        let r = recover(dir.path(), 0, MAX).unwrap();
+        let r = recover(dir.path(), 0).unwrap();
         assert_eq!(r.tail, Some(3));
         assert_eq!(r.tail_frames, 5);
         assert_eq!(r.discarded_bytes, 0);
@@ -449,7 +523,7 @@ mod tests {
             let torn = &whole[..whole.len() - cut];
             std::fs::write(segment_path(dir.path(), 1), torn).unwrap();
 
-            let r = recover(dir.path(), 0, MAX).unwrap();
+            let r = recover(dir.path(), 0).unwrap();
             assert_eq!(r.tail_frames, 3, "cut {cut}");
             assert_eq!(r.discarded_bytes, last as u64 - cut as u64, "cut {cut}");
             // Physically truncated, not merely reported: the writer appends
@@ -458,7 +532,7 @@ mod tests {
             assert_eq!(size(dir.path(), 1), good, "cut {cut}");
 
             // ...and recovery is a fixed point.
-            let again = recover(dir.path(), 0, MAX).unwrap();
+            let again = recover(dir.path(), 0).unwrap();
             assert_eq!(again.discarded_bytes, 0);
             assert_eq!(again.tail_frames, 3);
             assert_eq!(size(dir.path(), 1), good);
@@ -478,7 +552,7 @@ mod tests {
         whole[victim] ^= 0x40;
         std::fs::write(segment_path(dir.path(), 1), &whole).unwrap();
 
-        let r = recover(dir.path(), 0, MAX).unwrap();
+        let r = recover(dir.path(), 0).unwrap();
         assert_eq!(r.tail_frames, 3);
         assert_eq!(r.discarded_bytes, last as u64);
         assert_eq!(size(dir.path(), 1), good);
@@ -497,7 +571,7 @@ mod tests {
         padded.resize(padded.len() + 8192, 0);
         std::fs::write(segment_path(dir.path(), 1), &padded).unwrap();
 
-        let r = recover(dir.path(), 0, MAX).unwrap();
+        let r = recover(dir.path(), 0).unwrap();
         assert_eq!(r.tail_frames, 3);
         assert_eq!(r.discarded_bytes, 8192);
         assert_eq!(size(dir.path(), 1), good);
@@ -512,7 +586,7 @@ mod tests {
         whole.extend_from_slice(&0u32.to_le_bytes());
         std::fs::write(segment_path(dir.path(), 1), &whole).unwrap();
 
-        let r = recover(dir.path(), 0, MAX).unwrap();
+        let r = recover(dir.path(), 0).unwrap();
         assert_eq!(r.tail_frames, 2);
         assert_eq!(size(dir.path(), 1), good);
     }
@@ -524,7 +598,7 @@ mod tests {
             write_segment(dir.path(), id, 2);
         }
 
-        let r = recover(dir.path(), 3, MAX).unwrap();
+        let r = recover(dir.path(), 3).unwrap();
         assert_eq!(r.deleted, vec![1, 2, 3]);
         assert_eq!(r.pending, vec![4, 5]);
         assert_eq!(r.next_segment, 6);
@@ -542,13 +616,13 @@ mod tests {
         // would let a stale Parquet filename describe different records.
         let dir = tempfile::tempdir().unwrap();
         write_segment(dir.path(), 9, 1);
-        let r = recover(dir.path(), 9, MAX).unwrap();
+        let r = recover(dir.path(), 9).unwrap();
         assert_eq!(r.deleted, vec![9]);
         assert!(r.pending.is_empty());
         assert_eq!(r.next_segment, 10);
 
         // ...and the manifest alone is enough to know that, with no files left.
-        let r = recover(dir.path(), 12, MAX).unwrap();
+        let r = recover(dir.path(), 12).unwrap();
         assert_eq!(r.next_segment, 13);
     }
 
@@ -565,7 +639,7 @@ mod tests {
         std::fs::write(segment_path(dir.path(), 1), &sealed).unwrap();
         write_segment(dir.path(), 2, 2);
 
-        let r = recover(dir.path(), 0, MAX).unwrap();
+        let r = recover(dir.path(), 0).unwrap();
         assert_eq!(r.tail, Some(2), "only the highest id is scanned");
         assert_eq!(r.tail_frames, 2);
         assert_eq!(
@@ -583,7 +657,7 @@ mod tests {
         std::fs::create_dir_all(wal_dir(dir.path())).unwrap();
         std::fs::write(segment_path(dir.path(), 2), b"\x00\x00").unwrap();
 
-        let r = recover(dir.path(), 0, MAX).unwrap();
+        let r = recover(dir.path(), 0).unwrap();
         assert!(!segment_path(dir.path(), 2).exists());
         assert_eq!(r.pending, vec![1]);
         assert_eq!(r.tail, None);
@@ -592,12 +666,81 @@ mod tests {
         assert_eq!(r.next_segment, 3);
     }
 
+    /// A header that is *wrong* is a different thing from a header that is
+    /// *missing*, and only the second means the file is empty of records.
+    /// Deleting on the first cost a whole segment of durable frames for one bad
+    /// byte, so it now moves aside instead.
+    #[test]
+    fn a_segment_with_a_corrupt_header_is_quarantined_not_deleted() {
+        let dir = tempfile::tempdir().unwrap();
+        write_segment(dir.path(), 1, 1);
+        let good = write_segment(dir.path(), 2, 5);
+
+        // One flipped bit in the magic. Every frame behind it is intact.
+        let mut damaged = good.clone();
+        damaged[0] ^= 0x01;
+        std::fs::write(segment_path(dir.path(), 2), &damaged).unwrap();
+
+        let r = recover(dir.path(), 0).unwrap();
+        assert_eq!(r.quarantined, vec![2]);
+        assert_eq!(r.pending, vec![1], "it is not replayed");
+        assert!(!segment_path(dir.path(), 2).exists());
+
+        // The bytes survive, in full and unmodified.
+        let aside = segment_path(dir.path(), 2).with_extension(CORRUPT_EXT);
+        assert_eq!(std::fs::read(&aside).unwrap(), damaged, "nothing was lost");
+        assert_eq!(r.next_segment, 3, "and the id is still spent");
+
+        // Idempotent: a second start must not trip over the quarantined file.
+        let again = recover(dir.path(), 0).unwrap();
+        assert!(again.quarantined.is_empty());
+        assert_eq!(again.pending, vec![1]);
+        assert!(aside.exists());
+    }
+
+    /// A version mismatch is the wrong binary, not damage. Quarantining would
+    /// strand a WAL that the right binary reads perfectly, so refuse to start.
+    #[test]
+    fn an_unreadable_format_version_refuses_to_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut buf = write_segment(dir.path(), 1, 3);
+        // Bump the version field in place, leaving the magic correct.
+        let bumped = crate::error::FORMAT_VERSION.wrapping_add(1);
+        buf[4..6].copy_from_slice(&bumped.to_le_bytes());
+        std::fs::write(segment_path(dir.path(), 1), &buf).unwrap();
+
+        let err = recover(dir.path(), 0).unwrap_err().to_string();
+        assert!(err.contains("format"), "{err}");
+        assert!(
+            segment_path(dir.path(), 1).exists(),
+            "refusing must not touch the file"
+        );
+    }
+
+    /// The scan bounds a frame by the file it is reading, not by the current
+    /// `limits.max_record_bytes` -- lowering that must never invalidate records
+    /// that were durable before the edit.
+    #[test]
+    fn lowering_the_record_limit_does_not_truncate_a_durable_segment() {
+        let dir = tempfile::tempdir().unwrap();
+        // Frames here are a few hundred bytes; the old code passed the config's
+        // cap straight in, so any cap below a frame's length chopped the segment
+        // at its first record.
+        write_segment(dir.path(), 1, 8);
+        let before = size(dir.path(), 1);
+
+        let r = recover(dir.path(), 0).unwrap();
+        assert_eq!(r.tail_frames, 8, "every frame is still found");
+        assert_eq!(r.discarded_bytes, 0);
+        assert_eq!(size(dir.path(), 1), before, "and nothing was truncated");
+    }
+
     #[test]
     fn stray_files_are_ignored() {
         let dir = tempfile::tempdir().unwrap();
         write_segment(dir.path(), 1, 1);
         std::fs::write(wal_dir(dir.path()).join("README"), b"not a segment").unwrap();
-        let r = recover(dir.path(), 0, MAX).unwrap();
+        let r = recover(dir.path(), 0).unwrap();
         assert_eq!(r.pending, vec![1]);
         assert!(wal_dir(dir.path()).join("README").exists());
     }
@@ -609,7 +752,7 @@ mod tests {
         // reading at an offset recovery considered good.
         let dir = tempfile::tempdir().unwrap();
         write_segment(dir.path(), 1, 6);
-        let r = recover(dir.path(), 0, MAX).unwrap();
+        let r = recover(dir.path(), 0).unwrap();
 
         let bytes = crate::wal::reader::read_segment(segment_path(dir.path(), 1)).unwrap();
         let mut reader =
@@ -704,7 +847,7 @@ mod tests {
     fn segment_names_recovery_reports_are_the_ones_on_disk() {
         let dir = tempfile::tempdir().unwrap();
         write_segment(dir.path(), 41, 1);
-        let r = recover(dir.path(), 0, MAX).unwrap();
+        let r = recover(dir.path(), 0).unwrap();
         assert_eq!(r.pending, vec![41]);
         assert!(
             wal_dir(dir.path())

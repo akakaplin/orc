@@ -8,12 +8,21 @@ use orc::config::Config;
 use orc::engine::Engine;
 use orc::server::Server;
 
+/// Where to look for `config.json` when neither `--config` nor `--data` says.
+const DEFAULT_DATA_DIR: &str = "./data";
+
 #[derive(Parser, Debug)]
 #[command(name = "orc-server", version, about)]
 struct Args {
     /// Data directory. Overrides `data_dir` in the config file.
-    #[arg(long, default_value = "./data")]
-    data: PathBuf,
+    ///
+    /// `Option` rather than a `default_value`, so "not passed" is distinguishable
+    /// from "passed the default". With a default, the override below fired
+    /// unconditionally and `--config /etc/orc/config.json` silently ignored that
+    /// file's own `data_dir`, writing to `./data` relative to whatever working
+    /// directory the service manager happened to give us.
+    #[arg(long)]
+    data: Option<PathBuf>,
 
     /// Config path. Defaults to `<data>/config.json`.
     #[arg(long)]
@@ -63,14 +72,29 @@ fn log_level() -> tracing::Level {
 
 fn run() -> orc::Result<()> {
     let args = Args::parse();
-    let config_path = args.config.unwrap_or_else(|| args.data.join("config.json"));
+    let config_path = args.config.clone().unwrap_or_else(|| {
+        args.data
+            .clone()
+            .unwrap_or_else(|| PathBuf::from(DEFAULT_DATA_DIR))
+            .join("config.json")
+    });
 
     let mut config = Config::load(&config_path)?;
-    // `--data` wins over the file's own `data_dir`. That field is self-
-    // referential -- it lives inside the directory it names -- so honouring it
-    // over the path we were actually pointed at is how a server ends up reading
-    // one directory's config while writing another's.
-    config.data_dir = args.data.clone();
+    // An explicit `--data` wins over the file's own `data_dir`. That field is
+    // self-referential -- it lives inside the directory it names -- so honouring
+    // it over the path we were actually pointed at is how a server ends up
+    // reading one directory's config while writing another's. Absent the flag,
+    // the file decides, which is the only way `--config` alone can work.
+    if let Some(data) = &args.data {
+        if data != &config.data_dir {
+            tracing::info!(
+                config = %config.data_dir.display(),
+                using = %data.display(),
+                "--data overrides the config file's data_dir"
+            );
+        }
+        config.data_dir = data.clone();
+    }
 
     let engine = Arc::new(Engine::open_with(config.clone(), args.force_unlock)?);
     let server = Server::bind(Arc::clone(&engine), &config)?;

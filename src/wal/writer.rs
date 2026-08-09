@@ -18,7 +18,7 @@
 //! the page cache and the kernel writes them back. A power cut loses at most one
 //! group-commit window.
 //!
-//! # The fsync happens outside the append lock
+//! # The group-commit fsync happens outside the append lock
 //!
 //! The committer flushes the `BufWriter` under the lock (a `memcpy` and at most
 //! one `write(2)`), then releases it and fsyncs through a *second descriptor* on
@@ -28,6 +28,19 @@
 //! already returned before the lock is dropped, so the fsync covers at least the
 //! bytes we counted — and covering *more* (appends that landed meanwhile) is
 //! free correctness, never a hazard.
+//!
+//! **A segment roll is the exception, and is not free.** [`Shared::roll`] fsyncs
+//! the outgoing segment, then creates the incoming one — a second fsync plus a
+//! directory fsync — with the append lock held throughout, so appenders block for
+//! all three. That is not an oversight to be tidied away later: recovery scans
+//! only the tail segment, and it may do so *because* a sealed segment is fully
+//! durable before its successor exists. Moving either fsync out from under the
+//! lock would let an appender write into the new segment while the old one is
+//! still unsynced, which is precisely the ordering the guarantee rests on.
+//!
+//! What that costs is one stall per `segment_max_bytes` of ingest — at the 64 MiB
+//! default, rare enough to sit well outside p99. It is only visible with a small
+//! `segment_max_bytes`, which is a test configuration rather than a real one.
 //!
 //! # The WAL is deliberately not size-capped
 //!
@@ -141,6 +154,10 @@ struct Shared {
     fsyncs: AtomicU64,
     fsync_failures: AtomicU64,
     last_fsync_us: AtomicI64,
+    /// When the last commit failure was logged. A disk that stays broken fails
+    /// on every tick, and one line per attempt buries the first -- which is the
+    /// one that says what actually happened.
+    last_failure_log_us: AtomicI64,
 }
 
 #[derive(Debug)]
@@ -231,6 +248,7 @@ impl WalWriter {
             fsyncs: AtomicU64::new(0),
             fsync_failures: AtomicU64::new(0),
             last_fsync_us: AtomicI64::new(0),
+            last_failure_log_us: AtomicI64::new(0),
         });
 
         let active = shared.create_segment(opts.first_segment)?;
@@ -466,8 +484,20 @@ impl Shared {
     }
 
     fn note_failure(&self, e: &std::io::Error, what: &str) {
-        self.fsync_failures.fetch_add(1, Ordering::Relaxed);
-        tracing::error!(error = %e, "wal commit failed while {what}; retrying on the next tick");
+        let failures = self.fsync_failures.fetch_add(1, Ordering::Relaxed) + 1;
+        // Always counted, at most once a second logged. `fsync_failures` is the
+        // signal an operator alerts on; the log is for reading afterwards, and a
+        // million identical lines make it useless for that.
+        let now = now_us();
+        let last = self.last_failure_log_us.load(Ordering::Relaxed);
+        if failures == 1 || now.saturating_sub(last) >= 1_000_000 {
+            self.last_failure_log_us.store(now, Ordering::Relaxed);
+            tracing::error!(
+                error = %e,
+                failures,
+                "wal commit failed while {what}; retrying on the next tick"
+            );
+        }
     }
 }
 
@@ -552,6 +582,15 @@ fn committer(shared: Arc<Shared>) {
                     shared.note_failure(&e, "fsyncing the segment");
                 }
             }
+        }
+
+        // A failed commit leaves `synced` where it was, so `dirty()` stays above
+        // `fsync_bytes` and the wait predicate above is already false -- meaning
+        // `wait_timeout_while` returns without parking and the retry runs flat
+        // out on a broken disk. The roll path below has the same hazard and the
+        // same fix; this is the one it was missing.
+        if retry {
+            std::thread::sleep(tick);
         }
 
         {
@@ -858,7 +897,7 @@ mod tests {
             .set_len(len - 7)
             .unwrap();
 
-        let r = crate::wal::recovery::recover(dir.path(), 0, MAX).unwrap();
+        let r = crate::wal::recovery::recover(dir.path(), 0).unwrap();
         assert_eq!(r.tail_frames, 9);
         assert_eq!(
             r.discarded_bytes,

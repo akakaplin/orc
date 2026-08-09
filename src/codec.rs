@@ -131,6 +131,16 @@ const fn corrupt(reason: &'static str) -> DecodeError {
     DecodeError::Corrupt { reason }
 }
 
+/// The `Corrupt` reason a header carrying an unrecognised [`FORMAT_VERSION`]
+/// produces.
+///
+/// Exported because recovery has to tell it apart from real damage: damage means
+/// quarantine the segment and carry on, while a version mismatch means this is
+/// the wrong binary for this directory and starting at all would strand records
+/// the right binary reads perfectly. Naming the constant here keeps the two ends
+/// of that comparison from drifting.
+pub const UNSUPPORTED_VERSION: &str = "unsupported format version";
+
 // ---------------------------------------------------------------------------
 // Headers
 // ---------------------------------------------------------------------------
@@ -182,7 +192,7 @@ fn parse_common_header(buf: &[u8], needed: usize) -> DecodeResult<&[u8]> {
         return Err(corrupt("bad magic; not an orc segment or batch"));
     }
     if u16::from_le_bytes(buf[4..6].try_into().unwrap()) != FORMAT_VERSION {
-        return Err(corrupt("unsupported format version"));
+        return Err(corrupt(UNSUPPORTED_VERSION));
     }
     Ok(&buf[6..needed])
 }
@@ -201,12 +211,20 @@ fn parse_common_header(buf: &[u8], needed: usize) -> DecodeResult<&[u8]> {
 /// frame left in a WAL buffer would be indistinguishable from a real one to the
 /// next writer, so partial output is never an acceptable failure mode here.
 ///
-/// `extra` is sorted by `(name, value)` at encode time. Sorting by name alone
-/// would leave two pairs with equal names in input order, which is enough to make
-/// the same logical record encode to two different byte strings — and the
+/// `extra` is sorted by `(name, value)` at encode time, and duplicate names are
+/// **collapsed, the first in that order winning** — matching how the flush
+/// resolves duplicate `(ts, id)`. Sorting by name alone would
+/// leave two pairs with equal names in input order, which is enough to make the
+/// same logical record encode to two different byte strings — and the
 /// byte-identical re-encode is what makes a crash-recovered flush reproducible.
-/// Duplicate names are preserved, not rejected: ingest never turns away a record
-/// for the shape of its `extra`.
+///
+/// Collapsing rather than preserving is not about ingest being fussy: `extra`
+/// becomes a Parquet MAP, and a MAP with a repeated key is not a well-formed
+/// value. `extra['k']` has no answer, and DuckDB refuses the whole file rather
+/// than the one row — so one record with two `feed` entries would cost every
+/// reader every row in the file. There is no input-order "first" to keep once
+/// the pairs are sorted, so the rule is defined on the canonical order, which
+/// makes it reproducible.
 pub fn encode(out: &mut Vec<u8>, series: &str, epoch: u32, row: &Row) -> Result<()> {
     Encoder::default().encode(out, series, epoch, row)
 }
@@ -257,10 +275,11 @@ impl Encoder {
             size: row.extra.len(),
             limit: u16::MAX as usize,
         })?;
-        out.extend_from_slice(&n.to_le_bytes());
         if is_canonical(row.extra) {
-            // The common case: the caller already handed us sorted pairs (a
-            // decoded frame being re-encoded always is), so skip the scratch.
+            // The common case: the caller already handed us pairs in canonical
+            // order with distinct names (a decoded frame being re-encoded always
+            // does), so skip the scratch entirely.
+            out.extend_from_slice(&n.to_le_bytes());
             for &(name, value) in row.extra {
                 put_str16(out, name)?;
                 put_str16(out, value)?;
@@ -269,6 +288,13 @@ impl Encoder {
             self.order.clear();
             self.order.extend(0..n as u32);
             self.order.sort_unstable_by_key(|&i| row.extra[i as usize]);
+            // Equal names are adjacent now, so one pass collapses each run to
+            // its first member -- the same "first wins" rule the flush applies
+            // to duplicate `(ts, id)`.
+            self.order
+                .dedup_by(|a, b| row.extra[*a as usize].0 == row.extra[*b as usize].0);
+            let kept = u16::try_from(self.order.len()).expect("no more than we started with");
+            out.extend_from_slice(&kept.to_le_bytes());
             for &i in &self.order {
                 let (name, value) = row.extra[i as usize];
                 put_str16(out, name)?;
@@ -297,9 +323,13 @@ impl Encoder {
     }
 }
 
-/// Already in the canonical `(name, value)` order the encoder would produce.
+/// Already exactly what the encoder would produce: sorted by name, no duplicates.
+///
+/// Strictly increasing rather than merely sorted, because equal names still need
+/// collapsing. Strictly increasing names imply sorted `(name, value)` pairs, so
+/// this is the full canonical-form check and not just half of it.
 fn is_canonical(extra: &[(&str, &str)]) -> bool {
-    extra.windows(2).all(|w| w[0] <= w[1])
+    extra.windows(2).all(|w| w[0].0 < w[1].0)
 }
 
 /// Strings whose length the layout carries in a `u16`: the series name, the id,
@@ -690,6 +720,47 @@ mod tests {
         assert_eq!(rec.data, "");
         assert!(ks.is_empty());
         assert!(ex.is_empty());
+    }
+
+    /// `extra` becomes a Parquet MAP, and a MAP with a repeated key is not a
+    /// well-formed value: `extra['k']` has no answer, and a reader rejects the
+    /// whole file rather than the offending row.
+    #[test]
+    fn duplicate_extra_names_collapse_to_the_first_in_canonical_order() {
+        let decode_extra = |frame: &[u8]| -> Vec<(String, String)> {
+            let mut keys = Vec::new();
+            let mut extra = Vec::new();
+            decode(frame, 0, 1 << 20, &mut keys, &mut extra).unwrap();
+            extra
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect()
+        };
+
+        // Sorted by (name, value), so "a" -> "1" is the first of its run.
+        let dupes = [("a", "2"), ("b", "9"), ("a", "1"), ("a", "3")];
+        let got = decode_extra(&frame("s", 1, &row(1, "i", &[], &dupes, "d")));
+        assert_eq!(
+            got,
+            [
+                ("a".to_string(), "1".to_string()),
+                ("b".to_string(), "9".to_string())
+            ]
+        );
+
+        // Already-sorted input with duplicates must collapse identically -- the
+        // fast path is only a fast path if it agrees with the slow one.
+        let sorted = [("a", "1"), ("a", "3"), ("b", "9")];
+        assert_eq!(
+            decode_extra(&frame("s", 1, &row(1, "i", &[], &sorted, "d"))),
+            got
+        );
+
+        // And the collapsed form re-encodes to the same bytes, which is what
+        // makes a replayed flush reproducible.
+        let once = frame("s", 1, &row(1, "i", &[], &dupes, "d"));
+        let pairs: Vec<(&str, &str)> = [("a", "1"), ("b", "9")].to_vec();
+        assert_eq!(once, frame("s", 1, &row(1, "i", &[], &pairs, "d")));
     }
 
     #[test]

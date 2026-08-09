@@ -17,6 +17,33 @@ const US_PER_SEC: i64 = 1_000_000;
 const US_PER_HOUR: i64 = 3_600 * US_PER_SEC;
 const US_PER_DAY: i64 = 24 * US_PER_HOUR;
 
+/// Years [`parse_rfc3339_utc`] will accept.
+///
+/// Epoch microseconds in an `i64` reach a little past ±294 000 years, so this is
+/// the representable range with room to spare — the multiply in `parse` cannot
+/// overflow inside it. Four digits are what the format is really for; the bound
+/// exists so a typo like `"999999999-01-01T00:00:00Z"` is an error rather than a
+/// panic in a debug build and a wrapped, nonsensical accept window in release.
+const MIN_YEAR: i64 = -250_000;
+const MAX_YEAR: i64 = 250_000;
+
+/// Days in a month, Gregorian.
+fn days_in_month(year: i64, month: u32) -> i64 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if is_leap(year) => 29,
+        2 => 28,
+        _ => 0,
+    }
+}
+
+/// Proleptic Gregorian leap year. `div_euclid` rather than `%` so it stays
+/// correct for negative years, where `%` would give the wrong sign.
+fn is_leap(year: i64) -> bool {
+    year.rem_euclid(4) == 0 && (year.rem_euclid(100) != 0 || year.rem_euclid(400) == 0)
+}
+
 /// Days since 1970-01-01 to civil `(year, month, day)`.
 ///
 /// Correct for negative inputs (dates before 1970).
@@ -85,8 +112,26 @@ pub fn parse_rfc3339_utc(s: &str) -> Result<i64> {
     if dparts.next().is_some() {
         return Err(bad("too many '-' separated fields in the date"));
     }
-    if !(1..=12).contains(&mo) || !(1..=31).contains(&d) {
-        return Err(bad("month or day out of range"));
+    // Bounded before `ymd_to_days`, which is a polynomial with no opinion about
+    // whether its inputs are a real date -- or whether they overflow. The range
+    // is generous: this is a sanity bound, and the accept window is what decides
+    // which timestamps are actually plausible.
+    if !(MIN_YEAR..=MAX_YEAR).contains(&y) {
+        return Err(bad(&format!(
+            "year out of range; must be {MIN_YEAR}..={MAX_YEAR}"
+        )));
+    }
+    if !(1..=12).contains(&mo) {
+        return Err(bad("month out of range"));
+    }
+    // Against the month's real length, not a flat 1..=31. `ymd_to_days` happily
+    // rolls 2026-02-31 forward to 2026-03-03, which would silently move the
+    // accept window off the day the operator wrote -- the same class of quiet
+    // misreading that rejecting a numeric offset above exists to prevent.
+    if d < 1 || d > days_in_month(y, mo as u32) {
+        return Err(bad(&format!(
+            "day {d} is out of range for month {mo} of {y}"
+        )));
     }
 
     let (time, frac_us) = match rest.split_once('.') {
@@ -233,6 +278,69 @@ mod tests {
                 parse_rfc3339_utc(bad).is_err(),
                 "should have rejected {bad:?}"
             );
+        }
+    }
+
+    /// A flat `1..=31` day check let `ymd_to_days` roll an impossible date
+    /// forward instead of refusing it, so `ts_min` silently started on a day the
+    /// operator never wrote.
+    #[test]
+    fn impossible_calendar_dates_are_refused_not_rolled_forward() {
+        for bad in [
+            "2026-02-30T00:00:00Z", // would have become 2026-03-02
+            "2026-02-29T00:00:00Z", // 2026 is not a leap year
+            "2026-04-31T00:00:00Z", // April has 30
+            "2026-06-31T00:00:00Z",
+            "2026-09-31T00:00:00Z",
+            "2026-11-31T00:00:00Z",
+            "2026-01-00T00:00:00Z", // day zero
+        ] {
+            assert!(
+                parse_rfc3339_utc(bad).is_err(),
+                "should have rejected {bad:?}, got {:?}",
+                parse_rfc3339_utc(bad).map(format_rfc3339_utc)
+            );
+        }
+
+        // The leap days that *are* real must still parse.
+        for good in [
+            "2024-02-29T00:00:00Z", // divisible by 4
+            "2000-02-29T00:00:00Z", // divisible by 400
+            "2026-01-31T00:00:00Z",
+            "2026-04-30T00:00:00Z",
+        ] {
+            assert!(parse_rfc3339_utc(good).is_ok(), "should have parsed {good}");
+        }
+        // 1900 is not a leap year: divisible by 100, not by 400.
+        assert!(parse_rfc3339_utc("1900-02-29T00:00:00Z").is_err());
+    }
+
+    /// The year was bounded only by `i64::FromStr`, so a typo overflowed the
+    /// microsecond multiply -- a panic in a debug build, a wrapped accept window
+    /// in release. Both from one hand-edited config field.
+    #[test]
+    fn an_out_of_range_year_is_an_error_rather_than_an_overflow() {
+        for bad in [
+            "999999999-01-01T00:00:00Z",
+            "300000-01-01T00:00:00Z",
+            "9223372036854775807-01-01T00:00:00Z",
+        ] {
+            let err = parse_rfc3339_utc(bad).unwrap_err().to_string();
+            assert!(err.contains("year"), "{bad}: {err}");
+        }
+
+        // And the extremes of the accepted range still compute, which is what
+        // makes the bound a real guarantee rather than a smaller cliff.
+        for edge in [MIN_YEAR, MAX_YEAR] {
+            let s = format!("{edge}-01-01T00:00:00Z");
+            if edge < 0 {
+                // A negative year is not RFC 3339 anyway; the parser requires
+                // digits, so this one is refused before the range check.
+                assert!(parse_rfc3339_utc(&s).is_err());
+                continue;
+            }
+            let us = parse_rfc3339_utc(&s).unwrap_or_else(|e| panic!("{s}: {e}"));
+            assert_eq!(parse_rfc3339_utc(&format_rfc3339_utc(us)).unwrap(), us);
         }
     }
 }

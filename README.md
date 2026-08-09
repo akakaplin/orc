@@ -131,7 +131,7 @@ find data/series -name 'hour=*' -type d -mtime +90 -exec rm -rf {} +
 
 ```json
 {
-  "server": { "ingest_endpoint": "tcp://127.0.0.1:5555" },
+  "server": { "ingest_endpoint": "tcp://127.0.0.1:5555", "max_batch_bytes": 8388608 },
   "wal":    { "fsync_interval_ms": 10, "segment_max_bytes": 67108864 },
   "flush":  { "interval_ms": 3600000, "compression": "lz4_raw" },
   "series": [
@@ -144,7 +144,28 @@ find data/series -name 'hour=*' -type d -mtime +90 -exec rm -rf {} +
 
 Every field has a default, so a minimal config is just `series`. Durations are integer milliseconds. `compression` accepts `lz4_raw` (default) or `uncompressed`; both are validated at load, so an unwritable codec fails immediately rather than at the first flush an hour later.
 
+A few constraints are worth knowing before you hit them, all checked at load:
+
+- **`flush.interval_ms: 0` disables the timer**, leaving flushing entirely to explicit `Engine::flush()` calls and the control socket. Any other value spawns a background thread that flushes on that period. The WAL is not capped, so turning the timer off means owning the schedule yourself.
+- **A declared key may not be named `ts`, `id`, `extra` or `data`.** Every Parquet file already has those columns, and Parquet does not object to a duplicate field name — the resulting file reads back wrong rather than failing.
+- **`server.max_batch_bytes` caps one ingest message.** `limits.max_record_bytes` bounds a single record; without this, nothing bounds the batch carrying them.
+
 **Endpoints default to loopback deliberately.** There is no authentication on the ingest socket — anything that can reach it can write records and consume disk. Before binding a real interface, put it on a private network or enable libzmq's built-in CURVE encryption and authentication.
+
+`orc-server --data DIR` overrides the config file's `data_dir`; without the flag the file decides, so `--config /etc/orc/config.json` alone writes where that file says. `orc-cli --control` likewise defaults to the ingest port + 1 rather than to localhost, so pointing `--ingest` at a remote host takes the handshake with it.
+
+## When something is wrong
+
+The engine never deletes data it cannot read. Two directories are where that shows up:
+
+- **`wal/<id>.wal.corrupt`** — a segment whose *header* would not parse, moved aside at startup or at flush. Its records are not in the dataset and will not be replayed, but every byte is intact. A header that is merely missing (a file too short to hold one) is deleted instead, because such a file can hold no locatable frames at all.
+- **`rejects/<id>.rej`** — individual frames that decoded but did not match their schema, plus the unreadable remainder of any segment whose scan stopped early. Capped by `limits.reject_max_bytes`.
+
+A **format-version mismatch refuses to start** rather than quarantining: the WAL is fine, the binary is wrong, and starting would strand records the right build reads perfectly.
+
+Startup also sweeps two kinds of debris from a flush that wrote files and then died before committing — staged files in `tmp/`, and Parquet in `series/` whose segment range runs past the manifest's watermark. Both are rows the next flush writes again, so leaving them would double-count.
+
+`stats` carries the counters worth alerting on. `flush_failures` rising while `wal_bytes` grows is a stalled flush — the WAL is uncapped by design, so this costs disk rather than availability, which is exactly why it needs watching.
 
 ## Known limits
 

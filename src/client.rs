@@ -81,6 +81,7 @@ pub struct ClientBuilder {
     sndhwm: i32,
     linger_ms: i32,
     on_full: OnFull,
+    control_timeout_ms: i32,
 }
 
 impl Default for ClientBuilder {
@@ -94,6 +95,10 @@ impl Default for ClientBuilder {
             // libzmq still holds. Zero here is a classic silent-loss bug.
             linger_ms: 2_000,
             on_full: OnFull::Block,
+            // Fine for ping, stats and the schema handshake. Not for `Flush`,
+            // which is synchronous and proportional to the backlog -- see
+            // [`Client::control`], which raises it for that one request.
+            control_timeout_ms: 5_000,
         }
     }
 }
@@ -125,6 +130,15 @@ impl ClientBuilder {
         self.on_full = on_full;
         self
     }
+    /// How long to wait for a control reply. Defaults to 5s.
+    ///
+    /// Does not apply to `Flush`, which the server handles synchronously over
+    /// however much WAL has accumulated; [`Client::control`] gives that one its
+    /// own, much longer bound.
+    pub fn control_timeout_ms(mut self, ms: i32) -> Self {
+        self.control_timeout_ms = ms;
+        self
+    }
 
     /// Connect both sockets and perform the schema handshake.
     pub fn connect(self) -> Result<Client> {
@@ -143,8 +157,17 @@ impl ClientBuilder {
         req.set_linger(self.linger_ms).map_err(zmq_err)?;
         // Without a timeout a dead server makes `recv` hang forever, which
         // turns "the server is down" into "my process is wedged".
-        req.set_rcvtimeo(5_000).map_err(zmq_err)?;
-        req.set_sndtimeo(5_000).map_err(zmq_err)?;
+        req.set_rcvtimeo(self.control_timeout_ms).map_err(zmq_err)?;
+        req.set_sndtimeo(self.control_timeout_ms).map_err(zmq_err)?;
+        // A plain REQ socket is a strict send/recv state machine, so a timed-out
+        // `recv` leaves it still expecting a reply and every later `send` fails
+        // with EFSM -- permanently, with no way to reset it. One slow flush would
+        // brick the socket for the life of the process. RELAXED lets a new
+        // request replace the abandoned one; CORRELATE is what makes that safe,
+        // by tagging replies so a late one from the abandoned request is
+        // discarded instead of being read as the answer to the new one.
+        req.set_req_relaxed(true).map_err(zmq_err)?;
+        req.set_req_correlate(true).map_err(zmq_err)?;
         req.connect(&control_endpoint)
             .map_err(|e| Error::Config(format!("connecting to {control_endpoint}: {e}")))?;
 
@@ -158,6 +181,7 @@ impl ClientBuilder {
             on_full: self.on_full,
             stats: ClientStats::default(),
             encoder: Encoder::default(),
+            control_timeout_ms: self.control_timeout_ms,
         };
         client.refresh_schema()?;
         Ok(client)
@@ -167,6 +191,11 @@ impl ClientBuilder {
 fn zmq_err(e: zmq::Error) -> Error {
     Error::Config(format!("zeromq: {e}"))
 }
+
+/// Receive timeout for a `Flush`, which the server answers only once the whole
+/// backlog is on disk. Ten minutes: long enough for a real hour of WAL, short
+/// enough that a genuinely wedged server is still eventually reported.
+const FLUSH_TIMEOUT_MS: i32 = 600_000;
 
 /// `tcp://host:5555` -> `tcp://host:5556`, matching the server's defaults.
 fn default_control_endpoint(ingest: &str) -> Result<String> {
@@ -180,7 +209,16 @@ fn default_control_endpoint(ingest: &str) -> Result<String> {
             "cannot derive a control endpoint from {ingest:?}; pass one explicitly"
         ))
     })?;
-    Ok(format!("{head}:{}", port + 1))
+    // 65535 has no successor. Unchecked, that is a panic in a debug build and a
+    // silent `:0` in release -- which connects nowhere and reports it as
+    // something else entirely.
+    let control = port.checked_add(1).ok_or_else(|| {
+        Error::Config(format!(
+            "cannot derive a control endpoint from {ingest:?}: port {port} has no successor; \
+             pass one explicitly"
+        ))
+    })?;
+    Ok(format!("{head}:{control}"))
 }
 
 /// A connected ingest client.
@@ -194,6 +232,8 @@ pub struct Client {
     on_full: OnFull,
     stats: ClientStats,
     encoder: Encoder,
+    /// Kept so `control` can restore it after raising it for a `Flush`.
+    control_timeout_ms: i32,
 }
 
 impl std::fmt::Debug for Client {
@@ -234,7 +274,30 @@ impl Client {
     }
 
     /// Send a control request and wait for the reply.
+    ///
+    /// `Flush` gets its own receive timeout. The server runs it synchronously —
+    /// decoding, sorting and writing Parquet for every pending segment before it
+    /// replies — so the time it takes is proportional to the backlog, and the
+    /// default control timeout would give up on a flush that is working fine and
+    /// report it as a failure while the server went on to complete it.
     pub fn control(&self, req: ControlRequest) -> Result<ControlResponse> {
+        let slow = matches!(req, ControlRequest::Flush);
+        if slow {
+            self.req.set_rcvtimeo(FLUSH_TIMEOUT_MS).map_err(zmq_err)?;
+        }
+        let result = self.control_inner(req);
+        if slow {
+            // Restore even on failure: leaving the long timeout in place would
+            // make a later `stats` against a dead server hang for minutes.
+            let restore = self.req.set_rcvtimeo(self.control_timeout_ms);
+            if let Err(e) = restore {
+                tracing::warn!(error = %e, "could not restore the control timeout");
+            }
+        }
+        result
+    }
+
+    fn control_inner(&self, req: ControlRequest) -> Result<ControlResponse> {
         self.req.send(req.to_bytes()?, 0).map_err(zmq_err)?;
         let reply = self.req.recv_bytes(0).map_err(zmq_err)?;
         Ok(ControlResponse::from_bytes(&reply)?)

@@ -12,8 +12,8 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::codec::{self, Encoder};
 use crate::config::{Config, SeriesHandle};
@@ -80,11 +80,32 @@ pub struct Stats {
 pub struct RawIngest {
     pub accepted: usize,
     pub rejected: usize,
+    /// Bytes dropped because a frame's length could not be trusted, so no frame
+    /// after it could be located.
+    ///
+    /// Separate from `rejected` because they measure different things: this is
+    /// the tail of a batch, and how many records were in it is precisely what is
+    /// unknowable. Non-zero means a client is sending malformed frames.
+    pub discarded_bytes: usize,
 }
 
 /// The embeddable engine.
+///
+/// Everything the engine *is* lives in [`Inner`], behind an `Arc` the flush timer
+/// shares. What stays out here is the timer's `JoinHandle`, and that placement is
+/// load-bearing: the thread owns a strong reference, so if the handle lived
+/// alongside it, the last `Arc` could be dropped *by the timer itself* at the end
+/// of a flush — and `Drop` would then try to join the thread it is running on.
 #[derive(Debug)]
 pub struct Engine {
+    inner: Arc<Inner>,
+    /// `None` when `flush.interval_ms` is 0, or once `close` has joined it.
+    flusher: Mutex<Option<std::thread::JoinHandle<()>>>,
+}
+
+/// The engine's actual state, shared with the flush timer.
+#[derive(Debug)]
+struct Inner {
     data_dir: PathBuf,
     config: Config,
     manifest: Mutex<Manifest>,
@@ -99,6 +120,10 @@ pub struct Engine {
     counters: Counters,
     ts_min: i64,
     ts_max_skew_us: i64,
+    /// Set by `close` to stop the flush timer. Paired with `wake` so shutdown
+    /// does not wait out an hour-long interval.
+    stop: Mutex<bool>,
+    wake: Condvar,
 }
 
 impl Engine {
@@ -120,13 +145,30 @@ impl Engine {
         let lock = DirLock::acquire(&data_dir, force_unlock)?;
 
         let mut manifest = Manifest::load(&data_dir)?;
-        manifest.reconcile(&config)?;
+        // Commit *before* the writer opens a segment, not at the next flush.
+        // `reconcile` mints epochs, and every frame appended below is stamped
+        // with one; an epoch that lives only in memory is re-minted on the next
+        // start for whatever the config says then, so yesterday's frames get
+        // decoded against today's key list -- silently, when the arity happens
+        // to match. Nothing else writes the manifest until a flush commits, and
+        // there may never be one.
+        if manifest.reconcile(&config)? {
+            manifest.commit(&data_dir)?;
+        }
 
-        let rec = recovery::recover(
-            &data_dir,
-            manifest.last_flushed_segment,
-            config.limits.max_record_bytes,
-        )?;
+        // Before the WAL is touched: a flush that wrote files and then failed
+        // before committing left staged files in `tmp/` and real Parquet in
+        // `series/`, and the next flush -- covering a wider segment range, so a
+        // different filename -- writes those same rows again beside them.
+        planner::sweep_uncommitted(&data_dir, manifest.last_flushed_segment)?;
+
+        let rec = recovery::recover(&data_dir, manifest.last_flushed_segment)?;
+        if !rec.quarantined.is_empty() {
+            tracing::error!(
+                segments = ?rec.quarantined,
+                "wal segments were quarantined; their records are not in the dataset"
+            );
+        }
         if !rec.deleted.is_empty() {
             tracing::info!(
                 count = rec.deleted.len(),
@@ -150,7 +192,8 @@ impl Engine {
         }
 
         let ts_min = config.limits.ts_min_us()?;
-        let engine = Engine {
+        let interval_ms = config.flush.interval_ms;
+        let inner = Arc::new(Inner {
             data_dir,
             ts_min,
             ts_max_skew_us: config.limits.ts_max_skew_ms.saturating_mul(1_000),
@@ -161,13 +204,15 @@ impl Engine {
             flush_lock: Mutex::new(()),
             counters: Counters::default(),
             config,
-        };
+            stop: Mutex::new(false),
+            wake: Condvar::new(),
+        });
 
         // A restart must not sit on segments the previous run never flushed.
         // "if overdue", not "always": an engine that restarts every few minutes
         // would otherwise emit a tiny Parquet file per restart.
-        if engine.config.flush.on_startup && (!rec.pending.is_empty() && engine.flush_overdue()) {
-            match engine.flush() {
+        if inner.config.flush.on_startup && (!rec.pending.is_empty() && inner.flush_overdue()) {
+            match inner.flush() {
                 Ok(o) if o.rows_written > 0 => {
                     tracing::info!(rows = o.rows_written, "startup flush")
                 }
@@ -175,11 +220,112 @@ impl Engine {
                 Err(e) => tracing::error!(error = %e, "startup flush failed; ingest continues"),
             }
         }
-        Ok(engine)
+
+        // The periodic flush the whole design is stated in terms of. Without it
+        // Parquet only ever appears at startup or on an explicit request, so a
+        // long-running server accumulates WAL forever and no reader sees a row.
+        let flusher = match interval_ms {
+            0 => None,
+            ms => {
+                let shared = Arc::clone(&inner);
+                let interval = Duration::from_millis(ms);
+                Some(
+                    std::thread::Builder::new()
+                        .name("orc-flush".into())
+                        .spawn(move || flusher(shared, interval))?,
+                )
+            }
+        };
+
+        Ok(Engine {
+            inner,
+            flusher: Mutex::new(flusher),
+        })
     }
 
+    /// Stop the flush timer and wait for it, then close the WAL.
+    ///
+    /// The order is the point: joining first lets a flush already in progress
+    /// finish against a live WAL, where closing first would fail it on a writer
+    /// that no longer exists. Idempotent — `Drop` calls this, and so may the
+    /// caller.
+    pub fn close(&self) -> Result<()> {
+        let handle = {
+            let mut stop = self.inner.stop.lock().unwrap_or_else(|e| e.into_inner());
+            *stop = true;
+            self.inner.wake.notify_all();
+            drop(stop);
+            self.flusher
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take()
+        };
+        if let Some(handle) = handle {
+            // A panicking flush thread has already logged; losing the join is
+            // not a reason to fail a close that still has a WAL to flush.
+            if handle.join().is_err() {
+                tracing::error!("the flush timer thread panicked");
+            }
+        }
+        self.inner.close()
+    }
+}
+
+impl Drop for Engine {
+    fn drop(&mut self) {
+        if let Err(e) = self.close() {
+            tracing::error!(error = %e, "closing the engine during drop");
+        }
+    }
+}
+
+/// The periodic flush.
+///
+/// Waits on a condvar rather than sleeping, so `close` interrupts an interval of
+/// any length immediately instead of shutdown taking up to an hour.
+fn flusher(inner: Arc<Inner>, interval: Duration) {
+    loop {
+        let stop = inner.stop.lock().unwrap_or_else(|e| e.into_inner());
+        let (stop, timeout) = inner
+            .wake
+            .wait_timeout_while(stop, interval, |stop| !*stop)
+            .unwrap_or_else(|e| e.into_inner());
+        if *stop {
+            return;
+        }
+        drop(stop);
+        // The predicate is re-checked internally, so reaching here without a
+        // timeout would be a spurious wake with nothing to do.
+        if !timeout.timed_out() {
+            continue;
+        }
+
+        // Failures are logged, never fatal: the WAL is uncapped precisely so a
+        // stalled flush costs disk rather than availability, and `flush_failures`
+        // rising alongside `wal_bytes` is the documented signal for it.
+        match inner.flush() {
+            Ok(o) if o.rows_written > 0 => {
+                tracing::info!(
+                    rows = o.rows_written,
+                    files = o.files_written.len(),
+                    "periodic flush"
+                );
+            }
+            Ok(_) => {}
+            Err(e) => tracing::error!(error = %e, "periodic flush failed; ingest continues"),
+        }
+    }
+}
+
+impl Inner {
     fn flush_overdue(&self) -> bool {
-        let interval = self.config.flush.interval_ms.saturating_mul(1_000) as i64;
+        // Saturating into i64, not `as i64`: `saturating_mul` saturates at
+        // `u64::MAX`, which `as` then wraps to -1 -- and "elapsed >= -1" is
+        // always true, so an absurd interval would mean "always overdue", the
+        // exact inverse of what it says. `Config::validate` bounds the value
+        // too; this makes the conversion safe on its own.
+        let interval =
+            i64::try_from(self.config.flush.interval_ms.saturating_mul(1_000)).unwrap_or(i64::MAX);
         match self.manifest.lock().ok().and_then(|m| m.last_flush_at) {
             // Never flushed: any pending segment is already overdue.
             None => true,
@@ -326,7 +472,11 @@ impl Engine {
     pub fn append_raw(&self, mut bytes: &[u8]) -> Result<RawIngest> {
         let limit = self.config.limits.max_record_bytes;
         let mut out = RawIngest::default();
-        let mut good: Vec<u8> = Vec::with_capacity(bytes.len());
+        // Grown as frames are accepted, not reserved from the message length.
+        // The length is attacker-supplied: reserving it up front paid for a
+        // whole batch before a single frame had been validated, so a hostile
+        // message cost its full size even when its first frame was garbage.
+        let mut good: Vec<u8> = Vec::new();
 
         while !bytes.is_empty() {
             let prefix = match codec::validate_prefix(bytes, limit) {
@@ -335,8 +485,20 @@ impl Engine {
                     // A corrupt frame has an untrustworthy length, so there is no
                     // safe way to find the next one: stop here rather than
                     // resynchronising onto whatever happens to look like a frame.
-                    tracing::warn!(error = %e, "stopped reading a batch at an undecodable frame");
+                    //
+                    // Everything after it is discarded with it, and the byte
+                    // count is the only honest measure of how much -- the frames
+                    // cannot be counted precisely for the same reason they
+                    // cannot be found. Reporting a flat 1 made a corrupt frame
+                    // near the head of a 1024-record batch look like one lost
+                    // record.
                     out.rejected += 1;
+                    out.discarded_bytes += bytes.len();
+                    tracing::warn!(
+                        error = %e,
+                        discarded_bytes = bytes.len(),
+                        "stopped reading a batch at an undecodable frame; the rest of it is dropped"
+                    );
                     break;
                 }
             };
@@ -387,9 +549,18 @@ impl Engine {
         let pending = crate::wal::list_segments(&self.data_dir)?;
         let mut manifest = self.manifest.lock().unwrap_or_else(|e| e.into_inner());
 
-        // Never consume the segment the writer is appending to.
+        // Never consume the segment the writer is appending to, and never
+        // reconsume one the manifest already calls durable. The second half is
+        // the rule startup applies too: without it, a `delete_segments` that
+        // fails after the commit leaves a segment that the next flush re-reads
+        // and rewrites under a wider name, so both files match the reader's glob
+        // and every row in the overlap comes back twice.
         let active = self.wal.segment();
-        let consumable: Vec<u64> = pending.into_iter().filter(|id| *id < active).collect();
+        let floor = manifest.last_flushed_segment;
+        let consumable: Vec<u64> = pending
+            .into_iter()
+            .filter(|id| *id < active && *id > floor)
+            .collect();
 
         match planner::run(&self.data_dir, &self.config, &mut manifest, &consumable) {
             Ok(outcome) => {
@@ -453,18 +624,61 @@ impl Engine {
         )
     }
 
-    /// Stop the committer, fsync, and release the directory lock.
-    ///
-    /// `Drop` calls this, so a forgotten `close()` is not a lost-data bug.
-    pub fn close(&self) -> Result<()> {
+    /// Stop the committer and fsync. The directory lock goes with `Inner`.
+    fn close(&self) -> Result<()> {
         self.wal.close()
     }
 }
 
-impl Drop for Engine {
-    fn drop(&mut self) {
-        if let Err(e) = self.close() {
-            tracing::error!(error = %e, "closing the wal during drop");
-        }
+/// Everything below forwards to [`Inner`]. The split exists only so the flush
+/// timer can hold the state without holding the thread handle that joins it.
+impl Engine {
+    /// Resolve a series name to a handle. Do this once, outside the hot loop.
+    pub fn series(&self, name: &str) -> Result<Arc<SeriesHandle>> {
+        self.inner.series(name)
+    }
+
+    /// Append one record.
+    pub fn append(&self, handle: &SeriesHandle, row: &Row<'_>) -> Result<()> {
+        self.inner.append(handle, row)
+    }
+
+    /// Append many records under a single WAL lock acquisition.
+    pub fn append_batch(&self, handle: &SeriesHandle, rows: &[Row<'_>]) -> Result<()> {
+        self.inner.append_batch(handle, rows)
+    }
+
+    /// Append frames a client already encoded, without re-encoding them.
+    pub fn append_raw(&self, bytes: &[u8]) -> Result<RawIngest> {
+        self.inner.append_raw(bytes)
+    }
+
+    /// Seal the active segment and turn every sealed one into Parquet.
+    ///
+    /// Single-flight with the interval timer and the control socket: a
+    /// concurrent caller waits rather than starting a second flush over the same
+    /// segments.
+    pub fn flush(&self) -> Result<FlushOutcome> {
+        self.inner.flush()
+    }
+
+    /// Counter snapshot.
+    pub fn stats(&self) -> Stats {
+        self.inner.stats()
+    }
+
+    /// Every resolved series handle, in arbitrary order.
+    pub fn series_handles(&self) -> impl Iterator<Item = &Arc<SeriesHandle>> {
+        self.inner.series_handles()
+    }
+
+    /// The data directory this engine owns.
+    pub fn data_dir(&self) -> &Path {
+        self.inner.data_dir()
+    }
+
+    /// Human-readable accept window, for diagnostics.
+    pub fn accept_window(&self) -> (String, Option<String>) {
+        self.inner.accept_window()
     }
 }

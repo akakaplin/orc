@@ -160,7 +160,12 @@ impl Manifest {
     /// Reconciliation is all-or-nothing: every series is checked before any is
     /// mutated, so a rejected retype in the last series of a config cannot leave
     /// the manifest half-updated with an epoch that was never committed.
-    pub fn reconcile(&mut self, config: &Config) -> Result<()> {
+    ///
+    /// Returns whether anything changed, so the caller knows whether it owes the
+    /// file a [`Manifest::commit`]. An epoch that exists only in memory is worse
+    /// than no epoch at all — the frames stamped with it are already durable, and
+    /// the next start would mint the same number for a different key list.
+    pub fn reconcile(&mut self, config: &Config) -> Result<bool> {
         for series in &config.series {
             let history = self
                 .series
@@ -170,6 +175,7 @@ impl Manifest {
             check_no_retype(&series.name, history, &series.keys)?;
         }
 
+        let mut changed = false;
         for series in &config.series {
             let history = self.series.entry(series.name.clone()).or_default();
 
@@ -188,8 +194,11 @@ impl Manifest {
             if same_layout {
                 // Refresh in place so the history still reports what ingest
                 // currently enforces, without minting an epoch for it.
-                if let Some(last) = history.last_mut() {
+                if let Some(last) = history.last_mut()
+                    && last.keys != series.keys
+                {
                     last.keys = series.keys.clone();
+                    changed = true;
                 }
                 continue;
             }
@@ -214,8 +223,9 @@ impl Manifest {
                 epoch,
                 keys: series.keys.clone(),
             });
+            changed = true;
         }
-        Ok(())
+        Ok(changed)
     }
 
     /// The epoch new frames for this series must be stamped with.
@@ -309,6 +319,33 @@ mod tests {
         m.reconcile(&cfg).unwrap();
         assert_eq!(m.current_epoch("trades"), Some(0));
         assert_eq!(m.series["trades"].len(), 1, "history must not grow");
+    }
+
+    /// The caller commits on `true` and skips the write on `false`, so a wrong
+    /// answer either loses a minted epoch or rewrites the file on every restart.
+    #[test]
+    fn reconcile_reports_whether_it_changed_anything() {
+        let cfg = config(&[("trades", vec![key("symbol", KeyType::Str)])]);
+        let mut m = Manifest::default();
+        assert!(m.reconcile(&cfg).unwrap(), "minting epoch 0 is a change");
+        assert!(!m.reconcile(&cfg).unwrap(), "an identical config is not");
+
+        // A new epoch.
+        let grown = config(&[(
+            "trades",
+            vec![key("symbol", KeyType::Str), key("size", KeyType::I64)],
+        )]);
+        assert!(m.reconcile(&grown).unwrap());
+        assert!(!m.reconcile(&grown).unwrap());
+
+        // A nullable-only edit mints no epoch but still rewrites the history,
+        // so it has to count as a change or the file goes stale.
+        let mut relaxed = key("symbol", KeyType::Str);
+        relaxed.nullable = true;
+        let same_layout = config(&[("trades", vec![relaxed, key("size", KeyType::I64)])]);
+        assert!(m.reconcile(&same_layout).unwrap(), "nullable edit persists");
+        assert!(!m.reconcile(&same_layout).unwrap());
+        assert_eq!(m.current_epoch("trades"), Some(1), "and mints no epoch");
     }
 
     #[test]

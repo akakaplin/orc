@@ -14,10 +14,22 @@ use std::collections::BTreeSet;
 
 use crate::config::KeyDef;
 use crate::manifest::EpochSchema;
+use crate::record::KeyType;
 
 /// SQL string literal quoting: double any embedded single quote.
 fn sql_str(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
+}
+
+/// The DuckDB type a declared key reads back as, matching what
+/// [`crate::flush::parquet::parquet_schema`] writes.
+fn duckdb_type(ty: KeyType) -> &'static str {
+    match ty {
+        KeyType::Bool => "BOOLEAN",
+        KeyType::I64 => "BIGINT",
+        KeyType::F64 => "DOUBLE",
+        KeyType::Str => "VARCHAR",
+    }
 }
 
 /// Quote an identifier for DuckDB, doubling embedded double quotes.
@@ -77,8 +89,22 @@ pub fn view_sql(series: &str, history: &[EpochSchema]) -> String {
             sql.push_str(&format!("  {ident},\n"));
         } else {
             // Declared in some epochs, in `extra` in the others.
+            //
+            // The cast is not optional. `extra`'s values are UTF-8, and DuckDB
+            // refuses to coalesce a BIGINT column against a VARCHAR one --
+            // "Cannot mix values of type BIGINT and VARCHAR in COALESCE
+            // operator - an explicit cast is required" -- so without it this
+            // file does not run at all once a non-string key is promoted. Every
+            // test covered `string` keys, where the two sides already agree,
+            // which is why that went unnoticed.
+            //
+            // `try_cast`, not `cast`: the `extra` half is whatever some producer
+            // wrote there, and a plain cast turns one unparseable value into a
+            // Conversion Error that fails the whole query rather than nulling
+            // the one row.
+            let ty = duckdb_type(k.ty);
             sql.push_str(&format!(
-                "  coalesce({ident}, extra[{}]) AS {ident},\n",
+                "  coalesce({ident}, try_cast(extra[{}] AS {ty})) AS {ident},\n",
                 sql_str(&k.name)
             ));
         }
@@ -113,12 +139,15 @@ pub fn view_columns(history: &[EpochSchema]) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::record::KeyType;
 
     fn key(name: &str) -> KeyDef {
+        typed_key(name, KeyType::Str)
+    }
+
+    fn typed_key(name: &str, ty: KeyType) -> KeyDef {
         KeyDef {
             name: name.to_string(),
-            ty: KeyType::Str,
+            ty,
             nullable: true,
         }
     }
@@ -147,9 +176,40 @@ mod tests {
         let sql = view_sql("trades", &h);
         assert!(sql.contains("  \"symbol\",\n"), "stable key: {sql}");
         assert!(
-            sql.contains("coalesce(\"venue\", extra['venue']) AS \"venue\""),
+            sql.contains("coalesce(\"venue\", try_cast(extra['venue'] AS VARCHAR)) AS \"venue\""),
             "promoted key: {sql}"
         );
+    }
+
+    /// The `extra` half of a coalesce is always UTF-8, so without a cast back to
+    /// the declared type DuckDB resolves the column to VARCHAR — promoting an
+    /// `i64` key would silently turn `size > 9` into a string comparison.
+    #[test]
+    fn a_promoted_key_keeps_the_type_its_config_declares() {
+        for (ty, sql_type) in [
+            (KeyType::I64, "BIGINT"),
+            (KeyType::F64, "DOUBLE"),
+            (KeyType::Bool, "BOOLEAN"),
+            (KeyType::Str, "VARCHAR"),
+        ] {
+            let h = [
+                EpochSchema {
+                    epoch: 0,
+                    keys: vec![],
+                },
+                EpochSchema {
+                    epoch: 1,
+                    keys: vec![typed_key("size", ty)],
+                },
+            ];
+            let sql = view_sql("trades", &h);
+            assert!(
+                sql.contains(&format!(
+                    "coalesce(\"size\", try_cast(extra['size'] AS {sql_type})) AS \"size\""
+                )),
+                "{ty:?} should cast to {sql_type}: {sql}"
+            );
+        }
     }
 
     #[test]
@@ -158,7 +218,10 @@ mod tests {
         // later values arrive in `extra`.
         let h = [epoch(0, &["venue"]), epoch(1, &[])];
         let sql = view_sql("trades", &h);
-        assert!(sql.contains("coalesce(\"venue\", extra['venue'])"), "{sql}");
+        assert!(
+            sql.contains("coalesce(\"venue\", try_cast(extra['venue'] AS VARCHAR))"),
+            "{sql}"
+        );
     }
 
     #[test]
@@ -171,7 +234,7 @@ mod tests {
         let sql = view_sql("odd\"name", &h);
         assert!(sql.contains("\"select\","), "keyword as ident: {sql}");
         assert!(
-            sql.contains("coalesce(\"it's\", extra['it''s']) AS \"it's\""),
+            sql.contains("coalesce(\"it's\", try_cast(extra['it''s'] AS VARCHAR)) AS \"it's\""),
             "quote escaped differently in ident vs literal: {sql}"
         );
         assert!(sql.contains("VIEW \"odd\"\"name\""), "escaped ident: {sql}");

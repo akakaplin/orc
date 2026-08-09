@@ -222,6 +222,110 @@ fn the_generated_view_runs_and_coalesces_a_promoted_key() {
     assert_eq!(venues, "XNAS,3\nXNYS,2", "got: {venues}");
 }
 
+/// Promoting a non-string key must leave `view.sql` runnable, and the column
+/// with the type its config declares.
+///
+/// DuckDB refuses to coalesce a BIGINT column against the VARCHAR one that
+/// `extra` yields — "an explicit cast is required" — so before the cast was
+/// added this file raised a Binder Error and the view was unusable from the
+/// moment a typed key was promoted. Every other view test uses `string` keys,
+/// where both sides already agree and nothing is wrong.
+#[test]
+fn a_promoted_typed_key_still_compares_as_its_declared_type() {
+    if !duckdb_available() {
+        eprintln!("skipping: duckdb not on PATH");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+
+    let config = |with_size: bool| {
+        let size = if with_size {
+            r#", {"name": "size", "type": "i64", "nullable": true}"#
+        } else {
+            ""
+        };
+        format!(
+            r#"{{
+              "data_dir": {},
+              "flush": {{ "on_startup": false }},
+              "wal": {{ "fsync_interval_ms": 1 }},
+              "series": [
+                {{ "name": "trades",
+                   "keys": [ {{"name": "symbol", "type": "string"}}{size} ] }}
+              ]
+            }}"#,
+            serde_json::to_string(&dir.path().to_string_lossy()).unwrap()
+        )
+    };
+
+    // Epoch 0: `size` undeclared, so 9 and 100 land in `extra` as text.
+    {
+        let cfg: Config = serde_json::from_str(&config(false)).unwrap();
+        let engine = Engine::open(cfg).unwrap();
+        let trades = engine.series("trades").unwrap();
+        // "n/a" is the uncontrolled-producer case: `extra` is untyped text, so
+        // nothing stopped it being written. A plain cast would turn it into a
+        // Conversion Error that fails every query through the view.
+        for (i, size) in ["9", "100", "n/a"].iter().enumerate() {
+            engine
+                .append(
+                    &trades,
+                    &Row {
+                        ts: T13 + i as i64,
+                        id: &format!("e0-{i}"),
+                        keys: &[Value::Str("AAPL")],
+                        extra: &[("size", size)],
+                        data: "",
+                    },
+                )
+                .unwrap();
+        }
+        engine.flush().unwrap();
+    }
+    // Epoch 1: `size` is a real BIGINT column.
+    {
+        let cfg: Config = serde_json::from_str(&config(true)).unwrap();
+        let engine = Engine::open(cfg).unwrap();
+        let trades = engine.series("trades").unwrap();
+        engine
+            .append(
+                &trades,
+                &Row {
+                    ts: T13 + HOUR_US,
+                    id: "e1-0",
+                    keys: &[Value::Str("MSFT"), Value::I64(50)],
+                    extra: &[],
+                    data: "",
+                },
+            )
+            .unwrap();
+        engine.flush().unwrap();
+    }
+
+    let view_sql = std::fs::read_to_string(dir.path().join("series/trades/view.sql")).unwrap();
+
+    // The column's type, straight from DuckDB rather than inferred.
+    let ty = query(
+        dir.path(),
+        &format!("{view_sql}\nselect column_type from (describe select size from trades) limit 1;"),
+    );
+    assert_eq!(ty, "BIGINT", "a promoted i64 key must not become text");
+
+    // Numeric comparison, not lexical -- and the unparseable value reads as
+    // NULL instead of taking the query down with it.
+    let big = query(
+        dir.path(),
+        &format!("{view_sql}\nselect size from trades where size > 9 order by size;"),
+    );
+    assert_eq!(big, "50\n100", "numeric comparison, not lexical: got {big}");
+
+    let counts = query(
+        dir.path(),
+        &format!("{view_sql}\nselect count(*), count(size) from trades;"),
+    );
+    assert_eq!(counts, "4,3", "the junk value nulls its own row only");
+}
+
 #[test]
 fn rows_are_sorted_by_ts_within_every_file() {
     if !duckdb_available() {
