@@ -359,3 +359,32 @@ fn a_dropped_client_flushes_what_it_buffered() {
     eventually("Drop to flush the partial batch", || appended(&probe) == 5);
     h.stop(&probe);
 }
+
+/// libzmq reports a control-socket timeout as `EAGAIN` — "Resource temporarily
+/// unavailable" — which sends the reader looking for a resource when the cause
+/// is that nothing is listening. This is the first failure a newcomer running
+/// the examples hits, so it has to name the endpoint it actually tried.
+#[test]
+fn a_dead_control_endpoint_is_named_rather_than_reported_as_eagain() {
+    let err = Client::builder()
+        .ingest("tcp://127.0.0.1:1")
+        .control("tcp://127.0.0.1:2")
+        // Short, so the test does not wait out the 5s default.
+        .control_timeout_ms(200)
+        .connect()
+        .expect_err("nothing is listening on port 2")
+        .to_string();
+
+    assert!(
+        err.contains("tcp://127.0.0.1:2"),
+        "must name the endpoint: {err}"
+    );
+    assert!(
+        err.contains("orc server running"),
+        "must say what to check: {err}"
+    );
+    assert!(
+        !err.contains("Resource temporarily unavailable"),
+        "the raw errno is what this replaces: {err}"
+    );
+}

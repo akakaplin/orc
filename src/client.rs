@@ -180,6 +180,7 @@ impl ClientBuilder {
             stats: ClientStats::default(),
             encoder: Encoder::default(),
             control_timeout_ms: self.control_timeout_ms,
+            control_endpoint,
             max_batch_bytes: self.max_batch_bytes,
             configured_max_batch_bytes: self.max_batch_bytes,
         };
@@ -233,6 +234,9 @@ pub struct Client {
     encoder: Encoder,
     /// Kept so `control` can restore it after raising it for a `Flush`.
     control_timeout_ms: i32,
+    /// Kept only to name it in a timeout: the endpoint is the one fact that
+    /// turns "the socket gave up" into something actionable.
+    control_endpoint: String,
     /// The cap actually in force: `min(configured, whatever the server said)`.
     max_batch_bytes: usize,
     /// What the builder was given, so a re-handshake recomputes the minimum from
@@ -295,10 +299,13 @@ impl Client {
     /// working flush as a failure while the server went on to finish it.
     pub fn control(&self, req: ControlRequest) -> Result<ControlResponse> {
         let slow = matches!(req, ControlRequest::Flush);
-        if slow {
+        let waited = if slow {
             self.req.set_rcvtimeo(FLUSH_TIMEOUT_MS).map_err(zmq_err)?;
-        }
-        let result = self.control_inner(req);
+            FLUSH_TIMEOUT_MS
+        } else {
+            self.control_timeout_ms
+        };
+        let result = self.control_inner(req, waited);
         if slow {
             // Restore even on failure: leaving the long timeout in place would
             // make a later `stats` against a dead server hang for minutes.
@@ -310,10 +317,34 @@ impl Client {
         result
     }
 
-    fn control_inner(&self, req: ControlRequest) -> Result<ControlResponse> {
-        self.req.send(req.to_bytes()?, 0).map_err(zmq_err)?;
-        let reply = self.req.recv_bytes(0).map_err(zmq_err)?;
+    fn control_inner(&self, req: ControlRequest, waited: i32) -> Result<ControlResponse> {
+        self.req
+            .send(req.to_bytes()?, 0)
+            .map_err(|e| self.control_err(e, "send to", self.control_timeout_ms))?;
+        let reply = self
+            .req
+            .recv_bytes(0)
+            .map_err(|e| self.control_err(e, "get a reply from", waited))?;
         Ok(ControlResponse::from_bytes(&reply)?)
+    }
+
+    /// Name a control-socket timeout for what it is.
+    ///
+    /// libzmq reports one as `EAGAIN`, which renders as "Resource temporarily
+    /// unavailable" — a message that sends the reader hunting for a resource
+    /// when the cause is almost always that nothing is listening at the
+    /// endpoint. That endpoint is the one fact worth printing, and the client
+    /// derives it from `--ingest` when it is not given, so it is also the one
+    /// the caller is least likely to already know.
+    fn control_err(&self, e: zmq::Error, what: &str, waited: i32) -> Error {
+        match e {
+            zmq::Error::EAGAIN => Error::Config(format!(
+                "could not {what} the control socket at {} within {waited} ms; \
+                 is an orc server running there?",
+                self.control_endpoint
+            )),
+            other => zmq_err(other),
+        }
     }
 
     /// Resolve a series by name. Do this once, outside the hot loop.

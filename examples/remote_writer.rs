@@ -25,7 +25,20 @@ fn now_us() -> u64 {
         .as_micros() as u64
 }
 
-fn main() -> orc::Result<()> {
+fn main() -> std::process::ExitCode {
+    // Same shape as the shipped binaries: `main() -> Result` would print the
+    // error with `Debug`, which wraps a perfectly good sentence in
+    // `Error: Config("...")`.
+    match run() {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("remote_writer: {e}");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+fn run() -> orc::Result<()> {
     let mut args = std::env::args().skip(1);
     let ingest = args
         .next()
