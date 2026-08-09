@@ -58,6 +58,40 @@ client.send(&trades, &row)?;
 
 Nothing stops one process being both: embed the engine, and bind a server to it so other processes can write to the same data directory through you.
 
+## Examples
+
+`examples/` has a working pair, both behind `--features net`:
+
+| File | What it shows |
+| --- | --- |
+| [`embedded_server.rs`](examples/embedded_server.rs) | One process that is both the database and a writer: it opens the engine, appends timestamps from a background thread, and binds a ZeroMQ server onto the *same* engine so other processes can write to the same directory. |
+| [`remote_writer.rs`](examples/remote_writer.rs) | A second process writing over the socket — handshake, send, then a synchronous `flush` so the rows reach Parquet immediately instead of at the next interval. |
+| [`two_processes.sh`](examples/two_processes.sh) | Drives both end to end and prints what landed on disk. |
+
+```sh
+./examples/two_processes.sh
+```
+
+It starts the embedded server on `tcp://127.0.0.1:5655`, polls `orc-cli ping` until the socket answers, runs the remote writer, prints the counters, shuts the server down, and lists the output:
+
+```
+==> counters (appended counts both writers; batches_received counts only the remote one)
+{ "status": "stats", "appended": 10, ..., "rows_flushed": 10, "batches_received": 1 }
+
+==> what landed on disk
+series/pulse/hour=2026-08-09T11/0000000001-0000000001.e0.parquet
+```
+
+Ten rows in one file: five written in-process and five over the wire, which is the point — embedding the engine and talking to it over a socket are the same write path, and neither writer needs to know the other exists. `KEEP=1` keeps the temporary data directory.
+
+Run them by hand instead:
+
+```sh
+cargo run --features net --example embedded_server -- ./data-example
+cargo run --features net --example remote_writer                  # in another shell
+cargo run --features cli --bin orc-cli -- --ingest tcp://127.0.0.1:5655 shutdown
+```
+
 ## Record shape
 
 | Field         | Type                              | Required   | Notes                                        |
@@ -287,6 +321,7 @@ cargo test --features cli
 cargo clippy --all-targets --features cli -- -D warnings
 cargo fmt --all --check
 ./scripts/check-deps.sh                        # dependency budget
+./examples/two_processes.sh                    # two processes, one data directory
 ```
 
 Toolchain: Rust 1.91, edition 2024. The first `--features net` build compiles libzmq from source, so it takes noticeably longer than later ones.

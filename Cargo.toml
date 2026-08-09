@@ -83,3 +83,14 @@ required-features = ["cli"]
 
 [profile.release]
 debug = 1
+
+# Examples need the transport; `two_processes.sh` also drives orc-cli, so it
+# asks for `cli`. Declared so `cargo build` stays pure Rust and does not try to
+# compile them.
+[[example]]
+name = "embedded_server"
+required-features = ["net"]
+
+[[example]]
+name = "remote_writer"
+required-features = ["net"]
