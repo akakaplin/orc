@@ -43,6 +43,15 @@ pub enum Error {
         limit: usize,
     },
 
+    /// A batch that would not survive the trip: libzmq refuses a message over
+    /// `server.max_batch_bytes` and drops it *below* the application, so the
+    /// server never sees it and cannot report it. Refusing on the sending side
+    /// is the only place the loss can be made visible.
+    BatchTooLarge {
+        size: usize,
+        limit: usize,
+    },
+
     UnknownEpoch {
         series: String,
         epoch: u32,
@@ -88,6 +97,11 @@ impl std::fmt::Display for Error {
             Error::RecordTooLarge { size, limit } => {
                 write!(f, "record is {size} bytes, over the {limit}-byte limit")
             }
+            Error::BatchTooLarge { size, limit } => write!(
+                f,
+                "batch is {size} bytes, over the server's {limit}-byte max_batch_bytes; \
+                 sending it would have it silently discarded by zeromq"
+            ),
             Error::UnknownEpoch { series, epoch } => write!(
                 f,
                 "frame declares schema epoch {epoch} for series {series:?}, which is not in the manifest history"
@@ -174,6 +188,14 @@ mod tests {
                     limit: 16,
                 },
                 "record is 20 bytes, over the 16-byte limit",
+                false,
+            ),
+            (
+                Error::BatchTooLarge {
+                    size: 100,
+                    limit: 64,
+                },
+                "silently discarded",
                 false,
             ),
             (

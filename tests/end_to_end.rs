@@ -418,6 +418,64 @@ fn dropping_an_engine_stops_its_flush_timer() {
     Engine::open(config).expect("the lock must have been released");
 }
 
+/// `manifest.json` is the only record of how far the flush got. Without it the
+/// watermark reads as 0, under which every committed Parquet file looks like
+/// debris from a flush that never committed — and the startup sweep deleted the
+/// entire dataset. There is no way to recover the watermark from the filenames,
+/// so the engine stops and says so.
+#[test]
+fn a_lost_manifest_stops_the_engine_instead_of_wiping_the_dataset() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let engine = open(dir.path());
+        let trades = engine.series("trades").unwrap();
+        for i in 0..5 {
+            push(&engine, &trades, T13 + i, "");
+        }
+        engine.flush().unwrap();
+    }
+    let committed = parquet_files(dir.path(), "trades");
+    assert_eq!(committed.len(), 1);
+    assert_eq!(parquet_rows(dir.path(), "trades"), 5);
+
+    std::fs::remove_file(dir.path().join("manifest.json")).unwrap();
+
+    let config: Config = serde_json::from_str(&config_json(dir.path())).unwrap();
+    let err = Engine::open(config).unwrap_err().to_string();
+    assert!(err.contains("manifest.json"), "{err}");
+    assert!(err.contains("series"), "{err}");
+    assert!(
+        committed[0].exists() && parquet_rows(dir.path(), "trades") == 5,
+        "a refusal must not be a deletion"
+    );
+
+    // Putting the manifest back is all it takes; the message says as much.
+    std::fs::write(
+        dir.path().join("manifest.json"),
+        serde_json::to_vec(&serde_json::json!({"last_flushed_segment": 1})).unwrap(),
+    )
+    .unwrap();
+    let engine = open(dir.path());
+    assert_eq!(
+        parquet_rows(dir.path(), "trades"),
+        5,
+        "and the data is still there"
+    );
+    drop(engine);
+}
+
+/// A fresh directory has no output, so the check above must not stand between
+/// an engine and its first start.
+#[test]
+fn a_fresh_directory_still_opens_without_a_manifest() {
+    let dir = tempfile::tempdir().unwrap();
+    assert!(!dir.path().join("manifest.json").exists());
+    let engine = open(dir.path());
+    let trades = engine.series("trades").unwrap();
+    push(&engine, &trades, T13, "a");
+    assert_eq!(engine.flush().unwrap().rows_written, 1);
+}
+
 #[test]
 fn flush_is_a_noop_when_there_is_nothing_to_do() {
     let dir = tempfile::tempdir().unwrap();

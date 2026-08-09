@@ -49,7 +49,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::config::{Config, KeyDef};
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::flush::parquet::{
     RowBuilder, WrittenFile, output_file_name, parse_output_file_name, write_file,
 };
@@ -150,12 +150,13 @@ pub fn run(
     let mut rejects = RejectSink::new(data_dir, config.limits.reject_max_bytes);
     let mut decoded = decode_segments(data_dir, &ids, &bufs, manifest, &mut rejects);
 
-    // A quarantined segment was renamed out of `wal/`, so it is neither consumed
-    // nor left to be re-read. Dropping it from `ids` keeps the outcome honest
-    // about what this flush actually turned into Parquet.
-    ids.retain(|id| !decoded.quarantined.contains(id));
+    // Dropping an unreadable segment from `ids` is what keeps the commit below
+    // from advancing the watermark over it and `delete_segments` from unlinking
+    // it. `unreadable`, not `quarantined`: the two differ when the rename fails,
+    // and it is the failed *read* that makes a segment unsafe to call durable.
+    ids.retain(|id| !decoded.unreadable.contains(id));
     if ids.is_empty() {
-        // Every segment offered was quarantined. There is nothing to write, and
+        // Every segment offered was unreadable. There is nothing to write, and
         // above all nothing to commit: advancing the watermark here would be the
         // engine asserting that unreadable segments are durable in Parquet.
         return Ok(FlushOutcome {
@@ -320,8 +321,11 @@ struct Decoded<'a> {
     schemas: BTreeMap<(String, u32), Vec<KeyDef>>,
     frames_rejected: usize,
     bytes_skipped: u64,
-    /// Segments moved aside because their header would not parse. They are not
-    /// consumed and must not be deleted — see [`quarantine_segment`].
+    /// Segments whose header would not parse. Not consumed, and above all not
+    /// deleted — whether or not the move aside succeeded.
+    unreadable: Vec<u64>,
+    /// The subset of `unreadable` that [`quarantine_segment`] managed to rename.
+    /// Reported to the caller so a failed move is visible as the difference.
     quarantined: Vec<u64>,
 }
 
@@ -365,10 +369,13 @@ fn decode_segments<'a>(
             Ok(r) => r,
             Err(err) => {
                 // No readable header means no locatable frames -- but the bytes
-                // behind it may be entirely intact, so the one thing that must
-                // not happen is what used to: skipping it here while the commit
-                // below advances the watermark past it and deletes it.
+                // behind it may be entirely intact, so it must not be deleted.
+                // Recorded before the move is attempted and regardless of whether
+                // it works: gating this on the rename left a segment that could
+                // not be moved in `ids`, where the commit declared it durable and
+                // the unlink took it.
                 tracing::error!(segment = segment_id, %err, "wal segment header is unreadable");
+                out.unreadable.push(segment_id);
                 if quarantine_segment(data_dir, segment_id) {
                     out.quarantined.push(segment_id);
                 }
@@ -541,6 +548,11 @@ impl Sink<'_> {
 /// parse is left alone — this is the only place the engine deletes from
 /// `series/`, and it has no claim on files it did not write.
 ///
+/// **`last_flushed_segment` must come from a manifest that was actually read off
+/// disk.** A missing `manifest.json` reads as 0, under which every committed
+/// file's range runs past it and this deletes the whole dataset.
+/// [`require_manifest_for_output`] is what stops that reaching here.
+///
 /// Runs at open, under the directory lock, so no flush can be in flight.
 pub fn sweep_uncommitted(data_dir: &Path, last_flushed_segment: u64) -> Result<()> {
     let tmp = tmp_dir(data_dir);
@@ -569,34 +581,21 @@ pub fn sweep_uncommitted(data_dir: &Path, last_flushed_segment: u64) -> Result<(
         }
     }
 
-    let root = data_dir.join(SERIES_DIR);
-    let Ok(series) = std::fs::read_dir(&root) else {
-        return Ok(());
-    };
     let mut removed = Vec::new();
-    for s in series.flatten() {
-        let Ok(hours) = std::fs::read_dir(s.path()) else {
+    let mut emptied: BTreeSet<PathBuf> = BTreeSet::new();
+    for (path, (_, last, _)) in output_files(data_dir) {
+        if last <= last_flushed_segment {
             continue;
-        };
-        for hour in hours.flatten() {
-            let Ok(files) = std::fs::read_dir(hour.path()) else {
-                continue;
-            };
-            for f in files.flatten() {
-                let name = f.file_name();
-                let Some((_, last, _)) = name.to_str().and_then(parse_output_file_name) else {
-                    continue;
-                };
-                if last <= last_flushed_segment {
-                    continue;
+        }
+        match std::fs::remove_file(&path) {
+            Ok(()) => {
+                if let Some(hour) = path.parent() {
+                    emptied.insert(hour.to_path_buf());
                 }
-                let path = f.path();
-                match std::fs::remove_file(&path) {
-                    Ok(()) => removed.push(path),
-                    Err(e) => {
-                        tracing::warn!(error = %e, path = %path.display(), "could not remove an orphan parquet file");
-                    }
-                }
+                removed.push(path);
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, path = %path.display(), "could not remove an orphan parquet file");
             }
         }
     }
@@ -614,7 +613,81 @@ pub fn sweep_uncommitted(data_dir: &Path, last_flushed_segment: u64) -> Result<(
             tracing::info!(path = %path.display(), "removed orphan parquet");
         }
     }
+    // `remove_dir` fails harmlessly when anything is left, which is exactly the
+    // check wanted: a partition emptied of orphans goes, one with a committed
+    // file or a hand-placed one stays.
+    for hour in &emptied {
+        let _ = std::fs::remove_dir(hour);
+    }
     Ok(())
+}
+
+/// Refuse to open a data directory that holds flush output but no manifest.
+///
+/// `manifest.json` is the only record of how far the flush got. Without it
+/// `last_flushed_segment` reads as 0, under which every Parquet file in
+/// `series/` looks like debris from a flush that never committed and
+/// [`sweep_uncommitted`] deletes the entire dataset.
+///
+/// Deliberately not a repair: the filenames say which segment ranges were
+/// written, not which of those the manifest had accepted, so there is nothing to
+/// guess the watermark back from. It stops and leaves the decision to someone
+/// who knows whether the manifest was lost or the Parquet was copied in.
+///
+/// A fresh directory has no output and passes, which is what lets an engine
+/// start for the first time.
+pub fn require_manifest_for_output(data_dir: &Path) -> Result<()> {
+    let found = output_files(data_dir);
+    let Some((first, _)) = found.first() else {
+        return Ok(());
+    };
+    Err(Error::Config(format!(
+        "{} has no {} but {}/ already holds {} parquet file(s) this engine wrote \
+         (for example {}). Refusing to start: the manifest is the only record of how \
+         far the flush got, and without it every one of those files looks like debris \
+         from a flush that never committed -- so starting would delete them. \
+         Restore {} from a backup, or move {}/ aside if you mean to start fresh.",
+        data_dir.display(),
+        crate::manifest::MANIFEST_FILE,
+        SERIES_DIR,
+        found.len(),
+        first.display(),
+        crate::manifest::MANIFEST_FILE,
+        SERIES_DIR,
+    )))
+}
+
+/// Every flush-output file under `series/`, with the `(first, last, epoch)` its
+/// name encodes.
+///
+/// Anything the parse does not recognise is left out: `series/` holds `view.sql`
+/// and whatever else an operator keeps there, and both callers either delete or
+/// refuse to start over what this returns. A directory that cannot be listed is
+/// skipped rather than reported — this walks a tree the README invites people to
+/// prune, so racing a `find -delete` must not fail startup.
+fn output_files(data_dir: &Path) -> Vec<(PathBuf, (u64, u64, u32))> {
+    let mut out = Vec::new();
+    let Ok(series) = std::fs::read_dir(data_dir.join(SERIES_DIR)) else {
+        return out;
+    };
+    for s in series.flatten() {
+        let Ok(hours) = std::fs::read_dir(s.path()) else {
+            continue;
+        };
+        for hour in hours.flatten() {
+            let Ok(files) = std::fs::read_dir(hour.path()) else {
+                continue;
+            };
+            for f in files.flatten() {
+                let name = f.file_name();
+                if let Some(parsed) = name.to_str().and_then(parse_output_file_name) {
+                    out.push((f.path(), parsed));
+                }
+            }
+        }
+    }
+    out.sort();
+    out
 }
 
 /// Move a segment out of `wal/` without destroying it.
@@ -625,9 +698,10 @@ pub fn sweep_uncommitted(data_dir: &Path, last_flushed_segment: u64) -> Result<(
 /// [`list_segments`](crate::wal::list_segments) no longer sees it, and every byte
 /// stays where an operator can get at it.
 ///
-/// Returns whether the rename happened. A failure is logged and swallowed: it
-/// leaves the segment where it is, which costs a repeated error on the next
-/// flush and loses nothing.
+/// Returns whether the rename happened. A failure is logged and swallowed,
+/// which really does cost nothing but a repeated error on the next flush: the
+/// caller records the segment as unreadable either way, so it stays out of the
+/// consumed set and the commit never claims it is durable.
 fn quarantine_segment(data_dir: &Path, id: u64) -> bool {
     let from = segment_path(data_dir, id);
     let to = from.with_extension(CORRUPT_EXT);
@@ -918,6 +992,35 @@ mod tests {
         let aside = segment_path(dir.path(), 2).with_extension(CORRUPT_EXT);
         assert!(!segment_path(dir.path(), 2).exists());
         assert_eq!(fs::read(&aside).unwrap(), bad, "every byte survives");
+    }
+
+    /// Quarantining is best-effort; staying out of the consumed set is not.
+    /// Gating that on the rename meant a segment that could not be moved was
+    /// declared durable and unlinked.
+    #[test]
+    fn a_segment_that_cannot_be_quarantined_is_still_not_deleted() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cfg, mut m) = trades();
+        write_segment(dir.path(), 1, &[rec(T13, "a")]);
+        let mut bad = write_segment(dir.path(), 2, &[rec(T13 + 1, "b")]);
+        bad[0] ^= 0xff;
+        fs::write(segment_path(dir.path(), 2), &bad).unwrap();
+
+        // Block the rename: `wal.corrupt` is a directory, so rename(2) fails
+        // whatever the platform spells the error.
+        let blocked = segment_path(dir.path(), 2).with_extension(CORRUPT_EXT);
+        fs::create_dir_all(&blocked).unwrap();
+        fs::write(blocked.join("occupied"), b"x").unwrap();
+
+        let out = run(dir.path(), &cfg, &mut m, &[1, 2]).unwrap();
+
+        assert_eq!(out.segments_consumed, vec![1], "2 was never consumed");
+        assert_eq!(m.last_flushed_segment, 1, "and the watermark stops short");
+        assert!(
+            segment_path(dir.path(), 2).exists(),
+            "the segment must still be on disk, in full"
+        );
+        assert_eq!(fs::read(segment_path(dir.path(), 2)).unwrap(), bad);
     }
 
     /// Frames larger than the *current* `limits.max_record_bytes` used to stop a
@@ -1323,6 +1426,76 @@ mod tests {
         );
         // A series with no rows in this flush is not touched, and gets no view.
         assert!(!series_dir(dir.path(), "quotes").join(VIEW_FILE).exists());
+    }
+
+    /// Without a manifest there is no watermark, and `sweep_uncommitted` reads
+    /// the resulting 0 as "every file here is uncommitted".
+    #[test]
+    fn flush_output_without_a_manifest_refuses_rather_than_being_swept() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cfg, mut m) = trades();
+        write_segment(dir.path(), 1, &[rec(T13, "a")]);
+        run(dir.path(), &cfg, &mut m, &[1]).unwrap();
+        let committed = parquet_files(dir.path());
+        assert_eq!(committed.len(), 1);
+
+        // A fresh directory is the case that must still pass.
+        let fresh = tempfile::tempdir().unwrap();
+        assert!(require_manifest_for_output(fresh.path()).is_ok());
+
+        let err = require_manifest_for_output(dir.path())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("manifest.json"), "{err}");
+        assert!(err.contains("Refusing to start"), "{err}");
+        assert!(committed[0].exists(), "and nothing was touched");
+
+        // A directory holding only files the engine did not write is not its
+        // business either way.
+        let stranger = tempfile::tempdir().unwrap();
+        let hour = series_dir(stranger.path(), "trades").join("hour=2026-08-08T13");
+        fs::create_dir_all(&hour).unwrap();
+        fs::write(hour.join("notes.txt"), b"mine").unwrap();
+        assert!(require_manifest_for_output(stranger.path()).is_ok());
+    }
+
+    /// An `hour=` directory left behind by the sweep reads as a partition with
+    /// no data. Only one that the sweep actually emptied is removed.
+    #[test]
+    fn the_sweep_removes_a_partition_it_emptied_but_not_one_it_did_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cfg, mut m) = trades();
+        write_segment(dir.path(), 1, &[rec(T13, "a")]);
+        run(dir.path(), &cfg, &mut m, &[1]).unwrap();
+
+        let hour = parquet_files(dir.path())[0].parent().unwrap().to_path_buf();
+        let orphan = hour.join(output_file_name(1, 9_999, 0));
+        fs::copy(&parquet_files(dir.path())[0], &orphan).unwrap();
+
+        // A second partition whose orphan sits next to a file of the operator's.
+        let other = series_dir(dir.path(), "trades").join("hour=2026-08-08T14");
+        fs::create_dir_all(&other).unwrap();
+        fs::copy(
+            &parquet_files(dir.path())[0],
+            other.join(output_file_name(1, 9_999, 0)),
+        )
+        .unwrap();
+        fs::write(other.join("notes.txt"), b"mine").unwrap();
+
+        sweep_uncommitted(dir.path(), m.last_flushed_segment).unwrap();
+
+        assert!(!orphan.exists());
+        assert!(hour.is_dir(), "a partition with a committed file stays");
+        assert!(other.is_dir(), "and so does one with anything else in it");
+        assert!(other.join("notes.txt").exists());
+
+        // Now empty the first partition entirely: with nothing left, it goes.
+        let solo = tempfile::tempdir().unwrap();
+        let hour = series_dir(solo.path(), "trades").join("hour=2026-08-08T13");
+        fs::create_dir_all(&hour).unwrap();
+        fs::write(hour.join(output_file_name(1, 9_999, 0)), b"x").unwrap();
+        sweep_uncommitted(solo.path(), 0).unwrap();
+        assert!(!hour.exists(), "an emptied partition is removed");
     }
 
     /// Recompute a frame's CRC after forging its bytes, so a test can build a

@@ -328,7 +328,11 @@ impl Encoder {
 /// Strictly increasing rather than merely sorted, because equal names still need
 /// collapsing. Strictly increasing names imply sorted `(name, value)` pairs, so
 /// this is the full canonical-form check and not just half of it.
-fn is_canonical(extra: &[(&str, &str)]) -> bool {
+///
+/// Shared with [`crate::flush::parquet::RowBuilder`], which has to collapse
+/// duplicates a second time for frames this encoder never saw. One definition of
+/// "canonical", so the two cannot come to disagree about what needs fixing.
+pub(crate) fn is_canonical(extra: &[(&str, &str)]) -> bool {
     extra.windows(2).all(|w| w[0].0 < w[1].0)
 }
 

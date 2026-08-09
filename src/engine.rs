@@ -43,6 +43,34 @@ thread_local! {
         std::cell::RefCell::new((Vec::new(), Encoder::default()));
 }
 
+/// A lower bound on a row's encoded size, from the fields that can be
+/// arbitrarily large: `data` and a `Value::Str` key both carry `u32` lengths.
+///
+/// Keeps a pathological record out of [`SCRATCH`], which is only ever
+/// `clear()`ed — so a rejected 500 MiB record would otherwise pin 500 MiB on
+/// this thread for the life of the process. The post-encode check is what
+/// enforces the limit exactly; this only has to catch the ruinous cases.
+///
+/// `extra` is left out: `u16` lengths, and walking it here would duplicate a
+/// pass the encoder is about to make on the hot path.
+fn oversize(row: &Row<'_>, limit: usize) -> Option<usize> {
+    let mut n = row.id.len().saturating_add(row.data.len());
+    for v in row.keys {
+        if let crate::record::Value::Str(s) = v {
+            n = n.saturating_add(s.len());
+        }
+    }
+    (n > limit).then_some(n)
+}
+
+/// Hand back a rejected record's capacity instead of holding it forever.
+/// `limit` rather than 0, because the steady-state path wants the high-water
+/// mark of a legitimate record.
+fn shrink_scratch(buf: &mut Vec<u8>, limit: usize) {
+    buf.clear();
+    buf.shrink_to(limit);
+}
+
 /// Counters an operator needs to see a problem coming.
 #[derive(Debug, Default)]
 struct Counters {
@@ -64,12 +92,18 @@ pub struct Stats {
     pub rejected_size: u64,
     pub rejected_series: u64,
     pub rejected_frames: u64,
-    /// Consecutive failed flushes. Rising while `wal_bytes` grows is the shape
-    /// of a stalled flush, which is the failure worth alerting on.
+    /// Consecutive failed flushes. Rising while `wal_total_bytes` grows is the
+    /// shape of a stalled flush, which is the failure worth alerting on.
     pub flush_failures: u64,
     pub rows_flushed: u64,
     pub rows_deduplicated: u64,
+    /// Bytes in the *active* segment: a sawtooth that resets on every roll, so
+    /// it says whether the writer is moving and nothing about the backlog.
     pub wal_bytes: u64,
+    /// Every byte of WAL on disk. The gauge a stalled flush shows up in —
+    /// `wal_bytes` cannot serve, because a stall keeps rolling segments and
+    /// leaves the active one small while the directory grows without bound.
+    pub wal_total_bytes: u64,
     pub segment: u64,
 }
 
@@ -144,6 +178,14 @@ impl Engine {
         let data_dir = PathBuf::from(&config.data_dir);
 
         let lock = DirLock::acquire(&data_dir, force_unlock)?;
+
+        // A missing manifest reads as `last_flushed_segment: 0`, under which
+        // every Parquet file here looks uncommitted and the sweep below deletes
+        // the lot. The watermark cannot be recovered from the filenames, so stop
+        // rather than guess.
+        if !Manifest::exists(&data_dir) {
+            planner::require_manifest_for_output(&data_dir)?;
+        }
 
         let mut manifest = Manifest::load(&data_dir)?;
         // Commit *before* the writer opens a segment, not at the next flush.
@@ -411,16 +453,19 @@ impl Inner {
     pub fn append(&self, handle: &SeriesHandle, row: &Row<'_>) -> Result<()> {
         self.check_row(handle, row)?;
         let limit = self.config.limits.max_record_bytes;
+        if let Some(size) = oversize(row, limit) {
+            self.counters.rejected_size.fetch_add(1, Ordering::Relaxed);
+            return Err(Error::RecordTooLarge { size, limit });
+        }
         SCRATCH.with(|cell| {
             let (buf, enc) = &mut *cell.borrow_mut();
             buf.clear();
             enc.encode(buf, handle.name(), handle.epoch(), row)?;
             if buf.len() > limit {
                 self.counters.rejected_size.fetch_add(1, Ordering::Relaxed);
-                return Err(Error::RecordTooLarge {
-                    size: buf.len(),
-                    limit,
-                });
+                let size = buf.len();
+                shrink_scratch(buf, limit);
+                return Err(Error::RecordTooLarge { size, limit });
             }
             self.wal.append(buf)
         })?;
@@ -430,10 +475,14 @@ impl Inner {
 
     /// Append many records under a single WAL lock acquisition.
     pub fn append_batch(&self, handle: &SeriesHandle, rows: &[Row<'_>]) -> Result<()> {
+        let limit = self.config.limits.max_record_bytes;
         for row in rows {
             self.check_row(handle, row)?;
+            if let Some(size) = oversize(row, limit) {
+                self.counters.rejected_size.fetch_add(1, Ordering::Relaxed);
+                return Err(Error::RecordTooLarge { size, limit });
+            }
         }
-        let limit = self.config.limits.max_record_bytes;
         SCRATCH.with(|cell| {
             let (buf, enc) = &mut *cell.borrow_mut();
             buf.clear();
@@ -442,10 +491,9 @@ impl Inner {
                 enc.encode(buf, handle.name(), handle.epoch(), row)?;
                 if buf.len() - start > limit {
                     self.counters.rejected_size.fetch_add(1, Ordering::Relaxed);
-                    return Err(Error::RecordTooLarge {
-                        size: buf.len() - start,
-                        limit,
-                    });
+                    let size = buf.len() - start;
+                    shrink_scratch(buf, limit);
+                    return Err(Error::RecordTooLarge { size, limit });
                 }
             }
             self.wal.append_batch(buf)
@@ -587,6 +635,17 @@ impl Inner {
     pub fn stats(&self) -> Stats {
         let w = self.wal.stats();
         let c = &self.counters;
+        // A listing plus a stat per segment: fine at the rate `stats` is
+        // scraped, and the writer only knows the segment it holds open. On
+        // failure fall back to that lower bound -- reporting 0 would read as
+        // "the backlog drained", the one wrong direction for a stall gauge.
+        let wal_total_bytes = match crate::wal::total_bytes(&self.data_dir) {
+            Ok(n) => n,
+            Err(e) => {
+                tracing::warn!(error = %e, "could not measure total wal bytes");
+                w.segment_bytes
+            }
+        };
         Stats {
             appended: c.appended.load(Ordering::Relaxed),
             rejected_ts: c.rejected_ts.load(Ordering::Relaxed),
@@ -597,6 +656,7 @@ impl Inner {
             rows_flushed: c.rows_flushed.load(Ordering::Relaxed),
             rows_deduplicated: c.rows_deduplicated.load(Ordering::Relaxed),
             wal_bytes: w.segment_bytes,
+            wal_total_bytes,
             segment: w.segment,
         }
     }
@@ -679,5 +739,117 @@ impl Engine {
     /// Human-readable accept window, for diagnostics.
     pub fn accept_window(&self) -> (String, Option<String>) {
         self.inner.accept_window()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{Config, SeriesConfig};
+
+    /// 2026-08-08T13:00:00Z.
+    const T13: u64 = 1_786_194_000_000_000;
+
+    fn engine(dir: &Path) -> Engine {
+        let config = Config {
+            data_dir: dir.to_path_buf(),
+            series: vec![SeriesConfig {
+                name: "trades".into(),
+                keys: vec![],
+            }],
+            ..Config::default()
+        };
+        Engine::open(config).unwrap()
+    }
+
+    fn row<'a>(ts: u64, data: &'a str) -> Row<'a> {
+        Row {
+            ts,
+            id: "",
+            keys: &[],
+            extra: &[],
+            data,
+        }
+    }
+
+    /// The scratch is thread-local and only ever cleared, so a rejected record
+    /// that got as far as being encoded used to pin its whole size on this
+    /// thread for the life of the process.
+    #[test]
+    fn an_oversized_record_does_not_pin_the_encode_scratch() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = engine(dir.path());
+        let trades = e.series("trades").unwrap();
+        let limit = Config::default().limits.max_record_bytes;
+
+        e.append(&trades, &row(T13, "small")).unwrap();
+        let huge = "x".repeat(64 * 1024 * 1024);
+        assert!(matches!(
+            e.append(&trades, &row(T13 + 1, &huge)),
+            Err(Error::RecordTooLarge { .. })
+        ));
+
+        SCRATCH.with(|cell| {
+            assert!(
+                cell.borrow().0.capacity() <= limit,
+                "the scratch kept {} bytes for a record that was refused",
+                cell.borrow().0.capacity()
+            );
+        });
+
+        // ...and the engine still works afterwards.
+        e.append(&trades, &row(T13 + 2, "after")).unwrap();
+        assert_eq!(e.stats().appended, 2);
+        assert_eq!(e.stats().rejected_size, 1);
+    }
+
+    /// `wal_bytes` is the active segment, which a stall keeps rolling past, so
+    /// it never shows the backlog operators are told to alert on.
+    #[test]
+    fn stats_report_the_whole_wal_not_just_the_active_segment() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config {
+            data_dir: dir.path().to_path_buf(),
+            wal: crate::config::WalConfig {
+                segment_max_bytes: 2048,
+                fsync_interval_ms: 1,
+                ..Config::default().wal
+            },
+            series: vec![SeriesConfig {
+                name: "trades".into(),
+                keys: vec![],
+            }],
+            ..Config::default()
+        };
+        let e = Engine::open(config).unwrap();
+        let trades = e.series("trades").unwrap();
+
+        let payload = "x".repeat(200);
+        for i in 0..400u64 {
+            e.append(&trades, &row(T13 + i, &payload)).unwrap();
+            // The committer, not the appender, is what rolls a full segment.
+            std::thread::sleep(Duration::from_millis(1));
+        }
+
+        // Measured before the snapshot, not after: the committer is still
+        // writing, and the log only grows here, so this is the one ordering that
+        // is not a race.
+        let real = crate::wal::total_bytes(dir.path()).unwrap();
+        let s = e.stats();
+        assert!(
+            s.segment > crate::wal::FIRST_SEGMENT,
+            "the test needs rolls"
+        );
+        assert!(
+            s.wal_total_bytes >= real,
+            "reported {} against {real} already on disk",
+            s.wal_total_bytes
+        );
+        assert!(
+            s.wal_bytes < s.wal_total_bytes,
+            "the active segment alone ({}) cannot be the whole log ({})",
+            s.wal_bytes,
+            s.wal_total_bytes
+        );
     }
 }

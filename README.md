@@ -149,7 +149,7 @@ A few constraints are worth knowing before you hit them, all checked at load:
 - **`flush.interval_ms: 0` disables the timer**, leaving flushing entirely to explicit `Engine::flush()` calls and the control socket. Any other value spawns a background thread that flushes on that period. The WAL is not capped, so turning the timer off means owning the schedule yourself.
 - **A declared key may not be named `ts`, `id`, `extra` or `data`.** Every Parquet file already has those columns, and Parquet does not object to a duplicate field name — the resulting file reads back wrong rather than failing.
 - **`limits.ts_min` must be 1970 or later.** Timestamps are unsigned, so there is nothing before the epoch to represent.
-- **`server.max_batch_bytes` caps one ingest message.** `limits.max_record_bytes` bounds a single record; without this, nothing bounds the batch carrying them.
+- **`server.max_batch_bytes` caps one ingest message**, and must be at least `limits.max_record_bytes`. libzmq discards an oversized message below the application, where neither side can log it, so the client learns this value in the handshake and splits its batches to fit — and refuses, loudly, a record too large to ever be delivered.
 
 **Endpoints default to loopback deliberately.** There is no authentication on the ingest socket — anything that can reach it can write records and consume disk. Before binding a real interface, put it on a private network or enable libzmq's built-in CURVE encryption and authentication.
 
@@ -166,7 +166,9 @@ A **format-version mismatch refuses to start** rather than quarantining: the WAL
 
 Startup also sweeps two kinds of debris from a flush that wrote files and then died before committing — staged files in `tmp/`, and Parquet in `series/` whose segment range runs past the manifest's watermark. Both are rows the next flush writes again, so leaving them would double-count.
 
-`stats` carries the counters worth alerting on. `flush_failures` rising while `wal_bytes` grows is a stalled flush — the WAL is uncapped by design, so this costs disk rather than availability, which is exactly why it needs watching.
+A **missing `manifest.json` refuses to start**, naming the directory. It is the only record of how far the flush got; without it every Parquet file in `series/` is indistinguishable from debris left by a flush that never committed, and there is nothing to recover the watermark from. Restore it from a backup, or move `series/` aside to start fresh.
+
+`stats` carries the counters worth alerting on. `flush_failures` rising while `wal_total_bytes` grows is a stalled flush — the WAL is uncapped by design, so this costs disk rather than availability, which is exactly why it needs watching. Alert on `wal_total_bytes`, not `wal_bytes`: the latter is the active segment alone, and a stalled flush keeps rolling past it.
 
 ## Known limits
 

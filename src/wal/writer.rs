@@ -42,6 +42,13 @@
 //! default, rare enough to sit well outside p99. It is only visible with a small
 //! `segment_max_bytes`, which is a test configuration rather than a real one.
 //!
+//! **A roll is also the only way out of a torn write.** If `write_all` fails
+//! part-way the segment ends mid-frame, and anything appended after it would
+//! bury that fragment where the flush's scan stops at it and abandons every
+//! record behind. So appends are refused until the segment is sealed — but only
+//! until: the committer retries the roll every tick, so a disk that fills and
+//! drains recovers without a restart.
+//!
 //! # The WAL is deliberately not size-capped
 //!
 //! Ingest never refuses a record because of accumulated WAL. If the flush
@@ -162,11 +169,17 @@ struct Shared {
 
 #[derive(Debug)]
 struct State {
-    /// `None` once closed, or if a segment could not be replaced after an I/O
-    /// failure. Appending to a writer in that state is an error, never silent.
+    /// `None` once closed. Appending to a writer in that state is an error,
+    /// never silent.
     open: Option<Active>,
     stop: bool,
     appended: u64,
+    /// Set when a partial write left a torn frame and the roll that would seal
+    /// it failed. Appends are refused while it is set — the damage has to stay
+    /// confined to a tail nobody writes to again — and the committer clears it
+    /// on the first roll that succeeds. Closing the writer instead, which is
+    /// what used to happen, needed a restart to undo.
+    needs_roll: bool,
 }
 
 #[derive(Debug)]
@@ -201,6 +214,13 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 
 fn closed() -> Error {
     Error::Io(std::io::Error::other("the wal writer is closed"))
+}
+
+fn torn() -> Error {
+    Error::Io(std::io::Error::other(
+        "the active wal segment holds a torn frame and could not be sealed; \
+         appends are refused until the committer rolls to a new segment",
+    ))
 }
 
 fn now_us() -> i64 {
@@ -243,6 +263,7 @@ impl WalWriter {
                 open: None,
                 stop: false,
                 appended: 0,
+                needs_roll: false,
             }),
             wake: Condvar::new(),
             fsyncs: AtomicU64::new(0),
@@ -290,6 +311,11 @@ impl WalWriter {
             // Reborrowed once, so `state.open` and `state.appended` are two
             // disjoint fields rather than two borrows of the guard.
             let state = &mut *guard;
+            if state.needs_roll {
+                // Appending past the torn frame would bury it mid-file, where
+                // the flush's scan stops and abandons every record after it.
+                return Err(torn());
+            }
             let Some(active) = state.open.as_mut() else {
                 return Err(closed());
             };
@@ -311,9 +337,18 @@ impl WalWriter {
                     // of a segment nobody will write to again, which is the
                     // exact shape the format is built to survive.
                     tracing::error!(error = %e, "wal append failed; sealing the segment to confine the torn frame");
-                    if let Err(roll) = self.shared.roll(state) {
-                        tracing::error!(error = %roll, "could not open a replacement segment; the wal is now closed");
-                        state.open = None;
+                    // Set before the attempt, cleared only on success.
+                    state.needs_roll = true;
+                    match self.shared.roll(state) {
+                        Ok(_) => state.needs_roll = false,
+                        // Deliberately not `state.open = None`: the usual cause
+                        // is the disk that just failed the write, and it may
+                        // clear. The committer retries every tick, where closing
+                        // the writer made a transient ENOSPC cost a restart.
+                        Err(roll) => tracing::error!(
+                            error = %roll,
+                            "could not seal the torn segment; appends are refused until the committer can"
+                        ),
                     }
                     return Err(e.into());
                 }
@@ -344,7 +379,9 @@ impl WalWriter {
         if active.bytes == SEGMENT_HEADER_BYTES as u64 {
             return Ok(None);
         }
-        let id = self.shared.roll(state)?;
+        // `roll_now`, so a seal that lands while a roll is owed resolves it
+        // rather than leaving ingest refused behind a flag whose reason is gone.
+        let id = roll_now(&self.shared, state)?;
         tracing::debug!(segment = id, "sealed wal segment");
         Ok(Some(id))
     }
@@ -400,6 +437,16 @@ impl WalWriter {
     /// The segment being appended to right now.
     pub fn segment(&self) -> u64 {
         lock(&self.shared.state).open.as_ref().map_or(0, |a| a.id)
+    }
+
+    /// Put the writer into the state a partial `write(2)` leaves behind.
+    ///
+    /// A real torn write needs the disk to fail mid-frame, which no safe-Rust
+    /// test can arrange. The detection is one `match` arm; what is worth pinning
+    /// is the recovery.
+    #[cfg(test)]
+    pub(crate) fn force_needs_roll(&self) {
+        lock(&self.shared.state).needs_roll = true;
     }
 }
 
@@ -501,6 +548,14 @@ impl Shared {
     }
 }
 
+/// Roll, and clear the "a roll is owed" flag if it worked. Pairing them keeps a
+/// caller from clearing it on a roll that failed.
+fn roll_now(shared: &Shared, state: &mut State) -> Result<u64> {
+    let id = shared.roll(state)?;
+    state.needs_roll = false;
+    Ok(id)
+}
+
 /// The committer thread: group-commit, segment rolling, and the lock heartbeat.
 fn committer(shared: Arc<Shared>) {
     let interval = Duration::from_millis(shared.cfg.fsync_interval_ms.max(1));
@@ -599,13 +654,18 @@ fn committer(shared: Arc<Shared>) {
                 .open
                 .as_ref()
                 .is_some_and(|a| a.bytes >= shared.cfg.segment_max_bytes);
-            if full && let Err(e) = shared.roll(&mut state) {
+            // `needs_roll`: an append tore a frame and could not seal the
+            // segment itself, so ingest is refused until this succeeds.
+            if (full || state.needs_roll)
+                && let Err(e) = roll_now(&shared, &mut state)
+            {
                 tracing::error!(error = %e, "rolling to a new wal segment failed; still writing to the old one");
                 drop(state);
-                // The segment is over its limit, so the wait predicate will not
-                // park us: without this the retry would spin a core for as long
-                // as the disk stays full. Ingest keeps working throughout -- an
-                // oversized segment costs startup scan time, not correctness.
+                // The segment is over its limit (or torn), so the wait predicate
+                // will not park us: without this the retry would spin a core for
+                // as long as the disk stays full. For the `full` case ingest
+                // keeps working throughout -- an oversized segment costs startup
+                // scan time, not correctness.
                 std::thread::sleep(tick);
             }
         }
@@ -963,6 +1023,50 @@ mod tests {
             list_segments(dir.path()).unwrap().len() > 1,
             "the test is only meaningful if the committer rolled"
         );
+    }
+
+    /// The refusal used to be permanent: the writer closed itself, so a full
+    /// disk that drained still needed a restart. What matters is the recovery.
+    #[test]
+    fn a_torn_segment_refuses_appends_and_the_committer_recovers_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let w = WalWriter::open(opts(dir.path(), cfg(2, 1 << 30, 1 << 30))).unwrap();
+        w.append(&frame("before")).unwrap();
+        let torn_segment = w.segment();
+
+        w.force_needs_roll();
+        assert!(
+            w.append(&frame("during")).is_err(),
+            "nothing may go in behind the torn frame"
+        );
+
+        eventually("the committer to seal the torn segment", || {
+            w.segment() > torn_segment
+        });
+        w.append(&frame("after")).unwrap();
+        w.close().unwrap();
+
+        // The torn segment is sealed intact and the new one holds what came
+        // next -- no record was lost and none was written past the tear.
+        assert_eq!(read_back(dir.path()), ["before", "after"]);
+        assert_eq!(list_segments(dir.path()).unwrap().len(), 2);
+    }
+
+    /// `seal` is the other way out: a flush that lands while a roll is owed
+    /// resolves it, rather than leaving ingest refused behind a stale flag.
+    #[test]
+    fn sealing_also_clears_a_pending_roll() {
+        let dir = tempfile::tempdir().unwrap();
+        let w = WalWriter::open(opts(dir.path(), cfg(60_000, 1 << 30, 1 << 30))).unwrap();
+        w.append(&frame("a")).unwrap();
+
+        w.force_needs_roll();
+        assert!(w.append(&frame("blocked")).is_err());
+
+        assert_eq!(w.seal().unwrap(), Some(FIRST_SEGMENT));
+        w.append(&frame("b")).unwrap();
+        w.close().unwrap();
+        assert_eq!(read_back(dir.path()), ["a", "b"]);
     }
 
     #[test]

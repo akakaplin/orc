@@ -82,6 +82,7 @@ pub struct ClientBuilder {
     linger_ms: i32,
     on_full: OnFull,
     control_timeout_ms: i32,
+    max_batch_bytes: usize,
 }
 
 impl Default for ClientBuilder {
@@ -91,6 +92,8 @@ impl Default for ClientBuilder {
             control: None,
             batch: 1024,
             sndhwm: 100_000,
+            // A fallback: the handshake replaces it with the server's own.
+            max_batch_bytes: crate::config::DEFAULT_MAX_BATCH_BYTES as usize,
             // Non-zero so a clean exit flushes rather than discarding whatever
             // libzmq still holds. Zero here is a classic silent-loss bug.
             linger_ms: 2_000,
@@ -140,6 +143,16 @@ impl ClientBuilder {
         self
     }
 
+    /// Largest message this client will put on the wire, in bytes.
+    ///
+    /// Rarely worth setting: the handshake learns the server's
+    /// `server.max_batch_bytes` and the client takes the smaller of the two, so
+    /// setting this higher cannot raise the limit the server enforces.
+    pub fn max_batch_bytes(mut self, bytes: usize) -> Self {
+        self.max_batch_bytes = bytes.max(codec::BATCH_HEADER_BYTES + 1);
+        self
+    }
+
     /// Connect both sockets and perform the schema handshake.
     pub fn connect(self) -> Result<Client> {
         let ctx = zmq::Context::new();
@@ -182,6 +195,8 @@ impl ClientBuilder {
             stats: ClientStats::default(),
             encoder: Encoder::default(),
             control_timeout_ms: self.control_timeout_ms,
+            max_batch_bytes: self.max_batch_bytes,
+            configured_max_batch_bytes: self.max_batch_bytes,
         };
         client.refresh_schema()?;
         Ok(client)
@@ -234,6 +249,11 @@ pub struct Client {
     encoder: Encoder,
     /// Kept so `control` can restore it after raising it for a `Flush`.
     control_timeout_ms: i32,
+    /// The cap actually in force: `min(configured, whatever the server said)`.
+    max_batch_bytes: usize,
+    /// What the builder was given, so a re-handshake recomputes the minimum from
+    /// the caller's intent rather than from an already-lowered value.
+    configured_max_batch_bytes: usize,
 }
 
 impl std::fmt::Debug for Client {
@@ -257,13 +277,24 @@ impl Client {
     /// without the declared order the client cannot build a frame at all.
     pub fn refresh_schema(&mut self) -> Result<()> {
         match self.control(ControlRequest::Schema)? {
-            ControlResponse::Schema { series } => {
+            ControlResponse::Schema {
+                series,
+                max_batch_bytes,
+            } => {
                 self.schema = series
                     .into_iter()
                     .map(|SeriesSchema { name, epoch, keys }| {
                         (name.clone(), RemoteSeries { name, epoch, keys })
                     })
                     .collect();
+                // The smaller of the two: the server's is the one libzmq
+                // enforces, and a server too old to report one leaves ours.
+                self.max_batch_bytes = match max_batch_bytes {
+                    Some(server) => self
+                        .configured_max_batch_bytes
+                        .min(usize::try_from(server).unwrap_or(usize::MAX)),
+                    None => self.configured_max_batch_bytes,
+                };
                 Ok(())
             }
             ControlResponse::Error { message } => Err(Error::Config(message)),
@@ -316,15 +347,50 @@ impl Client {
         self.schema.keys().map(String::as_str)
     }
 
-    /// Buffer one record, sending the batch once it is full.
+    /// Buffer one record, sending the batch once it is full — by record count or
+    /// by size, whichever comes first.
+    ///
+    /// The size bound is not a tuning knob. libzmq discards a message over the
+    /// receiver's `ZMQ_MAXMSGSIZE` *below* the application, so the server cannot
+    /// count, log or reject it and `send` still reports success — the records
+    /// just vanish. Batching by record count alone reached that with 1024
+    /// records of 8 KiB against the 8 MiB default.
+    ///
+    /// A record too large for a batch of its own is [`Error::BatchTooLarge`]:
+    /// no split will ever deliver it. A record that merely does not fit
+    /// alongside what is buffered sends those first and starts a new batch.
     pub fn send(&mut self, series: &RemoteSeries, row: &Row<'_>) -> Result<()> {
+        let before = self.buf.len();
         self.encoder
             .encode(&mut self.buf, &series.name, series.epoch, row)?;
+        let frame = self.buf.len() - before;
+
+        if codec::BATCH_HEADER_BYTES + frame > self.max_batch_bytes {
+            // `encode` restores the buffer on its own errors; this one is ours.
+            self.buf.truncate(before);
+            return Err(Error::BatchTooLarge {
+                size: codec::BATCH_HEADER_BYTES + frame,
+                limit: self.max_batch_bytes,
+            });
+        }
+        if before > 0 && codec::BATCH_HEADER_BYTES + self.buf.len() > self.max_batch_bytes {
+            // Lift this frame out, send what it would have overflowed, put it
+            // back as the first record of the next batch.
+            let frame = self.buf.split_off(before);
+            self.flush()?;
+            self.buf.extend_from_slice(&frame);
+        }
+
         self.pending += 1;
         if self.pending >= self.batch {
             self.flush()?;
         }
         Ok(())
+    }
+
+    /// The largest message this client will send, in bytes.
+    pub fn max_batch_bytes(&self) -> usize {
+        self.max_batch_bytes
     }
 
     /// Send whatever is buffered now.
@@ -333,6 +399,15 @@ impl Client {
     pub fn flush(&mut self) -> Result<()> {
         if self.pending == 0 {
             return Ok(());
+        }
+        // Unreachable via `send`, but this is the one place bytes reach the
+        // socket, and an oversized message here is lost with no diagnostic.
+        let size = codec::BATCH_HEADER_BYTES + self.buf.len();
+        if size > self.max_batch_bytes {
+            return Err(Error::BatchTooLarge {
+                size,
+                limit: self.max_batch_bytes,
+            });
         }
         let mut msg = Vec::with_capacity(codec::BATCH_HEADER_BYTES + self.buf.len());
         codec::encode_batch_header(&mut msg, self.pending as u32);

@@ -49,13 +49,30 @@ pub enum ControlRequest {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "kebab-case")]
 pub enum ControlResponse {
-    Pong { version: String },
+    Pong {
+        version: String,
+    },
     Stats(Box<StatsPayload>),
     Flushed(FlushPayload),
-    Schema { series: Vec<SeriesSchema> },
-    Reloaded { changed: Vec<String> },
+    Schema {
+        series: Vec<SeriesSchema>,
+        /// The server's `server.max_batch_bytes`, so a client can bound its
+        /// batches by the limit that is actually enforced.
+        ///
+        /// libzmq drops an oversized message *below* the application: neither
+        /// side can log it, so a client guessing this wrong loses records
+        /// silently. `Option` so a client can still talk to a server that
+        /// predates the field.
+        #[serde(default)]
+        max_batch_bytes: Option<u64>,
+    },
+    Reloaded {
+        changed: Vec<String>,
+    },
     ShuttingDown,
-    Error { message: String },
+    Error {
+        message: String,
+    },
 }
 
 /// One series as the client needs to see it.
@@ -69,7 +86,11 @@ pub struct SeriesSchema {
 }
 
 /// Counters, mirroring `Engine::stats`.
+///
+/// `#[serde(default)]` so a counter added later reads as 0 from an older
+/// server's reply rather than failing the parse.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct StatsPayload {
     pub appended: u64,
     pub rejected_ts: u64,
@@ -79,7 +100,12 @@ pub struct StatsPayload {
     pub flush_failures: u64,
     pub rows_flushed: u64,
     pub rows_deduplicated: u64,
+    /// Bytes in the *active* segment only: a sawtooth that resets on every roll.
     pub wal_bytes: u64,
+    /// Every byte of WAL on disk. This is the one to alert on — the log is
+    /// uncapped, so a stalled flush shows up here as steady growth long before
+    /// the volume fills.
+    pub wal_total_bytes: u64,
     pub segment: u64,
     /// Batches received on the ingest socket. Compared against a client's own
     /// send count, this is the only way to observe fire-and-forget loss.
@@ -162,9 +188,33 @@ mod tests {
                     nullable: false,
                 }],
             }],
+            max_batch_bytes: Some(8_388_608),
         };
         let bytes = reply.to_bytes().unwrap();
         assert_eq!(ControlResponse::from_bytes(&bytes).unwrap(), reply);
+    }
+
+    /// Both fields were added after the first release, so upgrading the client
+    /// before the server must not brick the handshake.
+    #[test]
+    fn a_reply_without_the_newer_fields_still_parses() {
+        let schema = ControlResponse::from_bytes(br#"{"status":"schema","series":[]}"#).unwrap();
+        assert_eq!(
+            schema,
+            ControlResponse::Schema {
+                series: vec![],
+                max_batch_bytes: None
+            }
+        );
+
+        let stats = ControlResponse::from_bytes(br#"{"status":"stats","appended":5}"#).unwrap();
+        match stats {
+            ControlResponse::Stats(s) => {
+                assert_eq!(s.appended, 5);
+                assert_eq!(s.wal_total_bytes, 0, "absent reads as zero, not an error");
+            }
+            other => panic!("expected stats, got {other:?}"),
+        }
     }
 
     #[test]

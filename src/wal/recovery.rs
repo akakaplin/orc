@@ -267,7 +267,16 @@ pub fn recover(data_dir: impl AsRef<Path>, last_flushed_segment: u64) -> Result<
     // deletion leaves behind.
     let flushed = ids.partition_point(|&id| id <= last_flushed_segment);
     for id in ids.drain(..flushed) {
-        std::fs::remove_file(segment_path(data_dir, id))?;
+        match std::fs::remove_file(segment_path(data_dir, id)) {
+            Ok(()) => {}
+            // Already gone is the outcome being asked for, not a failure. A
+            // crash between the manifest commit and `delete_segments` leaves
+            // exactly this, and the flush path has always tolerated it here --
+            // propagating it meant a file that raced with an external prune
+            // could stop the engine from starting at all.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
         out.deleted.push(id);
     }
     if !out.deleted.is_empty() {

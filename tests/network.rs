@@ -21,11 +21,17 @@ use orc::server::Server;
 const T13: u64 = 1_786_194_000_000_000;
 
 fn config_json(dir: &Path) -> String {
+    config_json_with(dir, 8_388_608, 16_384)
+}
+
+fn config_json_with(dir: &Path, max_batch_bytes: i64, max_record_bytes: usize) -> String {
     format!(
         r#"{{
           "data_dir": {},
           "server": {{ "ingest_endpoint": "tcp://127.0.0.1:*",
-                       "control_endpoint": "tcp://127.0.0.1:*" }},
+                       "control_endpoint": "tcp://127.0.0.1:*",
+                       "max_batch_bytes": {max_batch_bytes} }},
+          "limits": {{ "max_record_bytes": {max_record_bytes} }},
           "flush": {{ "on_startup": false }},
           "wal": {{ "fsync_interval_ms": 1 }},
           "series": [
@@ -47,7 +53,11 @@ struct Harness {
 
 impl Harness {
     fn start(dir: &Path) -> Harness {
-        let config: Config = serde_json::from_str(&config_json(dir)).unwrap();
+        Harness::start_with(&config_json(dir))
+    }
+
+    fn start_with(config_json: &str) -> Harness {
+        let config: Config = serde_json::from_str(config_json).unwrap();
         let engine = Arc::new(Engine::open(config.clone()).unwrap());
         let server = Server::bind(engine, &config).unwrap();
 
@@ -221,6 +231,101 @@ fn an_unparseable_control_request_still_gets_a_reply() {
         ControlResponse::Error { message } => assert!(!message.is_empty()),
         other => panic!("expected an error reply, got {other:?}"),
     }
+
+    h.stop(&client);
+}
+
+/// libzmq refuses a message over the receiver's `ZMQ_MAXMSGSIZE` and drops it
+/// *below* the application: the server never sees it, so it cannot count it, log
+/// it or reject it, and the sender's `send` returns success. Batching purely by
+/// record count made that reachable with nothing exotic, and the records simply
+/// disappeared — the client reported them sent, the server reported none
+/// received, and no log line on either side mentioned it.
+///
+/// So the client bounds itself by bytes, and the two cases are handled
+/// differently: a record too large to ever be delivered is an error, and a
+/// record that merely does not fit alongside what is buffered starts a new
+/// batch.
+#[test]
+fn a_batch_too_large_for_the_server_is_refused_rather_than_lost() {
+    let dir = tempfile::tempdir().unwrap();
+    // 4 KiB batches carrying 1 KiB records: a batch of 200 would be ~47 KiB.
+    let h = Harness::start_with(&config_json_with(dir.path(), 4096, 1024));
+    let mut client = Client::builder()
+        .ingest(&h.ingest)
+        .control(&h.control)
+        .batch(200)
+        .on_full(OnFull::Block)
+        .connect()
+        .unwrap();
+
+    // The cap came from the handshake, not from the client's own default.
+    assert_eq!(
+        client.max_batch_bytes(),
+        4096,
+        "the client must adopt the limit the server actually enforces"
+    );
+
+    let trades = client.series("trades").unwrap();
+    let payload = "x".repeat(200);
+    let row = |ts: u64| Row {
+        ts,
+        id: "",
+        keys: &[Value::Str("AAPL"), Value::Null],
+        extra: &[],
+        data: &payload,
+    };
+
+    // 200 records that would have been one 47 KiB message. Every one of them
+    // must arrive, in whatever number of batches that takes.
+    for i in 0..200u64 {
+        client.send(&trades, &row(T13 + i)).unwrap();
+    }
+    client.flush().unwrap();
+
+    eventually("every record to arrive despite the batch cap", || {
+        appended(&client) == 200
+    });
+    assert_eq!(
+        client.stats().records_dropped,
+        0,
+        "nothing was dropped to get there"
+    );
+    assert!(
+        client.stats().batches_sent > 1,
+        "which means the client split the batch rather than sending one oversized message"
+    );
+    // And every message it sent was actually within the cap.
+    assert!(client.stats().bytes_sent >= 200 * 200);
+
+    // A single record that cannot fit in a batch of its own can never be
+    // delivered, however the batch is split. That is an error, not a split.
+    let huge = "y".repeat(8_000);
+    let err = client
+        .send(
+            &trades,
+            &Row {
+                ts: T13,
+                id: "",
+                keys: &[Value::Str("AAPL"), Value::Null],
+                extra: &[],
+                data: &huge,
+            },
+        )
+        .unwrap_err();
+    assert!(
+        matches!(err, orc::Error::BatchTooLarge { .. }),
+        "expected BatchTooLarge, got {err:?}"
+    );
+    assert!(err.to_string().contains("silently discarded"), "{err}");
+
+    // The refusal must leave the client usable, not wedge its buffer.
+    assert_eq!(client.pending(), 0, "the refused record left no residue");
+    client.send(&trades, &row(T13 + 500)).unwrap();
+    client.flush().unwrap();
+    eventually("the client to keep working after a refusal", || {
+        appended(&client) == 201
+    });
 
     h.stop(&client);
 }

@@ -94,6 +94,19 @@ impl Manifest {
         serde_json::from_str(&text).map_err(|e| Error::Config(format!("{}: {e}", path.display())))
     }
 
+    /// Is there a committed manifest in this directory?
+    ///
+    /// [`Manifest::load`] cannot answer this — a fresh directory and one whose
+    /// manifest went missing both come back as [`Manifest::default`] — and the
+    /// two call for opposite responses. The second has lost the only record of
+    /// how far the flush got, and
+    /// [`sweep_uncommitted`](crate::flush::planner::sweep_uncommitted) would read
+    /// the resulting `last_flushed_segment: 0` as "every Parquet file here is
+    /// uncommitted".
+    pub fn exists(data_dir: impl AsRef<Path>) -> bool {
+        data_dir.as_ref().join(MANIFEST_FILE).is_file()
+    }
+
     /// Atomically replace `<data_dir>/manifest.json`.
     ///
     /// **This is the flush commit point, and the order below is the durability
@@ -485,6 +498,22 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(Manifest::load(dir.path()).unwrap(), Manifest::default());
         assert_eq!(Manifest::default().last_flush_at, None);
+    }
+
+    /// `load` cannot distinguish "fresh" from "lost". This is how the caller
+    /// tells them apart.
+    #[test]
+    fn exists_separates_a_fresh_directory_from_a_lost_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!Manifest::exists(dir.path()));
+
+        Manifest::default().commit(dir.path()).unwrap();
+        assert!(Manifest::exists(dir.path()));
+
+        std::fs::remove_file(dir.path().join(MANIFEST_FILE)).unwrap();
+        assert!(!Manifest::exists(dir.path()));
+        // ...while `load` reports the same thing in both cases.
+        assert_eq!(Manifest::load(dir.path()).unwrap(), Manifest::default());
     }
 
     #[test]

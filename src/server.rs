@@ -47,6 +47,9 @@ pub struct Server {
     stop: Arc<AtomicBool>,
     batches: AtomicU64,
     max_record_bytes: usize,
+    /// Reported in the schema handshake, so a client can bound its batches by
+    /// the limit libzmq will actually enforce against it.
+    max_batch_bytes: u64,
 }
 
 impl std::fmt::Debug for Server {
@@ -96,6 +99,7 @@ impl Server {
 
         Ok(Server {
             max_record_bytes: config.limits.max_record_bytes,
+            max_batch_bytes: config.server.max_batch_bytes.max(0) as u64,
             engine,
             ingest,
             control,
@@ -273,6 +277,7 @@ impl Server {
                     rows_flushed: s.rows_flushed,
                     rows_deduplicated: s.rows_deduplicated,
                     wal_bytes: s.wal_bytes,
+                    wal_total_bytes: s.wal_total_bytes,
                     segment: s.segment,
                     batches_received: self.batches.load(Ordering::Relaxed),
                 }))
@@ -288,6 +293,7 @@ impl Server {
             },
             ControlRequest::Schema => ControlResponse::Schema {
                 series: self.schema(),
+                max_batch_bytes: Some(self.max_batch_bytes),
             },
             // Deliberately not implemented rather than silently accepted:
             // adopting a new config means rebuilding the handle table the engine

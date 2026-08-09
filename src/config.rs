@@ -22,6 +22,7 @@ use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
 
+use crate::codec::BATCH_HEADER_BYTES;
 use crate::error::{Error, Result};
 use crate::record::KeyType;
 use crate::time::parse_rfc3339_utc;
@@ -195,13 +196,19 @@ impl Default for ServerConfig {
             ingest_endpoint: "tcp://127.0.0.1:5555".into(),
             control_endpoint: "tcp://127.0.0.1:5556".into(),
             rcv_hwm: 100_000,
-            // Comfortably above any sane batch (the client's default batch is
-            // 1024 records) and far below anything that threatens the flush,
-            // which holds every consumed segment in memory at once.
-            max_batch_bytes: 8_388_608, // 8 MiB
+            max_batch_bytes: DEFAULT_MAX_BATCH_BYTES,
         }
     }
 }
+
+/// Default for [`ServerConfig::max_batch_bytes`], and the client's fallback when
+/// a server does not state its own.
+///
+/// Far below anything that threatens the flush, which holds every consumed
+/// segment in memory at once. Shared with the client because the two have to
+/// agree: libzmq drops an oversized message below the application, so a client
+/// whose idea of the cap is larger loses records with no error on either side.
+pub const DEFAULT_MAX_BATCH_BYTES: i64 = 8_388_608; // 8 MiB
 
 impl Default for LimitsConfig {
     fn default() -> Self {
@@ -321,6 +328,18 @@ impl Config {
             return bad(format!(
                 "server.max_batch_bytes must be greater than 0 (got {})",
                 self.server.max_batch_bytes
+            ));
+        }
+        // A batch that cannot carry one maximum-size record means that record
+        // can never be delivered at all -- and it fails in the worst way, with
+        // libzmq dropping it below the application where neither end sees it.
+        let smallest_useful = self.limits.max_record_bytes as u64 + BATCH_HEADER_BYTES as u64;
+        if (self.server.max_batch_bytes as u64) < smallest_useful {
+            return bad(format!(
+                "server.max_batch_bytes {} cannot hold one limits.max_record_bytes record \
+                 ({} plus a {}-byte batch header): a full-size record would be dropped by \
+                 zeromq before the server saw it, with no error on either side",
+                self.server.max_batch_bytes, self.limits.max_record_bytes, BATCH_HEADER_BYTES
             ));
         }
         if !SUPPORTED_COMPRESSION.contains(&self.flush.compression.as_str()) {
@@ -721,6 +740,13 @@ mod tests {
             (
                 "zero max_batch_bytes",
                 r#"{"server":{"max_batch_bytes":0},"series":[]}"#,
+            ),
+            (
+                // A batch that cannot hold one record: every full-size record
+                // is silently dropped by zeromq before the server sees it.
+                "max_batch_bytes below max_record_bytes",
+                r#"{"server":{"max_batch_bytes":100},
+                    "limits":{"max_record_bytes":16384},"series":[]}"#,
             ),
         ];
         for (what, json) in cases {

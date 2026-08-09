@@ -307,11 +307,16 @@ pub struct Columns {
 #[derive(Debug)]
 pub struct RowBuilder {
     cols: Columns,
+    /// Reusable index scratch for collapsing duplicate `extra` names, on the
+    /// rare row that arrives with any. Indices rather than borrowed pairs, so it
+    /// outlives the rows it sorts.
+    order: Vec<u32>,
 }
 
 impl RowBuilder {
     pub fn new(series: &str, key_defs: &[KeyDef], cap: usize) -> Result<Self> {
         Ok(Self {
+            order: Vec::new(),
             cols: Columns {
                 series: series.to_string(),
                 schema: parquet_schema(key_defs)?,
@@ -352,7 +357,9 @@ impl RowBuilder {
         extra: &[(&str, &str)],
         data: &str,
     ) -> Result<()> {
-        let c = &mut self.cols;
+        // Destructured, so the `extra` scratch below and the columns are two
+        // disjoint borrows rather than two of `self`.
+        let Self { cols: c, order } = self;
         if keys.len() != c.keys.len() {
             return Err(Error::KeyArity {
                 series: c.series.clone(),
@@ -378,20 +385,39 @@ impl RowBuilder {
             column.append(value, &c.series, &c.key_names[i])?;
         }
         // A repeated key makes the MAP malformed, and a reader rejects the whole
-        // file over it rather than the one row. The codec already collapses
-        // duplicates into its canonical order, so this is the backstop for
-        // frames it did not produce -- a hand-rolled client's, arriving through
-        // `append_raw`, which validates only the fixed prefix. Adjacent-only,
-        // because sorted-by-name is the frame layout's contract; a producer that
-        // breaks that has already left the format behind.
+        // *file* over it rather than the one row. The codec collapses duplicates
+        // already, so this is the backstop for frames it never saw -- a
+        // hand-rolled client's, arriving through `append_raw`, which validates
+        // only the fixed prefix and never looks at `extra`.
+        //
+        // Which is why it cannot be the adjacent-only pass it used to be:
+        // sorted-by-name is the layout's contract, but a producer that ignores
+        // the contract is the whole case for a backstop, and
+        // `[("k","1"), ("z","9"), ("k","2")]` walks straight past a
+        // compare-with-previous check. The canonical case still costs one
+        // comparison pass and no allocation.
         let mut kept = 0u32;
-        for (i, (k, v)) in extra.iter().enumerate() {
-            if i > 0 && *k == extra[i - 1].0 {
-                continue;
-            }
+        let mut push = |k: &str, v: &str| {
             c.extra_keys.push(ByteArray::from(k.as_bytes().to_vec()));
             c.extra_values.push(ByteArray::from(v.as_bytes().to_vec()));
             kept += 1;
+        };
+        if crate::codec::is_canonical(extra) {
+            for &(k, v) in extra {
+                push(k, v);
+            }
+        } else {
+            order.clear();
+            order.extend(0..extra.len() as u32);
+            order.sort_unstable_by_key(|&i| extra[i as usize]);
+            // Equal names are adjacent now, so one pass collapses each run to
+            // its first member -- the codec's rule, so a frame it produced and a
+            // frame repaired here land identically.
+            order.dedup_by(|a, b| extra[*a as usize].0 == extra[*b as usize].0);
+            for &i in order.iter() {
+                let (k, v) = extra[i as usize];
+                push(k, v);
+            }
         }
         // A row with no undeclared keys gets a count of 0, which encodes as an
         // *empty* map rather than a null one. The two are different values to a
@@ -989,24 +1015,41 @@ mod tests {
     fn a_repeated_extra_key_cannot_reach_the_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("dupes.parquet");
-        let mut b = RowBuilder::new("s", &[], 2).unwrap();
+        let mut b = RowBuilder::new("s", &[], 4).unwrap();
         b.append(1, "a", &[], &[("k", "1"), ("k", "2"), ("z", "9")], "")
             .unwrap();
         // The row after it must stay aligned: the map columns are flattened, so
         // dropping an entry has to be reflected in this row's count or every
         // later row reads someone else's entries.
         b.append(2, "b", &[], &[("k", "3")], "").unwrap();
+        // Duplicates that are not adjacent. Sorted-by-name is the frame layout's
+        // contract, but a producer that ignores it is exactly what a backstop is
+        // for -- and a compare-with-previous check walks straight past this.
+        b.append(3, "c", &[], &[("k", "1"), ("z", "9"), ("k", "2")], "")
+            .unwrap();
+        // ...including when the run wraps the whole row.
+        b.append(4, "d", &[], &[("z", "9"), ("k", "1"), ("z", "8")], "")
+            .unwrap();
         write_file(&path, &b.finish().unwrap(), "s", 0, "uncompressed", 1024).unwrap();
 
         let rows = read_file(&path).unwrap();
+        let kz = [
+            ("k".to_string(), "1".to_string()),
+            ("z".to_string(), "9".to_string()),
+        ];
+        assert_eq!(rows[0].extra, kz);
+        assert_eq!(rows[1].extra, [("k".to_string(), "3".to_string())]);
+        // Repaired into canonical order, first-of-run winning -- the same rule
+        // and the same result the codec would have produced.
+        assert_eq!(rows[2].extra, kz);
         assert_eq!(
-            rows[0].extra,
+            rows[3].extra,
             [
                 ("k".to_string(), "1".to_string()),
-                ("z".to_string(), "9".to_string())
-            ]
+                ("z".to_string(), "8".to_string())
+            ],
+            "sorted by (name, value), so the lower value is the survivor"
         );
-        assert_eq!(rows[1].extra, [("k".to_string(), "3".to_string())]);
     }
 
     #[test]
