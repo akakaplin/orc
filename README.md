@@ -142,8 +142,11 @@ data/
   series/trades/
     hour=2026-08-08T13/0000000041-0000000042.e7.parquet
     view.sql                        # generated; unions epochs, coalesces promotions
+  tmp/trades/hour=.../              # staging; engine-private, never read it
   rejects/                          # decoded but invalid records, capped
 ```
+
+**Every Parquet file in `series/` is committed.** A flush stages its files in `tmp/`, commits the manifest, and only then renames them into `series/`. So a file you can see there is complete and fsynced, and orc will never rewrite its rows under another name. A file that is still in `tmp/` may never be committed.
 
 Reading it:
 
@@ -160,6 +163,19 @@ cd data && duckdb -c ".read series/trades/view.sql"
 ```sh
 find data/series -name 'hour=*' -type d -mtime +90 -exec rm -rf {} +
 ```
+
+### Exporting to object storage
+
+The same guarantee lets an external tool ship files to S3, R2 or similar and remove them locally. orc does not need to know the tool exists. No ready markers or locks are needed:
+
+1. List `series/*/hour=*/*.parquet`. Ignore `tmp/`.
+2. Upload each file to the same relative key. Names are unique and never reused, so a retry after a crash overwrites the same object with the same bytes.
+3. Delete the local file once the upload succeeds.
+
+Two things to watch:
+
+- **Leave recent `hour=` directories alone.** Late data can still land in an hour directory. If the tool removes it just as a flush publishes into it, that publish fails. Nothing is lost, because the next flush publishes it again, but it shows up in `flush_failures`. Remove only directories older than a few flush intervals.
+- **Exported files are gone from `view.sql`.** The generated view only covers files still in `series/`, so query the bucket for older data.
 
 ## Configuration
 
@@ -270,7 +286,7 @@ The engine never deletes data it cannot read. Two directories are where that sho
 
 A **format-version mismatch refuses to start** rather than quarantining: the WAL is fine, the binary is wrong, and starting would strand records the right build reads perfectly.
 
-Startup also sweeps two kinds of debris from a flush that wrote files and then died before committing — staged files in `tmp/`, and Parquet in `series/` whose segment range runs past the manifest's watermark. Both are rows the next flush writes again, so leaving them would double-count.
+Startup also finishes or discards whatever an interrupted flush left in `tmp/`. A staged file whose segment range the manifest already covers is from a flush that committed and then died before publishing; its segments are gone, so it is published into `series/`. Anything else in `tmp/` is from a flush that never committed, and is deleted, because the next flush writes those rows again. Parquet in `series/` whose range runs past the watermark can only come from an older binary that published before committing, and is deleted for the same reason.
 
 A **missing `manifest.json` refuses to start**, naming the directory. It is the only record of how far the flush got; without it every Parquet file in `series/` is indistinguishable from debris left by a flush that never committed, and there is nothing to recover the watermark from. Restore it from a backup, or move `series/` aside to start fresh.
 

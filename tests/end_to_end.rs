@@ -326,22 +326,142 @@ fn an_uncommitted_flushs_output_is_swept_instead_of_being_duplicated() {
     assert!(stranger.exists(), "unrecognised names are left alone");
 }
 
-/// A staged file is uncommitted by definition, and its name embeds the segment
-/// range — so the next flush writes a differently-named file and never reclaims
-/// it. Left alone, every interrupted flush leaks its whole output forever.
+/// A staged file past the watermark is from a flush that never committed, and
+/// its name embeds the segment range — so the next flush writes a
+/// differently-named file and never reclaims it. Left alone, every interrupted
+/// flush leaks its whole output forever.
 #[test]
 fn staged_files_from_an_interrupted_flush_are_reclaimed() {
     let dir = tempfile::tempdir().unwrap();
+    drop(open(dir.path())); // a manifest, so the watermark is a real 0
+
     let tmp = dir.path().join("tmp");
+    // The flat layout an earlier binary staged into, before committing.
     std::fs::create_dir_all(&tmp).unwrap();
-    let staged = tmp.join("trades.hour=2026-08-08T13.0000000001-0000000002.e0.parquet");
+    let legacy = tmp.join("trades.hour=2026-08-08T13.0000000001-0000000002.e0.parquet");
+    std::fs::write(&legacy, vec![0u8; 4096]).unwrap();
+    // The nested layout, staged by a flush that failed before its commit.
+    let hour = tmp.join("trades").join("hour=2026-08-08T13");
+    std::fs::create_dir_all(&hour).unwrap();
+    let staged = hour.join("0000000001-0000000002.e0.parquet");
     std::fs::write(&staged, vec![0u8; 4096]).unwrap();
 
     let _engine = open(dir.path());
     assert!(
-        !staged.exists(),
-        "stale staging files must not survive open"
+        !legacy.exists(),
+        "legacy staging files must not survive open"
     );
+    assert!(
+        !staged.exists(),
+        "uncommitted staged files must not survive open"
+    );
+    assert!(!hour.exists(), "nor the directories they emptied");
+    assert!(
+        parquet_files(dir.path(), "trades").is_empty(),
+        "and nothing uncommitted is published"
+    );
+}
+
+/// A flush that committed and then failed to publish leaves the only copy of
+/// its rows in `tmp/` — the segments are already deleted. Open must finish the
+/// job, not discard it.
+#[test]
+fn committed_staged_files_are_published_at_open() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let engine = open(dir.path());
+        let trades = engine.series("trades").unwrap();
+        push(&engine, &trades, T13, "a");
+        push(&engine, &trades, T13 + 1, "b");
+        engine.flush().unwrap();
+    }
+    let published = parquet_files(dir.path(), "trades");
+    assert_eq!(published.len(), 1);
+
+    // Put it back where a flush interrupted between commit and publish leaves it.
+    let rel = published[0]
+        .strip_prefix(dir.path().join("series"))
+        .unwrap();
+    let staged = dir.path().join("tmp").join(rel);
+    std::fs::create_dir_all(staged.parent().unwrap()).unwrap();
+    std::fs::rename(&published[0], &staged).unwrap();
+    assert_eq!(parquet_rows(dir.path(), "trades"), 0);
+
+    let _engine = open(dir.path());
+    assert!(!staged.exists(), "promoted out of tmp/");
+    assert_eq!(parquet_files(dir.path(), "trades"), published);
+    assert_eq!(parquet_rows(dir.path(), "trades"), 2);
+}
+
+/// The contract an external mover relies on: whatever it finds in `series/`
+/// is committed, so moving it away and carrying on never loses or repeats a row.
+#[test]
+fn moving_published_files_away_loses_and_repeats_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let bucket = tempfile::tempdir().unwrap();
+    let mut moved = 0;
+    let mut sweep_to_bucket = |dir: &Path| {
+        for f in parquet_files(dir, "trades") {
+            let to = bucket.path().join(format!("{moved}.parquet"));
+            std::fs::copy(&f, &to).unwrap();
+            std::fs::remove_file(&f).unwrap();
+            moved += 1;
+        }
+    };
+
+    {
+        let e = open(dir.path());
+        let trades = e.series("trades").unwrap();
+        push(&e, &trades, T13, "a");
+        push(&e, &trades, T13 + HOUR_US, "b");
+        e.flush().unwrap();
+        sweep_to_bucket(dir.path());
+
+        push(&e, &trades, T13 + 1, "c");
+        push(&e, &trades, T13 + HOUR_US + 1, "d");
+        e.flush().unwrap();
+    }
+    // A restart in between must neither resurrect nor sweep anything.
+    let e = open(dir.path());
+    let trades = e.series("trades").unwrap();
+    push(&e, &trades, T13 + 2, "e");
+    e.flush().unwrap();
+    sweep_to_bucket(dir.path());
+
+    let mut seen: Vec<(u64, String)> = Vec::new();
+    for f in std::fs::read_dir(bucket.path()).unwrap().flatten() {
+        seen.extend(orc::flush::read::read_ts_id(&f.path()).unwrap());
+    }
+    seen.sort();
+    let ids: Vec<&str> = seen.iter().map(|(_, id)| id.as_str()).collect();
+    assert_eq!(ids, ["a", "c", "e", "b", "d"]);
+    assert!(parquet_files(dir.path(), "trades").is_empty());
+}
+
+/// Staged files can be the only copy of committed rows, so a lost manifest must
+/// stop the engine for them just as it does for published ones.
+#[test]
+fn a_lost_manifest_protects_committed_staged_files_too() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let engine = open(dir.path());
+        let trades = engine.series("trades").unwrap();
+        push(&engine, &trades, T13, "a");
+        engine.flush().unwrap();
+    }
+    let published = parquet_files(dir.path(), "trades").remove(0);
+    let staged = dir
+        .path()
+        .join("tmp")
+        .join(published.strip_prefix(dir.path().join("series")).unwrap());
+    std::fs::create_dir_all(staged.parent().unwrap()).unwrap();
+    std::fs::rename(&published, &staged).unwrap();
+    std::fs::remove_file(dir.path().join("manifest.json")).unwrap();
+
+    let config: Config = serde_json::from_str(&config_json(dir.path())).unwrap();
+    let err = Engine::open(config).unwrap_err().to_string();
+    assert!(err.contains("Refusing to start"), "{err}");
+    assert!(staged.exists(), "and the staged file was not touched");
 }
 
 /// The flush the whole design is described in terms of. Nothing scheduled one:
@@ -503,9 +623,11 @@ fn a_flush_that_failed_part_way_does_not_leave_duplicates_behind() {
     push(&e, &trades, T13, "a");
     push(&e, &trades, T13 + HOUR_US, "b");
 
-    // Fail the *second* partition: rows are sorted by ts, so the first hour has
-    // already been renamed into place by the time this one is reached.
-    let blocked = series_dir(dir.path(), "trades").join(orc::time::hour_partition(T13 + HOUR_US));
+    // Fail publishing the *second* partition: rows are sorted by ts, so the
+    // first hour has already been renamed into place by the time this one is
+    // reached. Publishing happens after the commit, so both are committed.
+    let hour = orc::time::hour_partition(T13 + HOUR_US);
+    let blocked = series_dir(dir.path(), "trades").join(&hour);
     std::fs::create_dir_all(blocked.parent().unwrap()).unwrap();
     std::fs::write(&blocked, b"not a directory").unwrap();
 
@@ -513,13 +635,21 @@ fn a_flush_that_failed_part_way_does_not_leave_duplicates_behind() {
     assert_eq!(
         parquet_files(dir.path(), "trades").len(),
         1,
-        "the first partition is already on disk, uncommitted"
+        "the first partition is published"
+    );
+    let staged = dir.path().join("tmp").join("trades").join(&hour);
+    assert_eq!(
+        std::fs::read_dir(&staged).unwrap().count(),
+        1,
+        "the second is committed but still staged"
     );
 
-    // Ingest carries on, so the next flush spans a wider segment range.
+    // Ingest carries on, so the next flush spans a wider segment range. It
+    // must publish the staged file first, not rewrite or lose its row.
     std::fs::remove_file(&blocked).unwrap();
     push(&e, &trades, T13 + 1, "c");
     e.flush().unwrap();
+    assert!(!staged.exists(), "promoted and its directory cleared");
 
     let mut seen: Vec<(u64, String)> = Vec::new();
     for f in parquet_files(dir.path(), "trades") {

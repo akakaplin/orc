@@ -607,9 +607,9 @@ pub fn writer_properties(
 
 /// Write `cols` to `path` as a complete Parquet file, then fsync it.
 ///
-/// The fsync matters: the flush renames this into `series/` and only then commits
-/// the manifest, so contents that were not durable before the rename leave a
-/// committed manifest pointing at a valid name with no data.
+/// The fsync matters: the flush commits the manifest while this file is still
+/// staged, then deletes the segments it came from, so contents that were not
+/// durable before the commit leave a committed range whose only copy is empty.
 pub fn write_file(
     path: &Path,
     cols: &Columns,

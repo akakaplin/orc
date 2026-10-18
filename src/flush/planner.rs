@@ -6,23 +6,27 @@
 //! 1. decode every listed segment, grouping rows by `(series, epoch)`
 //! 2. stable-sort each group by `(ts, id, arrival)` and drop `(ts, id)`
 //!    duplicates, keeping the first arrival
-//! 3. write one Parquet file per `(series, epoch, hour)` into `tmp/`, fsync it,
-//!    rename it into `series/<name>/hour=…/`, fsync that directory
+//! 3. stage one Parquet file per `(series, epoch, hour)` at
+//!    `tmp/<name>/hour=…/`, fsync it and the directories above it
 //! 4. commit the manifest — **this rename is the commit point**
-//! 5. only then delete the consumed WAL segments
-//! 6. regenerate `view.sql`, which is derived and therefore not worth failing on
+//! 5. publish: rename each staged file into `series/<name>/hour=…/`
+//! 6. only then delete the consumed WAL segments
+//! 7. regenerate `view.sql`, which is derived and therefore not worth failing on
 //!
-//! A crash anywhere leaves either the old manifest — the segments are still on
-//! disk, so the flush re-runs — or the new one, whose orphan segments startup
-//! deletes on `id <= last_flushed_segment`.
+//! **A Parquet file in `series/` is always committed.** Nothing reaches it before
+//! step 4, which is the contract an external tool moving files out to object
+//! storage relies on: anything it finds there is complete, durable and will never
+//! be written again under another name.
 //!
-//! Nothing loses data, and a re-run over the *same* segment list writes the same
-//! paths with the same bytes: [`output_file_name`] is a function of the consumed
-//! range. But a re-run is not guaranteed to see the same list — ingest carries on
-//! between attempts, so the retry covers a wider range and therefore a different
-//! filename, leaving step 3's output from the failed attempt beside it where both
-//! match the reader's glob. [`sweep_uncommitted`] is what removes it, and it has
-//! to run before the retry as well as at startup.
+//! A crash before step 4 leaves the old manifest: the segments are still on
+//! disk, the flush re-runs, and its staged output is debris. A crash after it
+//! leaves the new manifest, staged files that are now the only copy of their
+//! rows, and orphan segments startup deletes on `id <= last_flushed_segment`.
+//! [`sweep_uncommitted`] tells the two kinds of staged file apart by the same
+//! watermark — promoting the committed ones, deleting the rest — and runs before
+//! a retry as well as at startup. A retry covers a wider segment range than the
+//! failed attempt, so a different filename, and must never see its predecessor's
+//! uncommitted output survive into a later commit.
 //!
 //! # A bad frame costs one record, never the flush
 //!
@@ -181,6 +185,7 @@ pub fn run(
 
     let touched: BTreeSet<&str> = decoded.groups.keys().map(|&(series, _)| series).collect();
 
+    let mut staged = Vec::new();
     for (&(series, epoch), rows) in &mut decoded.groups {
         let keys = decoded
             .schemas
@@ -193,11 +198,15 @@ pub fn run(
 
         for run in hour_runs(rows) {
             outcome.rows_written += run.len();
-            outcome
-                .files_written
-                .push(sink.write_partition(series, epoch, keys, &rows[run])?);
+            let (written, path) = sink.stage_partition(series, epoch, keys, &rows[run])?;
+            outcome.files_written.push(written);
+            staged.push(path);
         }
     }
+    // `write_file` synced each file's contents; this makes their *names*
+    // durable. After the commit the segments are deleted and the staged files
+    // are the only copy, so a power cut must not be able to lose them.
+    fsync_staging(data_dir, &staged)?;
 
     // The commit point. Everything above is recoverable by replay; nothing
     // below may run before this rename lands.
@@ -205,6 +214,13 @@ pub fn run(
     manifest.last_flush_at = Some(now_us());
     manifest.commit(data_dir)?;
     outcome.segments_consumed = ids;
+
+    // Only now does anything appear in `series/`, so a file there is committed
+    // by construction. A failure here leaves the rest in `tmp/`, committed, and
+    // `sweep_uncommitted` promotes them before the next flush.
+    for path in &staged {
+        promote(data_dir, path)?;
+    }
 
     delete_segments(data_dir, &outcome.segments_consumed)?;
     regenerate_views(data_dir, manifest, &touched);
@@ -499,8 +515,7 @@ fn decode_segments<'a>(
 // Write
 // ---------------------------------------------------------------------------
 
-/// The staging-and-rename half of the job, bundled so the per-file call stays
-/// short.
+/// The staging half of the job, bundled so the per-file call stays short.
 #[derive(Debug)]
 struct Sink<'a> {
     data_dir: &'a Path,
@@ -510,18 +525,20 @@ struct Sink<'a> {
 }
 
 impl Sink<'_> {
-    /// Build, stage, fsync and rename one `(series, epoch, hour)` file.
+    /// Build, stage and fsync one `(series, epoch, hour)` file, returning where
+    /// it was staged. Publishing it into `series/` is [`promote`]'s job, after
+    /// the commit.
     ///
     /// `rows` must be sorted, deduplicated and within one hour — the caller's
     /// loop guarantees all three, and the Parquet writer declares `ts` a sorting
     /// column on the strength of it.
-    fn write_partition(
+    fn stage_partition(
         &self,
         series: &str,
         epoch: u32,
         keys: &[KeyDef],
         rows: &[DecodedRow<'_>],
-    ) -> Result<WrittenFile> {
+    ) -> Result<(WrittenFile, PathBuf)> {
         let mut builder = RowBuilder::new(series, keys, rows.len())?;
         for row in rows {
             builder.append(row.ts, row.id, &row.keys, &row.extra, row.data)?;
@@ -534,9 +551,12 @@ impl Sink<'_> {
         // its own output instead of appending a duplicate file.
         let name = output_file_name(self.first_segment, self.last_segment, epoch);
 
-        // `tmp/` is flat, so the staging name has to carry what the destination
-        // directory would otherwise disambiguate.
-        let staged = tmp_dir(self.data_dir).join(format!("{series}.{hour}.{name}"));
+        // `tmp/` mirrors `series/`, so recovery can derive the destination
+        // from the staged path alone. A flat `{series}.{hour}.{name}` cannot be
+        // split back apart: series names may contain dots.
+        let dir = tmp_dir(self.data_dir).join(series).join(&hour);
+        std::fs::create_dir_all(&dir)?;
+        let staged = dir.join(&name);
         write_file(
             &staged,
             &cols,
@@ -546,46 +566,82 @@ impl Sink<'_> {
             self.config.flush.row_group_rows,
         )?;
 
-        let series_root = series_dir(self.data_dir, series);
-        let dir = series_root.join(&hour);
-        std::fs::create_dir_all(&dir)?;
-        std::fs::rename(&staged, dir.join(&name))?;
-
-        // `write_file` synced the contents; only a directory fsync makes the
-        // *name* durable, and the manifest is about to claim this file exists.
-        // The whole chain, not just the leaf: an unsynced `series/<name>/` can
-        // lose a new `hour=` directory whole, file and all.
-        fsync_dir(&dir)?;
-        fsync_dir(&series_root)?;
-        fsync_dir(&self.data_dir.join(SERIES_DIR))?;
-
-        Ok(WrittenFile {
+        let written = WrittenFile {
             series: series.to_string(),
             epoch,
             hour,
             rows: rows.len(),
-        })
+        };
+        Ok((written, staged))
     }
 }
 
-/// Remove everything an interrupted flush left behind.
+/// Fsync every directory between `tmp/` and the staged files, so the names
+/// survive a power cut. Each directory once, however many files share it.
+fn fsync_staging(data_dir: &Path, staged: &[PathBuf]) -> Result<()> {
+    let root = tmp_dir(data_dir);
+    let mut dirs: BTreeSet<&Path> = BTreeSet::new();
+    for path in staged {
+        // `tmp/<series>/<hour>/<file>`: the hour and series levels.
+        let mut dir = path.parent();
+        while let Some(d) = dir.filter(|d| *d != root) {
+            dirs.insert(d);
+            dir = d.parent();
+        }
+    }
+    for dir in dirs {
+        fsync_dir(dir)?;
+    }
+    fsync_dir(&root)?;
+    Ok(())
+}
+
+/// Rename a committed staged file from `tmp/` into its place in `series/`.
 ///
-/// Two kinds of debris, both from a flush that wrote files then failed before
-/// [`Manifest::commit`]:
+/// Called only on a file the manifest already covers, which is what makes
+/// "it is in `series/`" mean "it is committed" for every reader and for an
+/// external mover. Idempotent: a re-run renames the same bytes over the same
+/// name.
+fn promote(data_dir: &Path, staged: &Path) -> Result<()> {
+    let rel = staged
+        .strip_prefix(tmp_dir(data_dir))
+        .map_err(|_| Error::Config(format!("{} is not under tmp/", staged.display())))?;
+    let dest = data_dir.join(SERIES_DIR).join(rel);
+    let dir = dest
+        .parent()
+        .expect("tmp/<series>/<hour>/<file> has a parent");
+    std::fs::create_dir_all(dir)?;
+    std::fs::rename(staged, &dest)?;
+
+    // The whole chain, not just the leaf: an unsynced `series/<name>/` can
+    // lose a new `hour=` directory whole, file and all.
+    fsync_dir(dir)?;
+    if let Some(series_root) = dir.parent() {
+        fsync_dir(series_root)?;
+    }
+    fsync_dir(&data_dir.join(SERIES_DIR))?;
+    Ok(())
+}
+
+/// Finish or discard everything an interrupted flush left behind.
 ///
-/// - **Staged files in `tmp/`.** A crash between `write_file` and the rename
-///   leaves one there, and nothing overwrites it because the staging name embeds
-///   the segment range. Staged files are uncommitted by definition, so `tmp/` is
-///   emptied unconditionally.
-/// - **Orphan Parquet in `series/`.** Files are renamed into place *before* the
-///   commit, so a failure between the two leaves a real file whose rows the next
-///   flush — wider range, different name — writes again beside it. Both match the
-///   reader's glob, so every row in the overlap comes back twice.
+/// One rule decides every case: a file whose `last_segment` is at most
+/// `last_flushed_segment` is committed, and one whose range reaches past the
+/// watermark can only be uncommitted.
 ///
-/// The rule for the second is exact: a committed file's `last_segment` is at most
-/// `last_flushed_segment`, so a range reaching past the watermark can only be
-/// uncommitted. A name that does not parse is left alone — this is the only place
-/// the engine deletes from `series/`.
+/// - **Staged files in `tmp/<series>/<hour>/`.** Committed ones are from a flush
+///   that committed and then failed to publish — their segments are gone, so
+///   they are the only copy — and are **promoted** into `series/`. Uncommitted
+///   ones are deleted, and a failure to delete one fails the sweep: left in
+///   place, the next commit would raise the watermark past it and a later sweep
+///   would promote a duplicate.
+/// - **Flat files directly in `tmp/`**, from a binary that staged there before
+///   committing. Uncommitted by definition, so deleted unconditionally.
+/// - **Orphan Parquet in `series/`.** The current flush publishes only after the
+///   commit, so it cannot produce these, but a data directory written by an
+///   earlier binary that renamed first and committed second can hold them. A
+///   name that does not parse is left alone — this is the only place the engine
+///   deletes from `series/`.
 ///
 /// **`last_flushed_segment` must come from a manifest that was actually read off
 /// disk.** A missing `manifest.json` reads as 0, under which every committed
@@ -594,11 +650,50 @@ impl Sink<'_> {
 ///
 /// Called at open, and again before a flush that follows a failed one — the
 /// interval timer means a server can run for months without a restart, so open
-/// alone would leave the duplicate visible for exactly that long. Both callers
-/// hold the flush lock or the directory lock, which is what makes deleting on
-/// the watermark safe: no flush can be part-way through renaming its output in.
+/// alone would leave committed rows unpublished for exactly that long. Both
+/// callers hold the flush lock or the directory lock, which is what makes acting
+/// on the watermark safe: no flush can be part-way through staging or publishing.
 pub fn sweep_uncommitted(data_dir: &Path, last_flushed_segment: u64) -> Result<()> {
-    // Staged files are uncommitted by definition, so `tmp/` empties whole.
+    let mut promoted = 0usize;
+    let mut discarded = 0usize;
+    let mut emptied: BTreeSet<PathBuf> = BTreeSet::new();
+    for (path, range) in staged_files(data_dir) {
+        match range {
+            Some((_, last, _)) if last <= last_flushed_segment => {
+                promote(data_dir, &path)?;
+                promoted += 1;
+            }
+            _ => {
+                std::fs::remove_file(&path)?;
+                discarded += 1;
+            }
+        }
+        emptied.extend(path.parent().map(Path::to_path_buf));
+    }
+    if promoted > 0 {
+        tracing::warn!(
+            files = promoted,
+            last_flushed_segment,
+            "published committed parquet that an interrupted flush left in tmp/"
+        );
+    }
+    if discarded > 0 {
+        tracing::info!(
+            files = discarded,
+            "removed staged files from an uncommitted flush"
+        );
+    }
+    // Hour directories first, then their series: `remove_dir` refuses anything
+    // still holding something, which is the check wanted.
+    for hour in &emptied {
+        let _ = std::fs::remove_dir(hour);
+        if let Some(series) = hour.parent() {
+            let _ = std::fs::remove_dir(series);
+        }
+    }
+
+    // Flat files at the top of `tmp/` predate the nested layout, and were
+    // staged before a commit, so they are uncommitted by definition.
     let (files, bytes) = std::fs::read_dir(tmp_dir(data_dir))
         .into_iter()
         .flatten()
@@ -673,23 +768,34 @@ pub fn sweep_uncommitted(data_dir: &Path, last_flushed_segment: u64) -> Result<(
 /// A fresh directory has no output and passes, which is what lets an engine
 /// start for the first time.
 pub fn require_manifest_for_output(data_dir: &Path) -> Result<()> {
-    let found = output_files(data_dir);
-    let Some((first, _)) = found.first() else {
+    // Staged files count: a flush that committed and then failed to publish
+    // leaves the only copy of its rows in `tmp/`, and the sweep would read a
+    // watermark of 0 as "delete them".
+    let mut found: Vec<PathBuf> = output_files(data_dir).into_iter().map(|(p, _)| p).collect();
+    found.extend(
+        staged_files(data_dir)
+            .into_iter()
+            .filter(|(_, range)| range.is_some())
+            .map(|(p, _)| p),
+    );
+    let Some(first) = found.first() else {
         return Ok(());
     };
     Err(Error::Config(format!(
-        "{} has no {} but {}/ already holds {} parquet file(s) this engine wrote \
+        "{} has no {} but {}/ or {}/ already holds {} parquet file(s) this engine wrote \
          (for example {}). Refusing to start: the manifest is the only record of how \
          far the flush got, and without it every one of those files looks like debris \
          from a flush that never committed -- so starting would delete them. \
-         Restore {} from a backup, or move {}/ aside if you mean to start fresh.",
+         Restore {} from a backup, or move {}/ and {}/ aside if you mean to start fresh.",
         data_dir.display(),
         crate::manifest::MANIFEST_FILE,
         SERIES_DIR,
+        TMP_DIR,
         found.len(),
         first.display(),
         crate::manifest::MANIFEST_FILE,
         SERIES_DIR,
+        TMP_DIR,
     )))
 }
 
@@ -709,6 +815,34 @@ fn output_files(data_dir: &Path) -> Vec<(PathBuf, (u64, u64, u32))> {
         .flat_map(|series| entries(series.path()))
         .flat_map(|hour| entries(hour.path()))
         .filter_map(|f| Some((f.path(), parse_output_file_name(f.file_name().to_str()?)?)))
+        .collect();
+    out.sort();
+    out
+}
+
+/// `(first_segment, last_segment, epoch)`, as [`parse_output_file_name`] reads a
+/// flush output name.
+type OutputRange = (u64, u64, u32);
+
+/// Every file staged under `tmp/<series>/<hour>/`, with the range its name
+/// encodes, or `None` for a name this engine did not write.
+///
+/// Unlike [`output_files`], unparseable names are returned: `tmp/` belongs to
+/// the engine, so anything in it is the sweep's to clear. Flat files directly in
+/// `tmp/` are not included; they are a different case.
+fn staged_files(data_dir: &Path) -> Vec<(PathBuf, Option<OutputRange>)> {
+    let entries = |dir: PathBuf| std::fs::read_dir(dir).into_iter().flatten().flatten();
+    let dirs = |e: &std::fs::DirEntry| e.file_type().is_ok_and(|t| t.is_dir());
+    let mut out: Vec<_> = entries(tmp_dir(data_dir))
+        .filter(dirs)
+        .flat_map(|series| entries(series.path()))
+        .filter(dirs)
+        .flat_map(|hour| entries(hour.path()))
+        .filter(|f| f.file_type().is_ok_and(|t| t.is_file()))
+        .map(|f| {
+            let range = f.file_name().to_str().and_then(parse_output_file_name);
+            (f.path(), range)
+        })
         .collect();
     out.sort();
     out

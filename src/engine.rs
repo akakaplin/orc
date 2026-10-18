@@ -200,10 +200,11 @@ impl Engine {
             manifest.commit(&data_dir)?;
         }
 
-        // Before the WAL is touched: a flush that wrote files and then failed
-        // before committing left staged files in `tmp/` and real Parquet in
-        // `series/`, and the next flush -- covering a wider segment range, so a
-        // different filename -- writes those same rows again beside them.
+        // Before the WAL is touched: an interrupted flush left staged files in
+        // `tmp/`. Uncommitted ones are rows the next flush -- covering a wider
+        // segment range, so a different filename -- writes again; committed
+        // ones are the only copy of rows whose segments recovery is about to
+        // delete, and are published into `series/`.
         planner::sweep_uncommitted(&data_dir, manifest.last_flushed_segment)?;
 
         let rec = recovery::recover(&data_dir, manifest.last_flushed_segment)?;
@@ -455,14 +456,13 @@ impl Inner {
         let active = self.wal.segment();
         let floor = manifest.last_flushed_segment;
 
-        // Debris from a flush that renamed files into `series/` and then failed
-        // before the commit. Startup sweeps it -- but the interval timer means a
-        // server runs for months without one, and this flush is about to write
-        // those same rows again under a wider segment range, so a different
-        // filename. Both would match the reader's glob and every row in the
-        // overlap would come back twice, once per failed attempt.
+        // A failed flush leaves staged files in `tmp/`: uncommitted ones this
+        // flush is about to write again under a wider segment range, and
+        // committed ones -- it failed while publishing -- that hold the only
+        // copy of their rows. Startup sorts them out too, but the interval
+        // timer means a server runs for months without one.
         //
-        // Only after a failure: a flush that committed left nothing behind, and
+        // Only after a failure: a flush that succeeded left nothing behind, and
         // the sweep walks every `hour=` partition in the dataset.
         if self.counters.flush_failures.load(Ordering::Relaxed) > 0 {
             planner::sweep_uncommitted(&self.data_dir, floor)?;
