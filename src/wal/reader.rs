@@ -1,29 +1,14 @@
-//! Reading a segment back, one frame at a time — the flush's input side.
+//! Reading a segment back, one frame at a time, for the flush.
 //!
-//! The contract is what the flush must be able to do with a bad record: **count
-//! it, route it aside, keep going.** Ingest validated only a frame's fixed
-//! prefix, so a malformed `keys` section first surfaces here, an hour later, with
-//! no way to reject it at the source — and a flush that can never finish means no
-//! Parquet is ever produced again. So a fault is a *value* this reader yields,
-//! never an error that ends iteration.
+//! A bad record is a yielded *value*, never an error that ends iteration, so one
+//! poison frame can't stall the flush forever:
 //!
-//! Two faults, and the difference is whether the reader can find the next frame:
+//! - [`FrameFault::BadRecord`], [`FrameFault::UnknownSchema`]: CRC is good, so
+//!   `len` is trusted; skip this frame and continue.
+//! - [`FrameFault::Undecodable`]: the frame can't be delimited; stop.
 //!
-//! - [`FrameFault::BadRecord`] and [`FrameFault::UnknownSchema`] — the frame's
-//!   CRC checked out, so its `len` is trustworthy and the next frame's offset is
-//!   known. The reader skips exactly this frame and continues.
-//! - [`FrameFault::Undecodable`] — the CRC failed, or the length is impossible,
-//!   or the buffer ends mid-frame. Nothing after this point can be located: a
-//!   frame that fails CRC is by definition of unknown length, so "skip it" has
-//!   no meaning. The reader stops, and everything before the fault is still
-//!   good.
-//!
-//! # Key counts come from the caller
-//!
-//! [`crate::codec::decode`] needs the arity of the schema at the frame's epoch,
-//! which lives in the manifest — see the codec's module docs for why. So a reader
-//! takes a lookup closure and does the cheap prefix read first, to learn which
-//! `(series, epoch)` to ask about.
+//! Key counts come from a caller-supplied `(series, epoch)` lookup, since
+//! [`crate::codec::decode`] needs the schema's arity.
 
 use std::path::Path;
 
@@ -31,52 +16,46 @@ use crate::codec::{self, DecodeError, DecodeResult, SEGMENT_HEADER_BYTES};
 use crate::error::Result;
 use crate::record::{RecordRef, Value};
 
-/// Read a whole segment file into memory.
-///
-/// Whole rather than streamed, deliberately: the flush sorts an index of offsets
-/// into this buffer rather than decoded rows, so a segment costs its own size and
-/// nothing per record.
-///
-/// That bounds flush memory only as well as segment size is bounded, which is
-/// *approximately* `wal.segment_max_bytes`: a segment rolls once it is over the
-/// limit, so one oversized `append_batch` makes one oversized segment.
-/// `server.max_batch_bytes` upstream is what keeps the overshoot to one batch.
+/// Read a whole segment file into memory. The flush uses [`read_segment_into`].
 pub fn read_segment(path: impl AsRef<Path>) -> Result<Vec<u8>> {
     Ok(std::fs::read(path)?)
 }
 
+/// [`read_segment`] into a reused buffer, replacing its contents. The flush
+/// reads segments one by one; reuse keeps its footprint at one segment.
+pub fn read_segment_into(path: impl AsRef<Path>, buf: &mut Vec<u8>) -> Result<()> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path)?;
+    buf.clear();
+    let len = file.metadata().map_or(0, |m| m.len() as usize);
+    buf.reserve(len);
+    file.read_to_end(buf)?;
+    Ok(())
+}
+
 /// One decoded frame and where it sits in the segment.
-///
-/// `offset` is half of the flush's `arrival` order — see
-/// [`crate::flush::planner`].
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Frame<'a> {
     pub record: RecordRef<'a>,
-    /// Byte offset of the frame within the segment file.
+    /// Byte offset in the segment; with the segment id, the flush's arrival order.
     pub offset: usize,
     /// Total bytes the frame occupies, `len` and `crc32` included.
     pub len: usize,
 }
 
 /// A frame that could not be turned into a record.
-///
-/// Every variant carries the offset: the flush copies the offending bytes to
-/// `rejects/`, and "which record?" is always the next question.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FrameFault<'a> {
-    /// The frame is intact but its contents do not decode under the schema its
-    /// epoch names — a key section that disagrees with the arity, an unknown
-    /// type tag, a string that is not UTF-8. A well-behaved encoder cannot
-    /// produce this; a hand-rolled client can. Skippable.
+    /// Intact frame whose contents don't decode under its epoch's schema.
+    /// Skippable.
     BadRecord {
         offset: usize,
         len: usize,
         err: DecodeError,
     },
 
-    /// The frame names an epoch that is not in the manifest's history for its
-    /// series. Old epochs are never removed, so this means the manifest was
-    /// truncated or hand-edited. Skippable.
+    /// Epoch absent from the manifest history (truncated or hand-edited
+    /// manifest). Skippable.
     UnknownSchema {
         offset: usize,
         len: usize,
@@ -84,9 +63,7 @@ pub enum FrameFault<'a> {
         epoch: u32,
     },
 
-    /// The bytes at this offset are not a locatable frame, so nothing after them
-    /// can be found either. Iteration stops here; this is the fault recovery
-    /// turns into a truncation.
+    /// Not a delimitable frame; iteration stops (recovery truncates here).
     Undecodable { offset: usize, err: DecodeError },
 }
 
@@ -141,12 +118,8 @@ impl FrameFault<'_> {
 /// A frame, or the reason it is not one.
 pub type FrameResult<'a> = std::result::Result<Frame<'a>, FrameFault<'a>>;
 
-/// A forward cursor over the frames of one segment.
-///
-/// `L` maps `(series, epoch)` to that schema's key count; `None` produces
-/// [`FrameFault::UnknownSchema`]. A closure rather than a `&Manifest` so the
-/// flush can cache it — the same pair repeats for millions of consecutive
-/// frames.
+/// A forward cursor over the frames of one segment. `L` maps `(series, epoch)`
+/// to a key count; `None` yields [`FrameFault::UnknownSchema`].
 pub struct SegmentReader<'a, L> {
     id: u64,
     buf: &'a [u8],
@@ -154,8 +127,7 @@ pub struct SegmentReader<'a, L> {
     max_record_bytes: usize,
     key_count: L,
     stopped: bool,
-    // Reused across frames, so a scan of a 64 MiB segment allocates only until
-    // these reach the high-water mark of one record.
+    // Reused across frames.
     keys: Vec<Value<'a>>,
     extra: Vec<(&'a str, &'a str)>,
 }
@@ -175,11 +147,8 @@ impl<'a, L> SegmentReader<'a, L>
 where
     L: FnMut(&str, u32) -> Option<usize>,
 {
-    /// Parse the segment header and position at the first frame.
-    ///
-    /// A bad header is the one fatal failure: without it the file is not known to
-    /// be an orc segment this build understands, and decoding anyway would be
-    /// inventing records.
+    /// Parse the segment header (the one fatal failure) and position at the
+    /// first frame.
     pub fn new(buf: &'a [u8], max_record_bytes: usize, key_count: L) -> DecodeResult<Self> {
         let id = codec::parse_segment_header(buf)?;
         Ok(Self {
@@ -194,25 +163,18 @@ where
         })
     }
 
-    /// The id the segment's own header declares. Worth comparing against the
-    /// file name: they disagree only for a hand-copied or renamed segment, which
-    /// silently reorders `arrival`.
+    /// The id the segment's header declares; differs from the file name only if
+    /// the file was renamed.
     pub fn segment_id(&self) -> u64 {
         self.id
     }
 
-    /// Offset of the next frame — also, after iteration ends, the offset of the
-    /// first byte the reader could not use.
-    ///
-    /// The same offset startup recovery truncates at, though it computes it with
-    /// its own scan: this one needs a schema for every frame, and recovery
-    /// deliberately runs before it has one.
+    /// Offset of the next frame; after iteration ends, of the first unusable byte.
     pub fn offset(&self) -> usize {
         self.at
     }
 
-    /// The declared key values of the frame most recently returned by
-    /// [`Self::next_frame`], positional in the order its epoch declares.
+    /// Key values of the frame last returned by [`Self::next_frame`].
     pub fn keys(&self) -> &[Value<'a>] {
         &self.keys
     }
@@ -229,16 +191,12 @@ where
             return None;
         }
 
-        // Copy the slice reference out of `self` first: the records handed back
-        // borrow from the segment buffer, not from this reader, so they must not
-        // be tied to the `&mut self` borrow.
+        // Copied out so records borrow the buffer, not `&mut self`.
         let buf = self.buf;
         let offset = self.at;
         let rest = &buf[offset..];
 
-        // The cheap read first -- ts, epoch, series, id and a CRC check -- which
-        // is what tells us both which schema to decode against and where the
-        // frame ends.
+        // Prefix + CRC: gives the schema to decode against and the frame length.
         let prefix = match codec::validate_prefix(rest, self.max_record_bytes) {
             Ok(p) => p,
             Err(err) => {
@@ -272,8 +230,7 @@ where
                     len,
                 }))
             }
-            // The CRC already agreed, so `frame_len` is trustworthy even though
-            // the contents are not: skip precisely this record and carry on.
+            // CRC agreed, so `frame_len` is trusted: skip just this record.
             Err(err) => {
                 self.at += prefix.frame_len;
                 Some(Err(FrameFault::BadRecord {
@@ -344,8 +301,7 @@ mod tests {
 
     #[test]
     fn the_lookup_sees_each_frames_own_series_and_epoch() {
-        // A segment spanning a reload-config: two epochs of one series, decoded
-        // each under its own arity. Nothing outside the frame says which.
+        // Two epochs of one series, each decoded under its own arity.
         let mut buf = Vec::new();
         encode_segment_header(&mut buf, 1);
         encode(&mut buf, "trades", 0, &row("old", &[Value::Str("AAPL")])).unwrap();
@@ -376,9 +332,7 @@ mod tests {
 
     #[test]
     fn a_poison_frame_costs_one_record_and_no_more() {
-        // Valid CRC, valid prefix, corrupt `keys` section: exactly what an
-        // ill-behaved client can get past `append_raw`. The flush must write
-        // every other record.
+        // Valid CRC and prefix, corrupt `keys`: what a bad client can get past ingest.
         let mut buf = segment(1, &[("s", 0, "before", 1), ("s", 0, "poison", 1)]);
         let poison_at = buf.len() - {
             let mut one = Vec::new();
@@ -436,7 +390,6 @@ mod tests {
             let fault = r.next_frame().unwrap().unwrap_err();
             assert!(fault.is_terminal(), "cut of {cut}: {fault:?}");
             assert_eq!(fault.offset(), good_upto);
-            // Terminal means terminal: the reader does not try to resynchronise.
             assert!(r.next_frame().is_none());
             assert_eq!(r.offset(), good_upto);
         }
@@ -457,7 +410,6 @@ mod tests {
 
     #[test]
     fn a_zero_padded_tail_stops_the_scan() {
-        // What a sparse write or a filesystem that zero-fills leaves behind.
         let mut buf = segment(1, &[("s", 0, "good", 1)]);
         let good_upto = buf.len();
         buf.resize(good_upto + 4096, 0);

@@ -1,13 +1,7 @@
-//! Reading back what the flush wrote.
+//! Reading back flushed Parquet, for verification and tests only.
 //!
-//! The engine is write-only by design — readers point DuckDB or polars at the
-//! data directory. This module is not a query path and is not built for one: it
-//! materialises whole rows as owned `String`s, which is exactly wrong for
-//! scanning and exactly right for asserting that a file says what it should.
-//!
-//! It exists so the write path can be verified without pulling Arrow in, and so
-//! integration tests can check output without a Parquet dev-dependency of their
-//! own. Anything performance-sensitive should use a real reader.
+//! Not a query path: rows are materialised as owned `String`s. Real readers
+//! use DuckDB or polars.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -22,16 +16,10 @@ fn read_err(path: &Path, e: parquet::errors::ParquetError) -> Error {
     Error::Config(format!("reading parquet {path:?}: {e}"))
 }
 
-/// One row, with every value rendered as text.
-///
-/// Types are deliberately flattened to `String`: callers are asserting on
-/// content, and a single representation keeps those assertions readable. `keys`
-/// is positional, matching the series' declared key order.
+/// One row, every value rendered as text. `keys` follow declared key order.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReadRow {
-    /// Unsigned, matching the engine's own `ts`. Parquet stores it signed, so
-    /// this narrows in the other direction — a negative value means the file was
-    /// not written by this engine.
+    /// Stored signed in Parquet; negative means not written by this engine.
     pub ts: u64,
     pub id: String,
     pub keys: Vec<Option<String>>,
@@ -40,15 +28,14 @@ pub struct ReadRow {
     pub data: String,
 }
 
-/// What a reader can see about a file without decoding its rows.
+/// File metadata, without decoding rows.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileMeta {
     pub key_value: HashMap<String, String>,
     pub sorting_columns: Vec<SortingColumn>,
-    /// Rows in each row group, in order.
     pub row_group_rows: Vec<i64>,
     pub num_rows: i64,
-    /// Leaf column paths, dotted, in schema order.
+    /// Dotted leaf column paths, in schema order.
     pub columns: Vec<String>,
 }
 
@@ -68,8 +55,7 @@ fn field_text(f: &Field) -> Option<String> {
     }
 }
 
-/// The `ts` column, whose logical type makes the record reader hand back a
-/// timestamp rather than a plain i64.
+/// `ts` arrives as a timestamp field (its logical type), not a plain i64.
 fn field_ts(f: &Field) -> Result<u64> {
     let raw = match f {
         Field::TimestampMicros(v) | Field::Long(v) => *v,
@@ -104,7 +90,7 @@ fn row_from(row: &ParquetRow) -> Result<ReadRow> {
                     return Err(Error::Config(format!("extra is not a map: {other}")));
                 }
             },
-            // Anything else is a declared key, and they arrive in schema order.
+            // Declared keys, in schema order.
             _ => keys.push(field_text(field)),
         }
     }
@@ -145,8 +131,7 @@ pub fn read_metadata(path: &Path) -> Result<FileMeta> {
         })
         .unwrap_or_default();
 
-    // Every row group carries the same declaration; the first is representative,
-    // and an empty file has none.
+    // All row groups declare the same order; an empty file has none.
     let sorting_columns = meta
         .row_groups()
         .first()
@@ -170,7 +155,7 @@ pub fn read_metadata(path: &Path) -> Result<FileMeta> {
     })
 }
 
-/// `(ts, id)` of every row — the pair the flush sorts and deduplicates on.
+/// `(ts, id)` of every row.
 pub fn read_ts_id(path: &Path) -> Result<Vec<(u64, String)>> {
     Ok(read_file(path)?.into_iter().map(|r| (r.ts, r.id)).collect())
 }

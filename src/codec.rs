@@ -1,9 +1,6 @@
-//! The frame codec — the single definition of orc's byte layout.
-//!
-//! The WAL and the ZeroMQ wire use the *same* frame, which is what lets the
-//! server append the bytes a client sent with no transcoding. That makes this
-//! module the on-disk format: every byte written here is a compatibility
-//! commitment, and changing one means bumping [`FORMAT_VERSION`].
+//! The frame codec: orc's byte layout, shared by the WAL and the ZeroMQ wire so
+//! the server appends client bytes untranscoded. Changing any byte here is a
+//! format break and needs a [`FORMAT_VERSION`] bump.
 //!
 //! ```text
 //! wal segment header (once):  magic u32 | format_version u16 | segment_id u64
@@ -20,33 +17,13 @@
 //!   data   u32 len + bytes
 //! ```
 //!
-//! Little-endian throughout, and every multi-byte read goes through
-//! `from_le_bytes` on a bounds-checked slice, so nothing assumes alignment or
-//! host endianness.
-//!
-//! Three properties are load-bearing and each has a dedicated test:
-//!
-//! - **`len` is checked against `max_record_bytes` before anything is read or
-//!   reserved.** A corrupt four-byte length is otherwise a request for 4 GiB.
-//! - **Truncated and corrupt are different answers.** [`DecodeError::Truncated`]
-//!   is "the buffer ends mid-frame, stop scanning"; [`DecodeError::Corrupt`] is
-//!   "the bytes that are present disagree with themselves". Recovery branches on
-//!   the difference, so it must be exact.
-//! - **Re-encoding a logical record is byte-identical**, which is what makes a
-//!   crash-recovered flush produce the same Parquet file. `extra` is sorted at
-//!   encode time to get there.
-//!
-//! # Key counts are not in the frame
-//!
-//! A frame stores key *values* with no count: the arity comes from the schema for
-//! the `epoch` the frame names. So [`decode`] takes the count from the caller,
-//! who learns it from the cheap fixed prefix — `validate_prefix` yields series
-//! and epoch, the caller maps those to an arity.
-//!
-//! Storing the count per frame would let a decoder work with no schema, but it
-//! would also be a second source of truth that can disagree with the manifest,
-//! at 1-2 bytes per record forever. The prefix re-read is a few loads at fixed
-//! offsets.
+//! Little-endian; every read is bounds-checked. Invariants (each tested):
+//! - `len` is checked against `max_record_bytes` before anything is read or reserved.
+//! - [`DecodeError::Truncated`] (torn tail) vs [`DecodeError::Corrupt`] (bytes
+//!   contradict themselves) is exact; recovery branches on it.
+//! - Re-encoding a record is byte-identical (`extra` is sorted), so a replayed
+//!   flush writes the same Parquet.
+//! - Frames carry no key count: the caller supplies the arity of the frame's epoch.
 
 use crate::error::{Error, FORMAT_VERSION, MAGIC, Result};
 use crate::record::{RecordRef, Row, Value, tag};
@@ -60,30 +37,18 @@ pub const BATCH_HEADER_BYTES: usize = 4 + 2 + 4;
 /// The `len` and `crc32` fields that precede every frame's payload.
 pub const FRAME_HEADER_BYTES: usize = 4 + 4;
 
-/// The smallest payload any frame can have: `ts` + `epoch` + two empty strings +
-/// an empty `extra` + an empty `data`, with zero declared keys.
-///
-/// A `len` below this is impossible rather than merely short, so it is reported
-/// as corruption without waiting to see whether the buffer could supply it.
+/// Smallest possible payload (zero keys, all strings empty). A smaller `len` is
+/// corrupt, not truncated.
 pub const MIN_PAYLOAD_BYTES: usize = 8 + 4 + 2 + 2 + 2 + 4;
 
-/// Why a frame could not be decoded.
-///
-/// The two variants are not two flavours of the same thing. `Truncated` is the
-/// expected end of a torn WAL segment — a crash mid-`write()` — and recovery
-/// responds by truncating the file at that offset. `Corrupt` means bytes that
-/// are all present contradict each other, which recovery logs loudly and the
-/// flush path turns into one rejected record.
+/// Why a frame could not be decoded. `Truncated` is a torn WAL tail (recovery
+/// truncates there); `Corrupt` is present bytes that contradict each other.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DecodeError {
-    /// The buffer ends before the frame does. `needed` is the total byte length
-    /// this frame will occupy once complete, so a streaming reader knows exactly
-    /// how much more to pull.
+    /// The buffer ends mid-frame; `needed` is the complete frame's length.
     Truncated { needed: usize, got: usize },
 
-    /// The frame is self-inconsistent: CRC mismatch, an implausible length, an
-    /// unknown type tag, invalid UTF-8, or a section that does not end where the
-    /// declared length says it must.
+    /// CRC mismatch, bad length, unknown tag, invalid UTF-8 or misaligned sections.
     Corrupt { reason: &'static str },
 }
 
@@ -112,25 +77,16 @@ impl DecodeError {
     }
 }
 
-/// Result alias for the decode side, which never returns [`Error`]: decoding
-/// failures are a property of the bytes, not of the engine.
+/// Decode-side result: failures are a property of the bytes, not the engine.
 pub type DecodeResult<T> = std::result::Result<T, DecodeError>;
 
 const fn corrupt(reason: &'static str) -> DecodeError {
     DecodeError::Corrupt { reason }
 }
 
-/// The `Corrupt` reason an unrecognised [`FORMAT_VERSION`] produces.
-///
-/// Exported because recovery must tell it apart from real damage: damage means
-/// quarantine and carry on, a version mismatch means the wrong binary and
-/// refusing to start. Naming the constant keeps both ends of that comparison in
-/// step.
+/// The `Corrupt` reason for an unknown [`FORMAT_VERSION`]. Recovery matches on it:
+/// a version mismatch refuses to start, real damage is quarantined.
 pub const UNSUPPORTED_VERSION: &str = "unsupported format version";
-
-// ---------------------------------------------------------------------------
-// Headers
-// ---------------------------------------------------------------------------
 
 /// Append a WAL segment header. Written once, before the first frame.
 pub fn encode_segment_header(out: &mut Vec<u8>, segment_id: u64) {
@@ -139,12 +95,7 @@ pub fn encode_segment_header(out: &mut Vec<u8>, segment_id: u64) {
     out.extend_from_slice(&segment_id.to_le_bytes());
 }
 
-/// Parse a WAL segment header, returning its segment id.
-///
-/// A wrong magic or version is reported as [`DecodeError::Corrupt`] rather than a
-/// variant of its own: to a reader that cannot interpret the bytes, "this is not
-/// an orc segment" and "this segment is damaged" call for the same response, and
-/// a third variant would blur the one distinction recovery actually branches on.
+/// Parse a WAL segment header, returning its segment id. Bad magic/version is `Corrupt`.
 pub fn parse_segment_header(buf: &[u8]) -> DecodeResult<u64> {
     let after = parse_common_header(buf, SEGMENT_HEADER_BYTES)?;
     Ok(u64::from_le_bytes(after[..8].try_into().unwrap()))
@@ -157,11 +108,8 @@ pub fn encode_batch_header(out: &mut Vec<u8>, count: u32) {
     out.extend_from_slice(&count.to_le_bytes());
 }
 
-/// Parse a ZeroMQ batch header, returning the frame count it declares.
-///
-/// The count is a hint for the ingest loop's bookkeeping, not a length: the
-/// frames themselves are self-delimiting, so a lying count cannot desynchronise
-/// the reader.
+/// Parse a ZeroMQ batch header, returning its frame count (a hint only: frames
+/// are self-delimiting).
 pub fn parse_batch_header(buf: &[u8]) -> DecodeResult<u32> {
     let after = parse_common_header(buf, BATCH_HEADER_BYTES)?;
     Ok(u32::from_le_bytes(after[..4].try_into().unwrap()))
@@ -184,36 +132,16 @@ fn parse_common_header(buf: &[u8], needed: usize) -> DecodeResult<&[u8]> {
     Ok(&buf[6..needed])
 }
 
-// ---------------------------------------------------------------------------
-// Encode
-// ---------------------------------------------------------------------------
-
-/// Appends one frame to `out`.
+/// Appends one frame to `out`; on error `out` is restored to its entry length.
 ///
-/// `out` is the caller's reusable buffer — the WAL writer's thread-local scratch
-/// or the client's batch buffer — so the steady path allocates only as it grows.
-///
-/// On any error `out` is restored to its entry length: a half-written frame in a
-/// WAL buffer is indistinguishable from a real one to the next writer.
-///
-/// `extra` is sorted by `(name, value)` and duplicate names are **collapsed,
-/// first in that order winning** — the flush's rule for duplicate `(ts, id)`.
-/// Sorting by name alone would leave equal names in input order, enough to make
-/// one logical record encode two ways and break the byte-identical re-encode a
-/// replayed flush depends on.
-///
-/// Collapsing is not fussiness: `extra` becomes a Parquet MAP, and a repeated key
-/// makes the MAP malformed — `extra['k']` has no answer and a reader rejects the
-/// whole file, so one record with two `feed` entries costs every reader every
-/// row. Defining the rule on the canonical order is what makes it reproducible.
+/// `extra` is sorted by `(name, value)` and duplicate names collapse to the first
+/// (a repeated MAP key makes the Parquet file unreadable). The canonical order
+/// makes re-encoding byte-identical.
 pub fn encode(out: &mut Vec<u8>, series: &str, epoch: u32, row: &Row) -> Result<()> {
     Encoder::default().encode(out, series, epoch, row)
 }
 
-/// A reusable encode-side scratch.
-///
-/// Ordering `extra` is the only allocation the layout forces, and this holds it
-/// across calls. Indices, not borrowed pairs, so it outlives the rows it sorts.
+/// Reusable encode scratch (the `extra` sort order).
 #[derive(Debug, Default)]
 pub struct Encoder {
     order: Vec<u32>,
@@ -256,9 +184,7 @@ impl Encoder {
             limit: u16::MAX as usize,
         })?;
         if is_canonical(row.extra) {
-            // The common case: the caller already handed us pairs in canonical
-            // order with distinct names (a decoded frame being re-encoded always
-            // does), so skip the scratch entirely.
+            // Fast path: already canonical (always so when re-encoding a decoded frame).
             out.extend_from_slice(&n.to_le_bytes());
             for &(name, value) in row.extra {
                 put_str16(out, name)?;
@@ -268,9 +194,7 @@ impl Encoder {
             self.order.clear();
             self.order.extend(0..n as u32);
             self.order.sort_unstable_by_key(|&i| row.extra[i as usize]);
-            // Equal names are adjacent now, so one pass collapses each run to
-            // its first member -- the same "first wins" rule the flush applies
-            // to duplicate `(ts, id)`.
+            // Collapse each run of equal names to its first member.
             self.order
                 .dedup_by(|a, b| row.extra[*a as usize].0 == row.extra[*b as usize].0);
             let kept = u16::try_from(self.order.len()).expect("no more than we started with");
@@ -284,9 +208,7 @@ impl Encoder {
 
         put_str32(out, row.data)?;
 
-        // Backfill len over the payload, then crc over len + payload. `len`
-        // counts everything after the crc field, so the frame occupies
-        // FRAME_HEADER_BYTES + len bytes.
+        // Backfill len (bytes after the crc), then crc over len + payload.
         let payload_len = out.len() - start - FRAME_HEADER_BYTES;
         let len = u32::try_from(payload_len).map_err(|_| Error::RecordTooLarge {
             size: payload_len,
@@ -303,14 +225,8 @@ impl Encoder {
     }
 }
 
-/// Already exactly what the encoder would produce: sorted by name, no duplicates.
-///
-/// Strictly increasing, not merely sorted, because equal names still need
-/// collapsing — and strictly increasing names imply sorted `(name, value)`, so
-/// this is the whole check. Shared with
-/// [`crate::flush::parquet::RowBuilder`], which collapses duplicates again for
-/// frames this encoder never saw, so the two cannot disagree on what needs
-/// fixing.
+/// Already canonical: names strictly increasing (sorted, no duplicates). Shared
+/// with [`crate::flush::parquet::RowBuilder`] so the two agree.
 pub(crate) fn is_canonical(extra: &[(&str, &str)]) -> bool {
     extra.windows(2).all(|w| w[0].0 < w[1].0)
 }
@@ -339,29 +255,20 @@ fn put_str32(out: &mut Vec<u8>, s: &str) -> Result<()> {
     Ok(())
 }
 
-/// One positional key: its tag byte, then its value.
-///
-/// `Value::Str` takes a `u32` length, not the `u16` `extra` uses. A declared key
-/// is a column value, not a label, and a `u16` would put a 64 KiB cliff in the
-/// format that any `max_record_bytes` above 64 KiB walks callers off — a record
-/// the config permits but the frame cannot represent.
+/// One positional key: tag byte, then value. `Str` takes a `u32` length so a key
+/// is never capped below `max_record_bytes`.
 fn put_value(out: &mut Vec<u8>, v: Value<'_>) -> Result<()> {
     out.push(v.tag());
     match v {
         Value::Null => {}
         Value::Bool(b) => out.push(u8::from(b)),
         Value::I64(i) => out.extend_from_slice(&i.to_le_bytes()),
-        // `to_le_bytes` is a bit-cast, so NaN payloads and signed zero survive a
-        // round trip. Any float-to-float conversion here would not.
+        // Bit-cast: NaN payloads and signed zero round-trip.
         Value::F64(f) => out.extend_from_slice(&f.to_le_bytes()),
         Value::Str(s) => put_str32(out, s)?,
     }
     Ok(())
 }
-
-// ---------------------------------------------------------------------------
-// Decode
-// ---------------------------------------------------------------------------
 
 /// The fixed prefix of a frame, plus how far the frame extends.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -370,22 +277,13 @@ pub struct Prefix<'a> {
     pub epoch: u32,
     pub series: &'a str,
     pub id: &'a str,
-    /// Total bytes this frame occupies, including `len` and `crc32`. Advance the
-    /// cursor by this to reach the next frame.
+    /// Total frame bytes, including `len` and `crc32`.
     pub frame_len: usize,
 }
 
-/// Verify a frame's integrity and read only its fixed prefix.
-///
-/// The server's `append_raw` hot path: check `len` against `max_record_bytes`,
-/// verify the CRC — so the frame is intact and self-delimiting — then read `ts`,
-/// `epoch`, `series`, `id` and stop. Never walks `keys`, `extra` or `data`, which
-/// is the point: validating those per record would put work on ingest that the
-/// hourly flush amortises.
-///
-/// So a frame that passes here can still fail [`decode`] — a malformed `keys`
-/// section survives a correct CRC. That is why the flush treats a decode failure
-/// as one rejected record rather than an impossibility.
+/// Check `len` and the CRC, then read only the fixed prefix: the `append_raw` hot
+/// path. `keys`/`extra`/`data` are not walked, so a frame passing here can still
+/// fail [`decode`].
 pub fn validate_prefix<'a>(buf: &'a [u8], max_record_bytes: usize) -> DecodeResult<Prefix<'a>> {
     let (payload, frame_len) = frame_payload(buf, max_record_bytes)?;
     let mut c = Cursor::new(payload);
@@ -402,15 +300,10 @@ pub fn validate_prefix<'a>(buf: &'a [u8], max_record_bytes: usize) -> DecodeResu
     })
 }
 
-/// Decode one frame from the front of `buf`, returning it and the bytes consumed.
+/// Decode one CRC-checked frame from the front of `buf`; returns it and its length.
 ///
-/// `key_count` is the arity of the schema for this frame's epoch — see the module
-/// docs for why the caller supplies it. `keys` and `extra` are caller-owned
-/// scratch, cleared and refilled, so a decode loop allocates only up to their
-/// high-water mark; their contents after an error are unspecified.
-///
-/// The decoder allocates nothing itself and bounds-checks every read against the
-/// payload, so no input can make it panic or read past the buffer.
+/// `key_count` is the arity of the frame's epoch. `keys`/`extra` are cleared and
+/// refilled (unspecified after an error). Allocates nothing and never panics.
 pub fn decode<'a>(
     buf: &'a [u8],
     key_count: usize,
@@ -419,6 +312,43 @@ pub fn decode<'a>(
     extra: &mut Vec<(&'a str, &'a str)>,
 ) -> DecodeResult<(RecordRef<'a>, usize)> {
     let (payload, frame_len) = frame_payload(buf, max_record_bytes)?;
+    decode_payload(payload, frame_len, key_count, keys, extra)
+}
+
+/// [`decode`] without the CRC, for frames this process already verified (the flush
+/// checks each frame once at segment read). Lengths and bounds are still checked.
+pub fn decode_verified<'a>(
+    buf: &'a [u8],
+    key_count: usize,
+    keys: &mut Vec<Value<'a>>,
+    extra: &mut Vec<(&'a str, &'a str)>,
+) -> DecodeResult<(RecordRef<'a>, usize)> {
+    let (payload, frame_len) = frame_extent(buf, usize::MAX)?;
+    decode_payload(payload, frame_len, key_count, keys, extra)
+}
+
+/// The flush merge's sort key: `(ts, raw id bytes, frame length)`. No CRC or
+/// UTF-8 check (done at segment read); byte order on `id` equals `str` order.
+pub fn verified_sort_key(buf: &[u8]) -> DecodeResult<(u64, &[u8], usize)> {
+    let (payload, frame_len) = frame_extent(buf, usize::MAX)?;
+    let mut c = Cursor::new(payload);
+    let ts = c.u64()?;
+    let _epoch = c.u32()?;
+    let series_len = c.u16()? as usize;
+    c.take(series_len)?;
+    let id_len = c.u16()? as usize;
+    let id = c.take(id_len)?;
+    Ok((ts, id, frame_len))
+}
+
+/// The shared body of [`decode`] and [`decode_verified`].
+fn decode_payload<'a>(
+    payload: &'a [u8],
+    frame_len: usize,
+    key_count: usize,
+    keys: &mut Vec<Value<'a>>,
+    extra: &mut Vec<(&'a str, &'a str)>,
+) -> DecodeResult<(RecordRef<'a>, usize)> {
     keys.clear();
     extra.clear();
 
@@ -441,10 +371,8 @@ pub fn decode<'a>(
 
     let data = c.str32()?;
 
-    // The frame declared its own length, so leftover bytes mean the sections
-    // inside disagree with it -- most often a key count that does not match the
-    // schema the frame was written under. Silently ignoring the tail would hand
-    // the caller a plausible record built from the wrong bytes.
+    // Leftover bytes mean the sections disagree with `len` (usually a wrong key
+    // count); never return a record built from misaligned bytes.
     if !c.is_empty() {
         return Err(corrupt("trailing bytes after data section"));
     }
@@ -461,16 +389,22 @@ pub fn decode<'a>(
     ))
 }
 
-/// Split `len` and `crc32` off the front of `buf`, returning the verified payload
-/// and the frame's total size.
-///
-/// The order of checks is the safety property. `len` is bounded against
-/// `max_record_bytes` **before** the buffer is consulted for that many bytes and
-/// before anything is reserved, so a corrupt length is corruption rather than a
-/// demand for gigabytes — and why an over-large `len` is `Corrupt`, not
-/// `Truncated`: "wait for more bytes" is the wrong answer to a length the format
-/// can never produce.
+/// Split off `len` and `crc32`, returning the CRC-verified payload and frame size.
+/// `len` is bounded by `max_record_bytes` before the buffer is consulted, so a
+/// bad length is `Corrupt`, never a request to wait for gigabytes.
 fn frame_payload(buf: &[u8], max_record_bytes: usize) -> DecodeResult<(&[u8], usize)> {
+    let (payload, frame_len) = frame_extent(buf, max_record_bytes)?;
+    let mut h = crc32fast::Hasher::new();
+    h.update(&buf[..4]);
+    h.update(payload);
+    if h.finalize() != u32::from_le_bytes(buf[4..8].try_into().unwrap()) {
+        return Err(corrupt("crc32 mismatch"));
+    }
+    Ok((payload, frame_len))
+}
+
+/// The length checks of [`frame_payload`], without the CRC.
+fn frame_extent(buf: &[u8], max_record_bytes: usize) -> DecodeResult<(&[u8], usize)> {
     if buf.len() < FRAME_HEADER_BYTES {
         return Err(DecodeError::Truncated {
             needed: FRAME_HEADER_BYTES,
@@ -485,8 +419,7 @@ fn frame_payload(buf: &[u8], max_record_bytes: usize) -> DecodeResult<(&[u8], us
         return Err(corrupt("length over max_record_bytes"));
     }
 
-    // `len` is now known to be small, so this addition cannot overflow and the
-    // buffer check that follows cannot be tricked by a wrapped total.
+    // `len` is bounded, so this cannot overflow.
     let frame_len = FRAME_HEADER_BYTES + len;
     if buf.len() < frame_len {
         return Err(DecodeError::Truncated {
@@ -495,21 +428,11 @@ fn frame_payload(buf: &[u8], max_record_bytes: usize) -> DecodeResult<(&[u8], us
         });
     }
 
-    let payload = &buf[FRAME_HEADER_BYTES..frame_len];
-    let mut h = crc32fast::Hasher::new();
-    h.update(&buf[..4]);
-    h.update(payload);
-    if h.finalize() != u32::from_le_bytes(buf[4..8].try_into().unwrap()) {
-        return Err(corrupt("crc32 mismatch"));
-    }
-    Ok((payload, frame_len))
+    Ok((&buf[FRAME_HEADER_BYTES..frame_len], frame_len))
 }
 
-/// A bounds-checked forward reader over one frame's payload.
-///
-/// Every overrun is [`DecodeError::Corrupt`], never `Truncated`: the payload is
-/// exactly as long as the frame said and the CRC agreed, so running out of bytes
-/// inside it means the contents contradict the length.
+/// A bounds-checked reader over one payload. Overruns are `Corrupt`: the payload
+/// length is known, so running out means the contents contradict it.
 #[derive(Debug)]
 struct Cursor<'a> {
     buf: &'a [u8],
@@ -526,8 +449,7 @@ impl<'a> Cursor<'a> {
     }
 
     fn take(&mut self, n: usize) -> DecodeResult<&'a [u8]> {
-        // Checked addition, not `pos + n`: `n` comes from a length field on
-        // disk, so on a 32-bit target it can be large enough to wrap.
+        // Checked: `n` comes from disk and may wrap on 32-bit targets.
         let end = self
             .pos
             .checked_add(n)
@@ -582,9 +504,7 @@ impl<'a> Cursor<'a> {
             tag::BOOL => match self.u8()? {
                 0 => Value::Bool(false),
                 1 => Value::Bool(true),
-                // Accepting any non-zero byte as `true` would let two different
-                // frames mean the same record, breaking the byte-identical
-                // re-encode this format depends on.
+                // Only 0/1, so each record has exactly one encoding.
                 _ => return Err(corrupt("bool value is neither 0 nor 1")),
             },
             tag::I64 => Value::I64(self.i64()?),
@@ -595,12 +515,8 @@ impl<'a> Cursor<'a> {
     }
 }
 
-/// Recompute a frame's CRC after a test has forged its bytes.
-///
-/// Lets a test build a frame that passes the integrity check and still fails to
-/// decode — the "poison frame" an ill-behaved client can get past `append_raw`,
-/// which three modules need to manufacture. Shared, because three copies of the
-/// CRC layout is three places to miss when it changes.
+/// Recompute a frame's CRC after a test forged its bytes (a "poison frame" that
+/// passes `append_raw` but fails [`decode`]).
 #[cfg(test)]
 pub(crate) fn reseal(frame: &mut [u8]) {
     let mut h = crc32fast::Hasher::new();
@@ -676,8 +592,7 @@ mod tests {
 
     #[test]
     fn float_bits_survive_exactly() {
-        // NaN payloads and signed zero are only preserved by a bit-cast, and
-        // `Value`'s PartialEq cannot see the difference -- so compare bits.
+        // `Value`'s PartialEq can't see NaN payloads or -0.0, so compare bits.
         for bits in [
             f64::NAN.to_bits(),
             (-f64::NAN).to_bits(),
@@ -699,8 +614,7 @@ mod tests {
 
     #[test]
     fn round_trips_the_empty_shapes() {
-        // Empty id, no keys, no extra, empty data -- every optional section at
-        // its minimum at once.
+        // Every optional section at its minimum.
         let buf = frame("s", 0, &row(0, "", &[], &[], ""));
         assert_eq!(buf.len(), FRAME_HEADER_BYTES + MIN_PAYLOAD_BYTES + 1); // +1 for "s"
 
@@ -713,9 +627,7 @@ mod tests {
         assert!(ex.is_empty());
     }
 
-    /// `extra` becomes a Parquet MAP, and a MAP with a repeated key is not a
-    /// well-formed value: `extra['k']` has no answer, and a reader rejects the
-    /// whole file rather than the offending row.
+    /// `extra` becomes a Parquet MAP, where a repeated key is malformed.
     #[test]
     fn duplicate_extra_names_collapse_to_the_first_in_canonical_order() {
         let decode_extra = |frame: &[u8]| -> Vec<(String, String)> {
@@ -739,16 +651,14 @@ mod tests {
             ]
         );
 
-        // Already-sorted input with duplicates must collapse identically -- the
-        // fast path is only a fast path if it agrees with the slow one.
+        // The canonical fast path must agree with the slow one.
         let sorted = [("a", "1"), ("a", "3"), ("b", "9")];
         assert_eq!(
             decode_extra(&frame("s", 1, &row(1, "i", &[], &sorted, "d"))),
             got
         );
 
-        // And the collapsed form re-encodes to the same bytes, which is what
-        // makes a replayed flush reproducible.
+        // ...and the collapsed form re-encodes identically.
         let once = frame("s", 1, &row(1, "i", &[], &dupes, "d"));
         let pairs: Vec<(&str, &str)> = [("a", "1"), ("b", "9")].to_vec();
         assert_eq!(once, frame("s", 1, &row(1, "i", &[], &pairs, "d")));
@@ -779,8 +689,7 @@ mod tests {
             frame("s", 1, &row(1, "i", &[], &dup_b, "d")),
         );
 
-        // Sorting is by UTF-8 byte order, which is what a decoded frame comes
-        // back in -- so decode/re-encode is a fixed point.
+        // UTF-8 byte order is decode order, so decode/re-encode is a fixed point.
         let (mut ks, mut ex) = (Vec::new(), Vec::new());
         decode(&canonical, 0, MAX, &mut ks, &mut ex).unwrap();
         let reencoded = frame("s", 1, &row(1, "i", &ks, &ex, "d"));
@@ -789,8 +698,7 @@ mod tests {
 
     #[test]
     fn encoding_is_deterministic_across_a_shared_buffer() {
-        // Two frames appended to one buffer must be byte-identical to the same
-        // two encoded separately: no state leaks between calls.
+        // No state leaks between calls.
         let r = row(9, "id", &[Value::I64(1)], &[("b", "2"), ("a", "1")], "d");
         let mut enc = Encoder::default();
         let mut both = Vec::new();
@@ -803,8 +711,6 @@ mod tests {
 
     #[test]
     fn a_failed_encode_leaves_the_buffer_untouched() {
-        // A half-written frame in a WAL buffer is indistinguishable from a real
-        // one, so a rejected record must not leave a trace.
         let mut out = Vec::new();
         encode(&mut out, "s", 1, &row(1, "ok", &[], &[], "d")).unwrap();
         let good = out.clone();
@@ -875,10 +781,7 @@ mod tests {
         );
         assert_eq!(p.frame_len, used);
 
-        // The poison frame: a corrupt `keys` section under a *valid* CRC, which
-        // is what an ill-behaved client can produce. `append_raw` accepts it --
-        // it never looks past the prefix -- and the flush is where it surfaces,
-        // as one rejected record rather than a failed flush.
+        // Poison frame: a corrupt `keys` section under a valid CRC passes the prefix.
         let mut poison = buf.clone();
         let keys_at = FRAME_HEADER_BYTES + 8 + 4 + 2 + "trades".len() + 2 + r.id.len();
         poison[keys_at] = 0x7f; // not a known tag
@@ -902,10 +805,7 @@ mod tests {
         let buf = frame("s", 1, &row(1, "i", &keys, &[("a", "b")], "d"));
         let (mut ks, mut ex) = (Vec::new(), Vec::new());
 
-        // Decoding under the wrong arity walks the sections out of step, which
-        // is exactly how a frame from another epoch would be misread. The
-        // trailing-bytes check is what turns that into an error instead of a
-        // record assembled from the wrong offsets.
+        // The trailing-bytes check turns a wrong arity into an error.
         for n in [0usize, 1, 2, 4, 100] {
             let e = decode(&buf, n, MAX, &mut ks, &mut ex);
             assert!(
@@ -920,9 +820,7 @@ mod tests {
 
     #[test]
     fn an_implausible_length_is_rejected_before_anything_is_reserved() {
-        // The whole point: 8 bytes of buffer claiming a 4 GiB payload. If the
-        // cap were checked after the buffer-length check we would answer
-        // "Truncated" and a streaming reader would dutifully try to buffer 4 GiB.
+        // 8 bytes claiming a 4 GiB payload: Corrupt, not Truncated.
         let mut buf = Vec::new();
         buf.extend_from_slice(&u32::MAX.to_le_bytes());
         buf.extend_from_slice(&0u32.to_le_bytes());
@@ -932,13 +830,11 @@ mod tests {
         assert!(e.is_corrupt(), "got {e:?}");
         assert!(validate_prefix(&buf, MAX).unwrap_err().is_corrupt());
 
-        // Nothing was reserved: the decoder allocates only by pushing values it
-        // has already read, so a rejected frame cannot grow the scratch at all.
+        // Nothing was reserved.
         assert_eq!(ks.capacity(), 0);
         assert_eq!(ex.capacity(), 0);
 
-        // The same holds for a length that is merely over the configured limit,
-        // and the limit is honoured even when the buffer could satisfy it.
+        // Also for a length merely over the configured limit.
         let real = frame("s", 1, &row(1, "i", &[], &[], "0123456789"));
         assert!(decode(&real, 0, MAX, &mut ks, &mut ex).is_ok());
         let tight = real.len() - FRAME_HEADER_BYTES - 1;
@@ -979,9 +875,7 @@ mod tests {
         data: &'static str,
     }
 
-    /// A corpus of frames covering every section at both its empty and its
-    /// populated shape. Every frame carries the same key arity so a decode loop
-    /// needs no schema lookup.
+    /// Every frame shares this key arity, so decoding needs no schema.
     const CORPUS_KEYS: usize = 5;
 
     fn corpus() -> (Vec<u8>, Vec<Case>) {
@@ -1013,9 +907,7 @@ mod tests {
             Case {
                 series: "unicode-✓",
                 epoch: u32::MAX,
-                // The extreme of the `ts` field's range. The codec carries eight
-                // bytes and asks no questions; the accept window is what decides
-                // which of them are plausible.
+                // The codec carries any `ts`; the accept window judges it.
                 ts: u64::MAX,
                 id: "ünïcödé id",
                 keys: vec![
@@ -1058,9 +950,7 @@ mod tests {
         while at < buf.len() {
             match decode(&buf[at..], CORPUS_KEYS, MAX, &mut ks, &mut ex) {
                 Ok((rec, used)) => {
-                    // A decode that succeeds must be *right*. Returning a
-                    // plausible-but-wrong record is the failure this whole test
-                    // exists to rule out.
+                    // A successful decode must return the right record.
                     assert!(n < cases.len(), "decoded more frames than were encoded");
                     let c = &cases[n];
                     assert_eq!(rec.ts, c.ts);
@@ -1087,8 +977,7 @@ mod tests {
         for cut in 0..buf.len() {
             let (n, err) = scan(&buf[..cut], &cases);
             match err {
-                // A cut inside a frame must say "truncated" -- that is the
-                // signal recovery uses to truncate the segment and carry on.
+                // A cut inside a frame must be Truncated...
                 Some(e) => assert!(e.is_truncated(), "prefix of {cut} bytes gave {e:?}"),
                 // ...unless the cut fell exactly on a frame boundary.
                 None => assert!(n < cases.len() || cut == buf.len()),
@@ -1101,10 +990,7 @@ mod tests {
         let (clean, cases) = corpus();
 
         for i in 0..clean.len() {
-            // XOR 0xff is a 8-bit burst; CRC-32 detects every burst up to 32
-            // bits, so *some* frame must fail. Which one, and whether the
-            // damaged length reads as truncated or corrupt, is not fixed -- but
-            // "decoded everything successfully" would mean a silent wrong read.
+            // CRC-32 catches every burst up to 32 bits, so some frame must fail.
             let mut buf = clean.clone();
             buf[i] ^= 0xff;
             let (n, err) = scan(&buf, &cases);
@@ -1128,9 +1014,7 @@ mod tests {
 
     #[test]
     fn arbitrary_bytes_never_panic() {
-        // Not a substitute for the structured tests above -- insurance that the
-        // decoder is total. Any panic here is an out-of-bounds read that the
-        // release build would turn into something worse.
+        // Insurance that the decoder is total: a panic is an out-of-bounds read.
         let mut rng = 0x2545_f491_4f6c_dd1du64;
         let mut next = move || {
             rng ^= rng << 13;
@@ -1141,8 +1025,7 @@ mod tests {
 
         let (clean, _) = corpus();
         for round in 0..2_000 {
-            // Declared inside the loop only because the scratch borrows from
-            // the buffer it decoded out of, which changes every round.
+            // Per round: the scratch borrows from this round's buffer.
             let (mut ks, mut ex) = (Vec::new(), Vec::new());
             let mut buf = if round % 2 == 0 {
                 clean.clone()

@@ -1,10 +1,4 @@
 //! End-to-end tests over the whole engine: open, append, flush, restart.
-//!
-//! The unit tests each prove one module in isolation. These prove the seams
-//! between them, which is where an integration bug actually lives: a record
-//! written through `Engine::append` has to survive encoding, the WAL, a fsync, a
-//! restart, decoding, sorting, dedup and the Parquet writer before a reader sees
-//! it, and any one of those handoffs can lose or reshape it.
 
 use std::path::Path;
 
@@ -13,14 +7,12 @@ use orc::engine::Engine;
 use orc::flush::planner::series_dir;
 use orc::record::{Row, Value};
 
-/// Epoch microseconds for 2026-08-08T13:00:00Z, inside the default accept
-/// window (which starts at 2000-01-01 and ends 24h after now).
+/// 2026-08-08T13:00:00Z in epoch microseconds, inside the default accept window.
 const T13: u64 = 1_786_194_000_000_000;
 const HOUR_US: u64 = 3_600_000_000;
 
 fn config_json(dir: &Path) -> String {
-    // `interval_ms: 0` disables the flush timer, so every test below controls
-    // exactly when a flush happens. The timer has its own test.
+    // `interval_ms: 0` disables the flush timer; tests flush explicitly.
     format!(
         r#"{{
           "data_dir": {},
@@ -113,15 +105,12 @@ fn append_flush_and_read_back() {
     assert_eq!(outcome.frames_rejected, 0);
     assert_eq!(parquet_rows(dir.path(), "trades"), 100);
 
-    // A series that never received a record must not produce a directory full
-    // of empty files.
+    // An empty series writes no files.
     assert_eq!(parquet_rows(dir.path(), "quotes"), 0);
 }
 
 #[test]
 fn records_survive_a_restart_without_an_explicit_flush() {
-    // The case the engine exists for: it restarts constantly, and a restart
-    // between append and flush must not lose anything.
     let dir = tempfile::tempdir().unwrap();
     {
         let engine = open(dir.path());
@@ -140,7 +129,7 @@ fn records_survive_a_restart_without_an_explicit_flush() {
                 )
                 .unwrap();
         }
-        // No flush: drop closes the WAL, leaving durable segments behind.
+        // No flush: drop leaves durable WAL segments.
     }
 
     let engine = open(dir.path());
@@ -182,7 +171,6 @@ fn duplicates_collapse_and_hours_split() {
     assert_eq!(outcome.rows_deduplicated, 1, "one duplicate dropped");
     assert_eq!(outcome.rows_written, 3);
 
-    // No file may span two hour partitions.
     let files = parquet_files(dir.path(), "trades");
     assert_eq!(files.len(), 2, "two hours, two files: {files:?}");
     assert_eq!(parquet_rows(dir.path(), "trades"), 3);
@@ -207,8 +195,7 @@ fn bad_timestamps_are_rejected_with_their_units_named() {
         )
     };
 
-    // The same instant in the three wrong units. Each must be refused, which is
-    // what makes the accept window double as a unit check.
+    // The accept window doubles as a unit check.
     assert!(attempt(T13 / 1_000_000).is_err(), "seconds");
     assert!(attempt(T13 / 1_000).is_err(), "milliseconds");
     assert!(attempt(T13.saturating_mul(1_000)).is_err(), "nanoseconds");
@@ -231,11 +218,8 @@ fn a_second_engine_cannot_open_the_same_directory() {
     );
 }
 
-/// A schema epoch is minted in memory at open and stamped into every frame from
-/// that moment. If it is not written down, the next start re-mints the same
-/// number for whatever the config says then — and yesterday's frames get decoded
-/// against today's key list. When the arity happens to match, that is silent:
-/// the values land under the wrong column names with no error and no counter.
+/// The epoch stamped into frames must be persisted at open, or a restart with a
+/// changed key list could reuse it and silently decode old frames into wrong columns.
 #[test]
 fn a_schema_epoch_is_durable_before_the_first_flush() {
     let dir = tempfile::tempdir().unwrap();
@@ -251,9 +235,7 @@ fn a_schema_epoch_is_durable_before_the_first_flush() {
         );
     }
 
-    // Same key names and types as `config_json`, but renamed: with the epoch
-    // lost, this would be minted as epoch 0 again and the frames above would
-    // decode against it -- same arity, same types, wrong columns.
+    // Same arity and types, renamed keys.
     let renamed = format!(
         r#"{{
           "data_dir": {},
@@ -274,17 +256,13 @@ fn a_schema_epoch_is_durable_before_the_first_flush() {
         "a renamed key list is a new epoch, not a reuse of the old number"
     );
 
-    // And the old frames still flush under the schema they were written with.
     let outcome = engine.flush().unwrap();
     assert_eq!(outcome.rows_written, 1);
     assert_eq!(outcome.frames_rejected, 0, "nothing was misdecoded");
 }
 
-/// Files are renamed into `series/` before the manifest commits, and the name
-/// encodes the consumed segment range. A flush that fails after the rename
-/// leaves a real file whose rows the next flush — now covering a wider range,
-/// hence a different name — writes again beside it. Both match the reader's
-/// glob, so every row in the overlap is returned twice.
+/// Parquet in `series/` past the watermark (only older binaries, which published
+/// before committing, leave these) is deleted at open; its rows are still in the WAL.
 #[test]
 fn an_uncommitted_flushs_output_is_swept_instead_of_being_duplicated() {
     let dir = tempfile::tempdir().unwrap();
@@ -300,16 +278,11 @@ fn an_uncommitted_flushs_output_is_swept_instead_of_being_duplicated() {
     let committed = parquet_files(dir.path(), "trades");
     assert_eq!(committed.len(), 1, "one committed file to start from");
 
-    // Exactly what an interrupted flush leaves: a valid Parquet file, correctly
-    // named for a segment range wider than anything committed, holding rows a
-    // later flush will write again. Copied from the real one so it is a genuine
-    // readable file rather than a stub.
+    // A real file named for a range past the watermark.
     let orphan = hour_dir.join("0000000001-0000009999.e0.parquet");
     std::fs::copy(&committed[0], &orphan).unwrap();
     assert_eq!(parquet_rows(dir.path(), "trades"), 4, "duplicated for now");
 
-    // Opening sweeps it: its range reaches past `last_flushed_segment`, which
-    // only a flush that never committed can produce.
     let engine = open(dir.path());
     assert!(!orphan.exists(), "the orphan must be gone");
     assert_eq!(
@@ -318,7 +291,6 @@ fn an_uncommitted_flushs_output_is_swept_instead_of_being_duplicated() {
         "and the committed file must not be"
     );
 
-    // A file the engine did not write is not its business, swept or otherwise.
     let stranger = hour_dir.join("notes.txt");
     std::fs::write(&stranger, b"mine").unwrap();
     drop(engine);
@@ -326,21 +298,18 @@ fn an_uncommitted_flushs_output_is_swept_instead_of_being_duplicated() {
     assert!(stranger.exists(), "unrecognised names are left alone");
 }
 
-/// A staged file past the watermark is from a flush that never committed, and
-/// its name embeds the segment range — so the next flush writes a
-/// differently-named file and never reclaims it. Left alone, every interrupted
-/// flush leaks its whole output forever.
+/// Uncommitted staged files in `tmp/` (nested or legacy flat) are deleted at open.
 #[test]
 fn staged_files_from_an_interrupted_flush_are_reclaimed() {
     let dir = tempfile::tempdir().unwrap();
     drop(open(dir.path())); // a manifest, so the watermark is a real 0
 
     let tmp = dir.path().join("tmp");
-    // The flat layout an earlier binary staged into, before committing.
+    // Legacy flat layout.
     std::fs::create_dir_all(&tmp).unwrap();
     let legacy = tmp.join("trades.hour=2026-08-08T13.0000000001-0000000002.e0.parquet");
     std::fs::write(&legacy, vec![0u8; 4096]).unwrap();
-    // The nested layout, staged by a flush that failed before its commit.
+    // Current `tmp/<series>/<hour>/` layout.
     let hour = tmp.join("trades").join("hour=2026-08-08T13");
     std::fs::create_dir_all(&hour).unwrap();
     let staged = hour.join("0000000001-0000000002.e0.parquet");
@@ -362,9 +331,8 @@ fn staged_files_from_an_interrupted_flush_are_reclaimed() {
     );
 }
 
-/// A flush that committed and then failed to publish leaves the only copy of
-/// its rows in `tmp/` — the segments are already deleted. Open must finish the
-/// job, not discard it.
+/// Committed files left in `tmp/` by a failed publish are the only copy of their
+/// rows; open promotes them into `series/`.
 #[test]
 fn committed_staged_files_are_published_at_open() {
     let dir = tempfile::tempdir().unwrap();
@@ -378,7 +346,7 @@ fn committed_staged_files_are_published_at_open() {
     let published = parquet_files(dir.path(), "trades");
     assert_eq!(published.len(), 1);
 
-    // Put it back where a flush interrupted between commit and publish leaves it.
+    // Simulate a crash between commit and publish.
     let rel = published[0]
         .strip_prefix(dir.path().join("series"))
         .unwrap();
@@ -393,8 +361,8 @@ fn committed_staged_files_are_published_at_open() {
     assert_eq!(parquet_rows(dir.path(), "trades"), 2);
 }
 
-/// The contract an external mover relies on: whatever it finds in `series/`
-/// is committed, so moving it away and carrying on never loses or repeats a row.
+/// `series/` holds only committed files, so an external mover can take them
+/// without losing or repeating a row.
 #[test]
 fn moving_published_files_away_loses_and_repeats_nothing() {
     let dir = tempfile::tempdir().unwrap();
@@ -421,7 +389,6 @@ fn moving_published_files_away_loses_and_repeats_nothing() {
         push(&e, &trades, T13 + HOUR_US + 1, "d");
         e.flush().unwrap();
     }
-    // A restart in between must neither resurrect nor sweep anything.
     let e = open(dir.path());
     let trades = e.series("trades").unwrap();
     push(&e, &trades, T13 + 2, "e");
@@ -438,8 +405,7 @@ fn moving_published_files_away_loses_and_repeats_nothing() {
     assert!(parquet_files(dir.path(), "trades").is_empty());
 }
 
-/// Staged files can be the only copy of committed rows, so a lost manifest must
-/// stop the engine for them just as it does for published ones.
+/// A lost manifest also refuses to start over committed staged files.
 #[test]
 fn a_lost_manifest_protects_committed_staged_files_too() {
     let dir = tempfile::tempdir().unwrap();
@@ -464,9 +430,7 @@ fn a_lost_manifest_protects_committed_staged_files_too() {
     assert!(staged.exists(), "and the staged file was not touched");
 }
 
-/// The flush the whole design is described in terms of. Nothing scheduled one:
-/// `flush.interval_ms` had no consumer, so Parquet only ever appeared at startup
-/// or on an explicit request, and a long-running server grew WAL forever.
+/// `flush.interval_ms` triggers flushes on its own.
 #[test]
 fn the_interval_timer_flushes_without_being_asked() {
     let dir = tempfile::tempdir().unwrap();
@@ -497,8 +461,6 @@ fn the_interval_timer_flushes_without_being_asked() {
             .unwrap();
     }
 
-    // Generous: the point is that it happens at all, not when. Polling rather
-    // than one long sleep keeps a passing run fast.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     while parquet_rows(dir.path(), "trades") < 10 && std::time::Instant::now() < deadline {
         std::thread::sleep(std::time::Duration::from_millis(20));
@@ -509,13 +471,10 @@ fn the_interval_timer_flushes_without_being_asked() {
         "the timer must flush with no explicit call"
     );
 
-    // And it must not keep the process alive or wedge the close.
     engine.close().unwrap();
 }
 
-/// `close` joins the timer, and `Drop` calls `close`. If the join were reachable
-/// from the timer thread itself it would deadlock; if it were skipped, a dropped
-/// engine would leave a thread flushing a directory it no longer owns.
+/// `Drop` → `close` joins the timer thread, so it never outlives the engine.
 #[test]
 fn dropping_an_engine_stops_its_flush_timer() {
     let dir = tempfile::tempdir().unwrap();
@@ -532,17 +491,13 @@ fn dropping_an_engine_stops_its_flush_timer() {
     std::thread::sleep(std::time::Duration::from_millis(60));
     drop(engine);
 
-    // The directory lock is released by the same Drop, so a second engine can
-    // only open if the first shut down completely.
+    // Reopening proves the lock was released.
     let config: Config = serde_json::from_str(&config_json).unwrap();
     Engine::open(config).expect("the lock must have been released");
 }
 
-/// `manifest.json` is the only record of how far the flush got. Without it the
-/// watermark reads as 0, under which every committed Parquet file looks like
-/// debris from a flush that never committed — and the startup sweep deleted the
-/// entire dataset. There is no way to recover the watermark from the filenames,
-/// so the engine stops and says so.
+/// Without `manifest.json` the watermark reads as 0 and the sweep would delete
+/// every file, so open refuses instead.
 #[test]
 fn a_lost_manifest_stops_the_engine_instead_of_wiping_the_dataset() {
     let dir = tempfile::tempdir().unwrap();
@@ -569,7 +524,7 @@ fn a_lost_manifest_stops_the_engine_instead_of_wiping_the_dataset() {
         "a refusal must not be a deletion"
     );
 
-    // Putting the manifest back is all it takes; the message says as much.
+    // Restoring the manifest is enough.
     std::fs::write(
         dir.path().join("manifest.json"),
         serde_json::to_vec(&serde_json::json!({"last_flushed_segment": 1})).unwrap(),
@@ -584,8 +539,6 @@ fn a_lost_manifest_stops_the_engine_instead_of_wiping_the_dataset() {
     drop(engine);
 }
 
-/// A fresh directory has no output, so the check above must not stand between
-/// an engine and its first start.
 #[test]
 fn a_fresh_directory_still_opens_without_a_manifest() {
     let dir = tempfile::tempdir().unwrap();
@@ -610,11 +563,8 @@ fn flush_is_a_noop_when_there_is_nothing_to_do() {
     assert!(parquet_files(dir.path(), "trades").is_empty());
 }
 
-/// A flush that renamed one partition into `series/` and then failed on the next
-/// leaves a real Parquet file the manifest never committed. Startup sweeps it —
-/// but the interval timer means a server runs for months without a restart, and
-/// the next flush covers a wider segment range, so it writes those same rows
-/// again under a different name. Both match the reader's glob.
+/// A publish that fails after commit leaves the committed file in `tmp/`; the
+/// next flush (no restart) promotes it instead of rewriting its rows.
 #[test]
 fn a_flush_that_failed_part_way_does_not_leave_duplicates_behind() {
     let dir = tempfile::tempdir().unwrap();
@@ -623,9 +573,7 @@ fn a_flush_that_failed_part_way_does_not_leave_duplicates_behind() {
     push(&e, &trades, T13, "a");
     push(&e, &trades, T13 + HOUR_US, "b");
 
-    // Fail publishing the *second* partition: rows are sorted by ts, so the
-    // first hour has already been renamed into place by the time this one is
-    // reached. Publishing happens after the commit, so both are committed.
+    // Block the second hour's publish; the first is published, both are committed.
     let hour = orc::time::hour_partition(T13 + HOUR_US);
     let blocked = series_dir(dir.path(), "trades").join(&hour);
     std::fs::create_dir_all(blocked.parent().unwrap()).unwrap();
@@ -644,8 +592,6 @@ fn a_flush_that_failed_part_way_does_not_leave_duplicates_behind() {
         "the second is committed but still staged"
     );
 
-    // Ingest carries on, so the next flush spans a wider segment range. It
-    // must publish the staged file first, not rewrite or lose its row.
     std::fs::remove_file(&blocked).unwrap();
     push(&e, &trades, T13 + 1, "c");
     e.flush().unwrap();

@@ -7,68 +7,43 @@ description = "Embeddable time-series engine: low-latency WAL ingest, periodic P
 license = "MIT"
 
 [features]
-# Nothing by default. The embeddable engine is the common case, and it must not
-# drag a C++ toolchain, cmake or a libzmq build into somebody's `cargo build`.
+# Nothing by default: the embeddable engine must not need cmake or a C++ toolchain.
 default = []
 
-# ZeroMQ transport. Enables both sides -- one process can be a server, a client,
-# or both. Library only: a program embedding the client gets zmq and nothing
-# else, because argument parsing and log formatting are the binaries' business.
+# ZeroMQ server and client. Library only: no arg parsing or log formatting.
 net = ["dep:zmq"]
 
-# What the shipped binaries need on top of `net`. Kept separate because clap and
-# tracing-subscriber are 18 crates that no library consumer has any use for.
+# The shipped binaries; clap and tracing-subscriber are of no use to library users.
 cli = ["net", "dep:clap", "dep:tracing-subscriber"]
 
 [dependencies]
-# Sanctioned: Parquet. Only `lz4` and `crc`; the default would also pull
-# snap/brotli/flate2/zstd/base64/simdutf8. `lz4` is one pure-Rust crate
-# (lz4_flex) and gives LZ4_RAW; zstd would make files ~35% smaller but costs 8
-# crates and a C compiler. `crc` gates Parquet's own page checksums onto crc32fast,
-# which we already depend on for WAL frames, so it is free.
-#
-# `arrow` is deliberately absent: an all-or-nothing feature costing 12 crates
-# (six arrow-*, flatbuffers, bitflags, base64, num-complex, rustc_version,
-# semver), of which arrow-ipc is pure toll -- we never touch IPC. All it does
-# for our schema is compute definition and repetition levels.
-# src/flush/parquet.rs computes them directly against the low-level writer, and
-# tests/parquet_reference.rs pins that the output is indistinguishable from what
-# ArrowWriter produced.
+# Only `lz4` (pure-Rust LZ4_RAW; zstd needs a C compiler) and `crc` (reuses crc32fast).
+# No `arrow` (12 crates): src/flush/parquet.rs uses the low-level writer instead.
 parquet = { version = "59.2", default-features = false, features = [
     "lz4",
     "crc",
 ] }
 
-# Sanctioned: JSON. Config, manifest and the control protocol.
+# Already pulled in by parquet; strings are sliced from one `Bytes` per column.
+bytes = "1"
+
+# Config, manifest and the control protocol.
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
-# Approved conveniences.
 crc32fast = "1.5"
 tracing = "0.1"
 
-# Optional: only with `net`. There is no way to link a system libzmq -- zmq-sys
-# 0.12's build script is nine lines that call `zeromq_src::Build::new()`
-# unconditionally, so enabling this always compiles libzmq and libsodium from C
-# source and always requires cmake and a C++ toolchain. That is the whole reason
-# it is behind a feature.
+# Behind `net` because it always builds libzmq from C (cmake + C++ toolchain).
 zmq = { version = "0.10", optional = true }
 
-# Optional: only with `cli`. `env-filter` is deliberately off -- it costs five
-# crates (regex-automata, regex-syntax, matchers, thread_local, sharded-slab) to
-# filter per target, and one binary has no targets worth filtering between.
+# Behind `cli`. No `env-filter`: five crates for nothing a single binary needs.
 clap = { version = "4.6", features = ["derive"], optional = true }
 tracing-subscriber = { version = "0.3", optional = true }
 
 [dev-dependencies]
 tempfile = "3.27"
-# Integration tests are a separate crate and cannot reach the library's own
-# dependencies, so the ones they use are declared again here.
-#
-# zmq is NOT here on purpose. Dev-dependencies cannot be feature-gated, so
-# declaring it would make plain `cargo test` build libzmq from source -- exactly
-# what putting the transport behind `net` was meant to prevent. The network
-# tests reach it through `orc::zmq` instead.
+# No zmq here: dev-deps can't be feature-gated; network tests use `orc::zmq`.
 serde_json = "1.0"
 
 [[bin]]
@@ -84,9 +59,7 @@ required-features = ["cli"]
 [profile.release]
 debug = 1
 
-# Examples need the transport; `two_processes.sh` also drives orc-cli, so it
-# asks for `cli`. Declared so `cargo build` stays pure Rust and does not try to
-# compile them.
+# Examples need the transport, so plain `cargo build` skips them.
 [[example]]
 name = "embedded_server"
 required-features = ["net"]

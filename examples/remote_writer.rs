@@ -1,16 +1,8 @@
-//! A separate process writing into someone else's engine over ZeroMQ.
-//!
-//! The counterpart to `embedded_server`: it never touches the data directory,
-//! only the socket. Records are encoded here in the same frame format the WAL
-//! uses, so the server appends the bytes it receives without transcoding them.
-//!
+//! Writes to `embedded_server` over ZeroMQ only. Optional args:
+//! `<ingest_endpoint> <control_endpoint>` (control defaults to ingest port + 1).
 //! ```sh
 //! cargo run --features net --example remote_writer -- tcp://127.0.0.1:5655
 //! ```
-//!
-//! Arguments, both optional: `<ingest_endpoint> <control_endpoint>`. The control
-//! endpoint defaults to the ingest port + 1, which is what the server defaults
-//! to as well.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -26,9 +18,7 @@ fn now_us() -> u64 {
 }
 
 fn main() -> std::process::ExitCode {
-    // Same shape as the shipped binaries: `main() -> Result` would print the
-    // error with `Debug`, which wraps a perfectly good sentence in
-    // `Error: Config("...")`.
+    // Not `main() -> Result`, which would print the error with `Debug`.
     match run() {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(e) => {
@@ -46,20 +36,15 @@ fn run() -> orc::Result<()> {
 
     let mut builder = Client::builder()
         .ingest(&ingest)
-        // Records per message. The client also splits on size, because a message
-        // over the server's `max_batch_bytes` is dropped by libzmq below the
-        // application, where neither side can report it.
+        // Records per message (also split by size).
         .batch(8)
-        // Block at the send high-water mark rather than dropping: a saturated
-        // server slows this process down instead of losing records silently.
+        // Block rather than drop when the queue is full.
         .on_full(OnFull::Block);
     if let Some(control) = args.next() {
         builder = builder.control(&control);
     }
 
-    // Connecting performs the schema handshake, which is not optional: keys
-    // travel positionally, so there is no frame to build until the server has
-    // said what order they go in and which epoch to stamp.
+    // Connecting performs the schema handshake.
     let mut client = builder.connect()?;
     let declared: Vec<&str> = client.series_names().collect();
     println!("connected to {ingest}; server declares {declared:?}");
@@ -78,12 +63,11 @@ fn run() -> orc::Result<()> {
             },
         )?;
     }
-    // Ingest is fire-and-forget: this only puts the buffered batch on the wire.
+    // Fire-and-forget: only puts the batch on the wire.
     client.flush()?;
     println!("sent {} records", client.stats().records_sent);
 
-    // Which is why the flush is a separate, synchronous request. Without it the
-    // records sit in the WAL until the server's own interval timer fires.
+    // A synchronous flush; otherwise records wait for the server's interval.
     match client.control(ControlRequest::Flush)? {
         ControlResponse::Flushed(f) => println!(
             "server flushed {} row(s) from segment(s) {:?}",

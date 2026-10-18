@@ -1,21 +1,8 @@
-//! One process that is both the database and a writer.
-//!
-//! It opens the engine, appends to it directly from a background thread, and at
-//! the same time binds a ZeroMQ server so other processes can write to the same
-//! data directory. Both writers land in the same WAL and the same Parquet files.
-//!
+//! One process that appends in-process and serves ZeroMQ for other writers.
+//! Optional args: `<data_dir> <ingest_endpoint> <control_endpoint>`; stop with `orc-cli shutdown`.
 //! ```sh
 //! cargo run --features net --example embedded_server -- ./data-example
 //! ```
-//!
-//! Arguments, all optional: `<data_dir> <ingest_endpoint> <control_endpoint>`.
-//! It serves until someone sends a `shutdown` on the control socket:
-//!
-//! ```sh
-//! cargo run --features cli --bin orc-cli -- --ingest tcp://127.0.0.1:5655 shutdown
-//! ```
-//!
-//! `examples/two_processes.sh` drives the whole thing end to end.
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -25,8 +12,7 @@ use orc::engine::Engine;
 use orc::record::Row;
 use orc::server::Server;
 
-/// Records carry epoch **microseconds**, UTC — not milliseconds, which is the
-/// mistake the accept window exists to catch.
+/// Timestamps are epoch **microseconds**, UTC.
 fn now_us() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -35,9 +21,7 @@ fn now_us() -> u64 {
 }
 
 fn main() -> std::process::ExitCode {
-    // Same shape as the shipped binaries: `main() -> Result` would print the
-    // error with `Debug`, which wraps a perfectly good sentence in
-    // `Error: Config("...")`.
+    // Not `main() -> Result`, which would print the error with `Debug`.
     match run() {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(e) => {
@@ -57,9 +41,7 @@ fn run() -> orc::Result<()> {
         .next()
         .unwrap_or_else(|| "tcp://127.0.0.1:5656".to_string());
 
-    // Built in code rather than read from `config.json`, so the example is one
-    // file. A real deployment writes the same fields to `<data_dir>/config.json`
-    // and calls `Config::load`.
+    // Normally `Config::load("<data_dir>/config.json")`.
     let config = Config {
         data_dir: data_dir.clone().into(),
         server: ServerConfig {
@@ -67,8 +49,7 @@ fn run() -> orc::Result<()> {
             control_endpoint: control,
             ..ServerConfig::default()
         },
-        // No declared keys: this series carries nothing but a timestamp and an
-        // id. Anything undeclared a writer sends would land in `extra`.
+        // No declared keys: just timestamp and id.
         series: vec![SeriesConfig {
             name: "pulse".to_string(),
             keys: Vec::new(),
@@ -76,13 +57,10 @@ fn run() -> orc::Result<()> {
         ..Config::default()
     };
 
-    // One engine, shared. The server holds a reference and so does the writer
-    // thread below -- appending in-process and appending over the socket are the
-    // same operation, and neither needs to know about the other.
+    // One engine shared by the server and the in-process writer.
     let engine = Arc::new(Engine::open(config.clone())?);
     let server = Server::bind(Arc::clone(&engine), &config)?;
 
-    // Resolved after binding, because a config may ask for port 0 or `*`.
     println!("data_dir {data_dir}");
     println!("ingest   {}", server.ingest_endpoint()?);
     println!("control  {}", server.control_endpoint()?);
@@ -91,8 +69,7 @@ fn run() -> orc::Result<()> {
     let local = {
         let engine = Arc::clone(&engine);
         std::thread::spawn(move || -> orc::Result<()> {
-            // Resolve once, outside the loop: this is the hash lookup that
-            // `append` is designed never to repeat.
+            // Resolve once, outside the loop.
             let pulse = engine.series("pulse")?;
             for i in 0..5 {
                 let id = format!("embedded-{i}");
@@ -113,8 +90,7 @@ fn run() -> orc::Result<()> {
         })
     };
 
-    // Blocks until a `shutdown` request. On the way out it drains whatever
-    // ZeroMQ still had queued and closes the engine, which flushes the WAL.
+    // Blocks until `shutdown`, then drains the queue and closes the engine.
     let served = server.run();
 
     match local.join() {

@@ -18,7 +18,7 @@ An embeddable time-series storage engine in Rust. Records go into a write-ahead 
                                                     series/<name>/hour=.../*.parquet
 ```
 
-- **Ingest never blocks on disk.** `append()` encodes into a thread-local buffer and copies it under a short mutex. A background committer thread owns `fsync`, so a process crash loses nothing already appended and a power cut loses at most one ~10 ms window.
+- **Ingest almost never waits on disk.** `append()` encodes into a thread-local buffer and copies it into a 256 KiB write buffer under a short mutex — ~125 ns median. A background committer thread flushes and fsyncs every ~10 ms, so a crash, process or power, loses at most that window. The exceptions are the tail: the append that fills the buffer pays its `write(2)` holding the lock, and a segment roll fsyncs with the lock held, so under sustained load expect occasional appends in the milliseconds.
 - **Every frame is self-describing.** It carries its own series name and its own schema epoch, so a WAL segment is interpretable with nothing but itself — no registry, no manifest. A lost `manifest.json` costs schema history, never the ability to tell what a record is.
 - **The write path is append-only.** No Parquet file is ever read back, merged or replaced. Files within an hour may overlap in time; each is internally sorted.
 
@@ -143,6 +143,7 @@ data/
     hour=2026-08-08T13/0000000041-0000000042.e7.parquet
     view.sql                        # generated; unions epochs, coalesces promotions
   tmp/trades/hour=.../              # staging; engine-private, never read it
+  runs/                             # flush scratch: sorted runs, removed when it ends
   rejects/                          # decoded but invalid records, capped
 ```
 
@@ -297,7 +298,7 @@ A **missing `manifest.json` refuses to start**, naming the directory. It is the 
 - **Recent data is invisible until it flushes.** A record is durable the instant it is appended, but no reader sees it for up to `interval_ms`. If you need fresher data, lower the interval and accept more files.
 - **Remote ingest is fire-and-forget.** PUSH/PULL has no acknowledgement, so a successful send is not proof of durability. Backpressure still works — the client blocks at the high-water mark by default rather than dropping silently.
 - **Deduplication covers one flush.** `(ts, id)` duplicates collapse within a flush window, not across them. Two id-less records sharing a timestamp are treated as the same event, so a producer emitting genuinely distinct events at identical microseconds must set `id`.
-- **A flush must fit in memory.** Every row of the segments being flushed is held until the last file is written. At high ingest rates an hour does not fit; lower `interval_ms` until external merge lands.
+- **A flush sorts in memory up to `flush.memory_budget_bytes` (256 MiB), then spills.** A window that fits is sorted in memory and writes nothing but Parquet. A larger one writes the overflow to `runs/` as sorted runs and merges them back, so it needs scratch disk about the size of the overflow. Peak memory is roughly the budget plus one segment and one row group, however much WAL the flush covers: a backlog costs disk and time, not RAM.
 - **No retention and no compaction.** Files accumulate forever unless you prune them yourself — see [Layout on disk](#layout-on-disk).
 - **No read path.** By design: point DuckDB, polars or Spark at the data directory.
 
@@ -308,6 +309,7 @@ Parquet, ZeroMQ and JSON are the sanctioned surface. Everything else is hand-rol
 | Crate                        | Where   | Why                                                                                             |
 | ---------------------------- | ------- | ----------------------------------------------------------------------------------------------- |
 | `parquet`                    | default | Output format. Written against the low-level API, so no Arrow.                                  |
+| `bytes`                      | default | Already pulled in by `parquet`; named so a row group's strings share one buffer.                |
 | `serde`, `serde_json`        | default | Config, manifest and control protocol — never the ingest path.                                  |
 | `crc32fast`, `tracing`       | default | Frame checksums and logging.                                                                    |
 | `zmq`                        | `net`   | Transport. Builds libzmq and libsodium from source, so this one needs cmake and a C++ compiler. |
@@ -319,11 +321,10 @@ Parquet output is LZ4_RAW-compressed. zstd would be ~35% smaller but costs eight
 
 ## Roadmap
 
-Working: durable WAL with group-commit fsync, crash recovery with truncate-and-amend, per-series schema evolution, hourly flush to sorted deduplicated Parquet with hour partitioning, ZeroMQ server and client, generated DuckDB views.
+Working: durable WAL with group-commit fsync, crash recovery with truncate-and-amend, per-series schema evolution, hourly flush to sorted deduplicated Parquet with hour partitioning, an external merge that keeps flush memory flat, ZeroMQ server and client, generated DuckDB views.
 
 Not yet:
 
-- **External merge** — per-segment sorted runs and a bounded-fan-in k-way merge, so flush memory stays flat regardless of window size.
 - **`reload-config` over the control socket** — the request exists and returns an explicit "not implemented" rather than pretending; restart to pick up config changes.
 - **Retention** — safe to do externally today (see above), but nothing built in.
 

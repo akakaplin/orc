@@ -1,14 +1,9 @@
-//! Error types for the engine's public surface.
-//!
-//! `Display` and `Error` are written by hand rather than derived. The enum is
-//! small, changes rarely, and deriving it would put a proc-macro crate (and its
-//! `syn` build) into every consumer's dependency graph for ten format strings.
+//! Engine error type. `Display`/`Error` are hand-written to avoid a proc-macro
+//! dependency.
 
 use crate::record::KeyType;
 
-/// Format version written into every WAL segment header and ZeroMQ batch header.
-///
-/// Bump this if the frame layout or any wire tag changes.
+/// Format version in every WAL segment and batch header; bump on any layout change.
 pub const FORMAT_VERSION: u16 = 1;
 
 /// Magic bytes identifying an orc WAL segment or batch: `"orc\0"` little-endian.
@@ -43,10 +38,8 @@ pub enum Error {
         limit: usize,
     },
 
-    /// A batch that would not survive the trip: libzmq refuses a message over
-    /// `server.max_batch_bytes` and drops it *below* the application, so the
-    /// server never sees it and cannot report it. Refusing on the sending side
-    /// is the only place the loss can be made visible.
+    /// Over `server.max_batch_bytes`: libzmq would silently drop it, so the
+    /// sender refuses it instead.
     BatchTooLarge {
         size: usize,
         limit: usize,
@@ -103,8 +96,6 @@ impl std::fmt::Display for Error {
                 "data directory {dir} is locked by a live process; \
                  pass --force-unlock only if you are certain it is stuck"
             ),
-            // Transparent: an io error already reads as a sentence, and wrapping
-            // it would bury the path the OS reported.
             Error::Io(e) => e.fmt(f),
             Error::Json(e) => write!(f, "json: {e}"),
         }
@@ -140,7 +131,6 @@ pub type Result<T> = std::result::Result<T, Error>;
 mod tests {
     use super::*;
 
-    /// The derive used to guarantee these; now they are ours to keep.
     #[test]
     fn every_variant_renders_and_reports_its_source() {
         let cases: Vec<(Error, &str, bool)> = vec![
@@ -217,7 +207,6 @@ mod tests {
         }
     }
 
-    /// `?` must keep working at every call site that relies on it.
     #[test]
     fn the_question_mark_conversions_still_exist() {
         fn io() -> Result<()> {

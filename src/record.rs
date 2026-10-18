@@ -1,11 +1,7 @@
-//! The record model shared by the ingest API, the codec and the flush path.
-//!
-//! The contract every other module codes against. Nothing here allocates: a
-//! [`Row`] borrows its strings from the caller, and a decoded [`RecordRef`]
-//! borrows from the buffer it came out of.
+//! The record model shared by ingest, the codec and the flush. Nothing here
+//! allocates: [`Row`] and [`RecordRef`] borrow their strings.
 
-/// A typed value for a declared key column. Small and `Copy`: passed by value on
-/// the ingest path, never owning its storage.
+/// A typed value for a declared key column.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Value<'a> {
     Null,
@@ -35,7 +31,6 @@ pub mod tag {
 }
 
 impl Value<'_> {
-    /// The wire tag for this value.
     pub fn tag(&self) -> u8 {
         match self {
             Value::Null => tag::NULL,
@@ -46,8 +41,7 @@ impl Value<'_> {
         }
     }
 
-    /// The declared type this value satisfies, or `None` for [`Value::Null`],
-    /// which satisfies any nullable column.
+    /// The declared type, or `None` for [`Value::Null`] (fits any nullable column).
     pub fn key_type(&self) -> Option<KeyType> {
         match self {
             Value::Null => None,
@@ -59,31 +53,21 @@ impl Value<'_> {
     }
 }
 
-/// A record as supplied by a caller of `append`.
-///
-/// `keys` is **positional**, in the order the series' config declares — that is
-/// what keeps a name lookup off the hot path.
+/// A record as supplied to `append`. `keys` is positional, in declared order.
 #[derive(Debug, Clone, Copy)]
 pub struct Row<'a> {
-    /// Epoch **microseconds**, UTC. Validated against the accept window.
-    ///
-    /// Unsigned: the window can never start before 1970, so a pre-epoch
-    /// timestamp was never storable anyway. Making it unrepresentable removes
-    /// sign handling from every date calculation downstream.
+    /// Epoch microseconds, UTC. Unsigned: the accept window never precedes 1970.
     pub ts: u64,
     /// Dedup key together with `ts`. May be empty.
     pub id: &'a str,
-    /// Values for the declared key columns, in declaration order.
     pub keys: &'a [Value<'a>],
     /// Undeclared key/value pairs. Sorted by name at encode time.
     pub extra: &'a [(&'a str, &'a str)],
-    /// Opaque payload, stored verbatim and never parsed by default.
+    /// Opaque payload, stored verbatim.
     pub data: &'a str,
 }
 
-/// The fixed part of a decoded frame. `keys` and `extra` go into caller-supplied
-/// scratch instead, so decoding a stream allocates only up to their high-water
-/// mark.
+/// The fixed part of a decoded frame; `keys`/`extra` go into caller scratch.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct RecordRef<'a> {
     pub ts: u64,
@@ -100,8 +84,7 @@ mod tests {
 
     #[test]
     fn tags_are_stable() {
-        // These are on-disk constants. If this test needs updating, the format
-        // version needs bumping too.
+        // On-disk constants: changing one means bumping the format version.
         assert_eq!(Value::Null.tag(), 0);
         assert_eq!(Value::Bool(true).tag(), 1);
         assert_eq!(Value::I64(0).tag(), 2);

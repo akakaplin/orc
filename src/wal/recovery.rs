@@ -1,36 +1,11 @@
 //! Startup: take the directory lock, drop flushed segments, amend the tail.
 //!
-//! Recovery's job is to make the log consistent again *cheaply*, because this
-//! engine is built for a process that restarts constantly. Two decisions follow,
-//! and neither is obvious.
-//!
-//! # The lock is heartbeated, not exclusive-create
-//!
-//! A plain `create_new` lockfile turns every `kill -9` into an outage needing
-//! manual intervention. So [`DirLock`] holds the pid and the committer refreshes
-//! its mtime about once a second; a lock older than [`LOCK_STALE_MS`] is
-//! abandoned and taken over, with a warning naming the dead pid. The common case
-//! self-heals while two live engines still cannot share a directory, and
-//! `--force-unlock` covers a process that is stuck but alive.
-//!
-//! (`flock` would give this for free, but only through a *direct* `libc`
-//! dependency and an `unsafe` call — `libc` is already in the tree via
-//! `parquet`, so the cost is the directness, not a new crate. Worth revisiting
-//! if the heartbeat proves fragile.)
-//!
-//! # Only the tail segment is scanned
-//!
-//! [`recover`] validates the highest-numbered segment and no other. A sealed
-//! segment was fully written and fsynced before the writer rolled past it, so it
-//! cannot be torn, and the flush validates every frame it reads anyway.
-//!
-//! Scanning them would make startup proportional to *unflushed* WAL — tens of
-//! gigabytes of CRC checking before the first write is accepted, and worse the
-//! further behind the flush has fallen, which is exactly when a slow start hurts
-//! most. Skipping them bounds startup at one segment.
-//!
-//! What is left is a log whose every segment was either sealed intact or
-//! truncated at its last good frame, so the flush can read it start to finish.
+//! - **Heartbeated lock**: [`DirLock`] holds the pid and the committer refreshes
+//!   its mtime; a lock older than [`LOCK_STALE_MS`] is taken over, so `kill -9`
+//!   self-heals. `--force-unlock` covers a stuck but live process.
+//! - **Only the tail is scanned**: a sealed segment was fsynced before the writer
+//!   rolled past it, so it can't be torn (and the flush validates every frame).
+//!   This bounds startup at one segment.
 
 use std::fs::{File, OpenOptions};
 use std::io::Write;
@@ -41,18 +16,13 @@ use crate::codec::{self, SEGMENT_HEADER_BYTES};
 use crate::error::{Error, Result};
 use crate::wal::{fsync_dir, list_segments, quarantine_segment, segment_path, wal_dir};
 
-/// The lockfile, in `data_dir`. Holds the pid of the engine that owns the
-/// directory.
+/// The lockfile in `data_dir`; holds the owner's pid.
 pub const LOCK_FILE: &str = "LOCK";
 
-/// A lock whose mtime is older than this is abandoned, and is taken over with a
-/// warning. Ten seconds is three orders of magnitude above the heartbeat, so a
-/// live engine cannot look dead through scheduling noise or a slow disk.
+/// A lock whose mtime is older than this is abandoned and may be taken over.
 pub const LOCK_STALE_MS: u64 = 10_000;
 
-/// How often the WAL committer refreshes the lock. Well under
-/// [`LOCK_STALE_MS`], because the cost of being late is another process
-/// deciding you are dead.
+/// How often the WAL committer refreshes the lock; well under [`LOCK_STALE_MS`].
 pub const LOCK_HEARTBEAT_MS: u64 = 1_000;
 
 /// Is this `Corrupt` reason "the wrong binary" rather than "damaged bytes"?
@@ -60,10 +30,7 @@ fn version_mismatch(reason: &str) -> bool {
     reason == codec::UNSUPPORTED_VERSION
 }
 
-/// Ownership of a data directory, for as long as this value lives.
-///
-/// Advisory: it stops a second `orc` from opening the same directory, not a text
-/// editor from writing into it. Dropping it releases the lock.
+/// Advisory ownership of a data directory; dropping it releases the lock.
 #[derive(Debug)]
 pub struct DirLock {
     path: PathBuf,
@@ -71,16 +38,9 @@ pub struct DirLock {
 }
 
 impl DirLock {
-    /// Take the lock, or fail if a live engine holds it.
-    ///
-    /// `force_unlock` takes it regardless — the escape for a process that is
-    /// stuck but alive, and the only way past a genuinely concurrent engine.
-    ///
-    /// Two engines can race to take over the *same* stale lock: there is no
-    /// atomic compare-and-swap on file contents without `libc`. Writing the pid
-    /// and reading it back closes the interesting window — the loser sees a pid
-    /// that is not its own — but that is a narrowing, not a proof. The guarantee
-    /// that holds is the one above: a heartbeated lock is never taken.
+    /// Take the lock, or fail if a live engine holds it; `force_unlock` takes it
+    /// regardless. Two engines racing for one stale lock is only narrowed (by
+    /// reading the pid back), not prevented.
     pub fn acquire(data_dir: impl AsRef<Path>, force_unlock: bool) -> Result<DirLock> {
         let data_dir = data_dir.as_ref();
         std::fs::create_dir_all(data_dir)?;
@@ -128,14 +88,12 @@ impl DirLock {
         Ok(DirLock { path, pid })
     }
 
-    /// Where the lockfile lives — this is what [`crate::wal::writer::WalOptions`]
-    /// takes as its heartbeat path.
+    /// The lockfile path (the writer's heartbeat path).
     pub fn path(&self) -> &Path {
         &self.path
     }
 
-    /// Prove the owner is still alive. The WAL committer calls this about once a
-    /// second; see [`touch_lock`].
+    /// Prove the owner is still alive; see [`touch_lock`].
     pub fn heartbeat(&self) -> std::io::Result<()> {
         touch_lock(&self.path)
     }
@@ -143,9 +101,7 @@ impl DirLock {
 
 impl Drop for DirLock {
     fn drop(&mut self) {
-        // Only remove a lock that is still ours. If another engine decided we
-        // were dead and took over, deleting the file would hand the directory to
-        // a third process while that one is running.
+        // Only remove a lock that is still ours (it may have been taken over).
         if read_pid(&self.path) != Some(self.pid) {
             tracing::warn!(path = %self.path.display(), "the directory lock was taken over; leaving it alone");
             return;
@@ -156,33 +112,24 @@ impl Drop for DirLock {
     }
 }
 
-/// Move the lock's mtime forward, which is the whole heartbeat.
-///
-/// Rewriting the pid is how the mtime moves — `std` has no `utimensat`. Not
-/// fsynced, because only the mtime's *visibility* to another process matters and
-/// a durable heartbeat would mean a real disk write on a one-second timer
-/// forever. Rewritten rather than appended, so the file stays one line.
+/// Heartbeat: rewrite the pid to bump the mtime. Not fsynced; only visibility to
+/// other processes matters.
 pub fn touch_lock(path: &Path) -> std::io::Result<()> {
     let mut f = OpenOptions::new().write(true).truncate(true).open(path)?;
     write_pid(&mut f, std::process::id())
 }
 
 fn write_pid(f: &mut File, pid: u32) -> std::io::Result<()> {
-    // Trailing newline so `cat data/LOCK` reads cleanly; the parser trims it.
     f.write_all(format!("{pid}\n").as_bytes())
 }
 
-/// The pid a lockfile names, if it can be read. Advisory only: a lock caught
-/// mid-heartbeat is momentarily empty.
+/// The pid a lockfile names, if readable (momentarily empty mid-heartbeat).
 pub fn read_pid(path: &Path) -> Option<u32> {
     std::fs::read_to_string(path).ok()?.trim().parse().ok()
 }
 
-/// How long since the lock was last heartbeated.
-///
-/// `None` when the mtime is unreadable or in the future — a clock that went
-/// backwards must not make a live engine look abandoned, so an unknown age
-/// counts as fresh.
+/// Time since the last heartbeat; `None` (treated as fresh) if the mtime is
+/// unreadable or in the future.
 fn lock_age(path: &Path) -> Option<Duration> {
     let mtime = std::fs::metadata(path).ok()?.modified().ok()?;
     SystemTime::now().duration_since(mtime).ok()
@@ -191,37 +138,27 @@ fn lock_age(path: &Path) -> Option<Duration> {
 /// What recovery found and did.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Recovery {
-    /// Segments deleted because the flush had already turned them into Parquet.
+    /// Segments deleted as already flushed (or headerless).
     pub deleted: Vec<u64>,
-    /// Segments left for the flush to consume, ascending. Includes the amended
-    /// tail, which is sealed by the fact that the writer opens a new segment.
+    /// Segments left for the flush, ascending, including the amended tail.
     pub pending: Vec<u64>,
     /// The segment that was scanned, if there was one.
     pub tail: Option<u64>,
     /// Intact frames found in the tail.
     pub tail_frames: u64,
-    /// Bytes chopped off the tail: at most one torn record, unless the storage
-    /// itself damaged the file.
+    /// Bytes chopped off the tail (normally at most one torn record).
     pub discarded_bytes: u64,
-    /// Segments moved aside as `<id>.wal.corrupt` because their header did not
-    /// parse. Their frames are **not** in the dataset and will not be without
-    /// manual work, but every byte is still on disk.
+    /// Segments moved aside as `<id>.wal.corrupt` (bad header); their frames
+    /// are not in the dataset.
     pub quarantined: Vec<u64>,
-    /// The id the writer must open. Always greater than every id ever seen in
-    /// this directory, so a segment is never reused or overwritten.
+    /// The id the writer must open; greater than every id ever seen here.
     pub next_segment: u64,
 }
 
 /// Bring `wal/` into a state the flush can read start to finish.
 ///
-/// Takes `last_flushed_segment` rather than the whole manifest, because that one
-/// number is all recovery uses.
-///
-/// Does not re-validate records: one accepted once stays accepted even if the
-/// config has since been tightened, or a config edit would discard durable data.
-/// Which is also why the scan bounds frame lengths by the segment's own size
-/// rather than `limits.max_record_bytes` — that cap bounds allocation, and the
-/// scan has the file in memory already.
+/// Never re-validates against current limits (frame length is bounded by the
+/// file size), so tightening config can't discard durable records.
 pub fn recover(data_dir: impl AsRef<Path>, last_flushed_segment: u64) -> Result<Recovery> {
     let data_dir = data_dir.as_ref();
     let dir = wal_dir(data_dir);
@@ -235,18 +172,13 @@ pub fn recover(data_dir: impl AsRef<Path>, last_flushed_segment: u64) -> Result<
         ..Recovery::default()
     };
 
-    // Anything at or below `last_flushed_segment` is already durable in Parquet.
-    // These are the orphans a crash between the manifest commit and the segment
-    // deletion leaves behind.
+    // At or below `last_flushed_segment`: already in Parquet, orphaned by a
+    // crash between manifest commit and segment deletion.
     let flushed = ids.partition_point(|&id| id <= last_flushed_segment);
     for id in ids.drain(..flushed) {
         match std::fs::remove_file(segment_path(data_dir, id)) {
             Ok(()) => {}
-            // Already gone is the outcome being asked for, not a failure. A
-            // crash between the manifest commit and `delete_segments` leaves
-            // exactly this, and the flush path has always tolerated it here --
-            // propagating it meant a file that raced with an external prune
-            // could stop the engine from starting at all.
+            // Already gone is fine.
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(e.into()),
         }
@@ -260,7 +192,7 @@ pub fn recover(data_dir: impl AsRef<Path>, last_flushed_segment: u64) -> Result<
         );
     }
 
-    // Only the tail. See the module docs: this is what bounds startup cost.
+    // Only the tail (see module docs).
     if let Some(&tail) = ids.last() {
         let path = segment_path(data_dir, tail);
         match scan_tail(&path)? {
@@ -270,8 +202,7 @@ pub fn recover(data_dir: impl AsRef<Path>, last_flushed_segment: u64) -> Result<
                 out.discarded_bytes = scan.discarded;
             }
             TailHeader::Absent => {
-                // The header never made it to disk, so the file can hold no
-                // frames at all -- there is nothing to amend, only to remove.
+                // No header, so no frames: remove it.
                 let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
                 std::fs::remove_file(&path)?;
                 fsync_dir(&dir)?;
@@ -284,11 +215,8 @@ pub fn recover(data_dir: impl AsRef<Path>, last_flushed_segment: u64) -> Result<
                     "discarded a wal segment too short to hold a header"
                 );
             }
-            // A header that is present but wrong says nothing about the frames
-            // behind it, which may be entirely intact -- so this must never
-            // unlink the file. Quarantining takes it out of the log (its records
-            // are not replayed, and the name is free for the writer to reuse)
-            // while leaving every byte on disk to be recovered by hand.
+            // A bad header says nothing about the frames behind it: quarantine,
+            // never delete.
             TailHeader::Corrupt(reason) if !version_mismatch(reason) => {
                 let quarantined = quarantine_segment(data_dir, tail)?;
                 ids.pop();
@@ -301,9 +229,7 @@ pub fn recover(data_dir: impl AsRef<Path>, last_flushed_segment: u64) -> Result<
                      its frames may still be readable and are NOT in the dataset"
                 );
             }
-            // A format-version mismatch is not damage, it is the wrong binary.
-            // Starting anyway would quarantine a whole WAL that the right binary
-            // would read perfectly, so refuse instead.
+            // Version mismatch means the wrong binary, not damage: refuse to start.
             TailHeader::Corrupt(reason) => {
                 return Err(Error::Config(format!(
                     "wal segment {tail} was written in a format this build cannot read \
@@ -336,27 +262,17 @@ struct TailScan {
 }
 
 /// What the tail segment's header turned out to be.
-///
-/// Three cases, three answers; collapsing them is how a version bump or one
-/// flipped bit used to unlink a segment full of good records.
-/// `parse_segment_header` reports them distinctly for exactly this caller.
 enum TailHeader {
-    /// A usable header; the frames after it were scanned and amended.
+    /// Usable header; frames were scanned and amended.
     Scanned(TailScan),
-    /// Shorter than a header. The file cannot hold a single locatable frame, so
-    /// there is genuinely nothing in it to keep.
+    /// Shorter than a header: nothing to keep.
     Absent,
-    /// A header is present but wrong. The bytes after it may be entirely
-    /// recoverable by hand, so they are quarantined rather than deleted.
+    /// Present but wrong: quarantine (or refuse on a version mismatch).
     Corrupt(&'static str),
 }
 
-/// Validate the tail's frames and truncate it at the last good offset.
-///
-/// Checks what can be checked without a schema: that each frame is delimited by
-/// the buffer, and the CRC. Whether the *contents* decode is the flush's
-/// question, asked hourly rather than on every startup. The length cap is the
-/// buffer's own size — see [`recover`].
+/// Check the tail's frame envelopes (length, CRC; no schema needed) and
+/// truncate at the last good offset, fsyncing the truncation.
 fn scan_tail(path: &Path) -> Result<TailHeader> {
     let bytes = std::fs::read(path)?;
     let size = bytes.len() as u64;
@@ -368,8 +284,7 @@ fn scan_tail(path: &Path) -> Result<TailHeader> {
                 .and_then(|n| n.to_str())
                 .and_then(crate::wal::parse_segment_name);
             if named != Some(id) {
-                // Not fatal, but `arrival` order is (segment_id, offset), so a
-                // renamed segment silently reorders records across a replay.
+                // Not fatal, but arrival order uses the id, so this reorders.
                 tracing::warn!(path = %path.display(), header_id = id, "segment header disagrees with its file name");
             }
         }
@@ -397,9 +312,6 @@ fn scan_tail(path: &Path) -> Result<TailHeader> {
     let discarded = size - at as u64;
     if discarded > 0 {
         let err = stopped_by.expect("a short read is the only way to stop early");
-        // A crash mid-write costs one partial record; anything larger means the
-        // storage damaged bytes that were already acknowledged, which is worth
-        // saying loudly.
         tracing::warn!(
             path = %path.display(),
             frames,
@@ -501,9 +413,6 @@ mod tests {
             let r = recover(dir.path(), 0).unwrap();
             assert_eq!(r.tail_frames, 3, "cut {cut}");
             assert_eq!(r.discarded_bytes, last as u64 - cut as u64, "cut {cut}");
-            // Physically truncated, not merely reported: the writer appends
-            // straight after this offset, so a torn frame left in place would be
-            // spliced into the next record.
             assert_eq!(size(dir.path(), 1), good, "cut {cut}");
 
             // ...and recovery is a fixed point.
@@ -521,8 +430,7 @@ mod tests {
         let last = frame("s1-3").len();
         let good = (whole.len() - last) as u64;
 
-        // Damage a byte inside the final frame's payload; the CRC is what
-        // catches it, and everything before it must survive untouched.
+        // Damage a byte inside the final frame's payload.
         let victim = whole.len() - 3;
         whole[victim] ^= 0x40;
         std::fs::write(segment_path(dir.path(), 1), &whole).unwrap();
@@ -535,9 +443,6 @@ mod tests {
 
     #[test]
     fn a_zero_padded_tail_is_discarded() {
-        // What a sparse write, or a filesystem that zero-fills a lost block,
-        // leaves behind. A run of zeros is a frame claiming length 0, which is
-        // below the smallest frame the format can produce.
         let dir = tempfile::tempdir().unwrap();
         let whole = write_segment(dir.path(), 1, 3);
         let good = whole.len() as u64;
@@ -587,8 +492,6 @@ mod tests {
 
     #[test]
     fn ids_never_go_backwards_even_with_no_segments_left() {
-        // Everything was flushed, so the directory is empty -- but reusing an id
-        // would let a stale Parquet filename describe different records.
         let dir = tempfile::tempdir().unwrap();
         write_segment(dir.path(), 9, 1);
         let r = recover(dir.path(), 9).unwrap();
@@ -596,16 +499,14 @@ mod tests {
         assert!(r.pending.is_empty());
         assert_eq!(r.next_segment, 10);
 
-        // ...and the manifest alone is enough to know that, with no files left.
+        // The manifest alone suffices with no files left.
         let r = recover(dir.path(), 12).unwrap();
         assert_eq!(r.next_segment, 13);
     }
 
     #[test]
     fn only_the_tail_segment_is_scanned() {
-        // The load-bearing performance decision, asserted so it cannot regress:
-        // a sealed segment is not read at all, even when it is damaged. The
-        // flush validates it later and rejects the bad frame there.
+        // A sealed segment is not touched even when damaged.
         let dir = tempfile::tempdir().unwrap();
         let mut sealed = write_segment(dir.path(), 1, 4);
         let sealed_len = sealed.len() as u64;
@@ -636,15 +537,10 @@ mod tests {
         assert!(!segment_path(dir.path(), 2).exists());
         assert_eq!(r.pending, vec![1]);
         assert_eq!(r.tail, None);
-        // The id is spent regardless: a new segment 2 would be a second file
-        // claiming an arrival range that already existed.
+        // The id is spent regardless.
         assert_eq!(r.next_segment, 3);
     }
 
-    /// A header that is *wrong* is a different thing from a header that is
-    /// *missing*, and only the second means the file is empty of records.
-    /// Deleting on the first cost a whole segment of durable frames for one bad
-    /// byte, so it now moves aside instead.
     #[test]
     fn a_segment_with_a_corrupt_header_is_quarantined_not_deleted() {
         let dir = tempfile::tempdir().unwrap();
@@ -661,20 +557,17 @@ mod tests {
         assert_eq!(r.pending, vec![1], "it is not replayed");
         assert!(!segment_path(dir.path(), 2).exists());
 
-        // The bytes survive, in full and unmodified.
         let aside = segment_path(dir.path(), 2).with_extension(CORRUPT_EXT);
         assert_eq!(std::fs::read(&aside).unwrap(), damaged, "nothing was lost");
         assert_eq!(r.next_segment, 3, "and the id is still spent");
 
-        // Idempotent: a second start must not trip over the quarantined file.
+        // Idempotent.
         let again = recover(dir.path(), 0).unwrap();
         assert!(again.quarantined.is_empty());
         assert_eq!(again.pending, vec![1]);
         assert!(aside.exists());
     }
 
-    /// A version mismatch is the wrong binary, not damage. Quarantining would
-    /// strand a WAL that the right binary reads perfectly, so refuse to start.
     #[test]
     fn an_unreadable_format_version_refuses_to_start() {
         let dir = tempfile::tempdir().unwrap();
@@ -692,15 +585,9 @@ mod tests {
         );
     }
 
-    /// The scan bounds a frame by the file it is reading, not by the current
-    /// `limits.max_record_bytes` -- lowering that must never invalidate records
-    /// that were durable before the edit.
     #[test]
     fn lowering_the_record_limit_does_not_truncate_a_durable_segment() {
         let dir = tempfile::tempdir().unwrap();
-        // Frames here are a few hundred bytes; the old code passed the config's
-        // cap straight in, so any cap below a frame's length chopped the segment
-        // at its first record.
         write_segment(dir.path(), 1, 8);
         let before = size(dir.path(), 1);
 
@@ -722,9 +609,7 @@ mod tests {
 
     #[test]
     fn the_scan_matches_what_the_reader_will_later_decode() {
-        // Recovery checks the frame envelope; the flush decodes the contents.
-        // They must agree on where the frames are, or the flush would start
-        // reading at an offset recovery considered good.
+        // Recovery and the flush must agree on frame boundaries.
         let dir = tempfile::tempdir().unwrap();
         write_segment(dir.path(), 1, 6);
         let r = recover(dir.path(), 0).unwrap();
@@ -756,14 +641,11 @@ mod tests {
         let held = DirLock::acquire(dir.path(), false).unwrap();
         assert_eq!(read_pid(held.path()), Some(std::process::id()));
 
-        // A live engine holds it: refuse, and say so with a typed error rather
-        // than by clobbering someone else's log.
         let err = DirLock::acquire(dir.path(), false).unwrap_err();
         assert!(matches!(err, Error::Locked(_)), "{err:?}");
         assert!(err.to_string().contains("force-unlock"));
 
-        // The same lock, a `kill -9` ago: taking it over is what keeps a crash
-        // from becoming an outage.
+        // The same lock, a `kill -9` ago.
         age_lock(held.path(), Duration::from_millis(LOCK_STALE_MS + 5_000));
         let taken = DirLock::acquire(dir.path(), false).unwrap();
         assert_eq!(read_pid(taken.path()), Some(std::process::id()));
@@ -800,8 +682,7 @@ mod tests {
         };
         assert!(!path.exists(), "dropping the lock must release it");
 
-        // A lock we lost to a takeover belongs to whoever holds it now, so our
-        // Drop must not delete it out from under them.
+        // A lock lost to a takeover must survive our Drop.
         let held = DirLock::acquire(dir.path(), false).unwrap();
         std::fs::write(&path, b"999999\n").unwrap();
         drop(held);

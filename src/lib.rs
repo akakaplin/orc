@@ -1,16 +1,10 @@
 //! `orc` — an embeddable time-series storage engine.
 //!
-//! Records are appended to a write-ahead log at sub-microsecond latency and
-//! periodically flushed to sorted Parquet that DuckDB, polars and Spark read
-//! directly. The engine is write-only: it owns the write path and leaves reading
-//! to those tools.
+//! Records go to a write-ahead log and are periodically flushed to sorted
+//! Parquet for DuckDB/polars/Spark to read. The engine is write-only.
 //!
-//! Two invariants carry most of the design:
-//!
-//! - **Every frame is self-describing.** It names its own series and schema
-//!   epoch, so a WAL segment is interpretable with nothing but itself.
-//! - **The write path is append-only.** No Parquet file is ever read back,
-//!   merged or replaced, which removes a whole category of recovery cases.
+//! Invariants: every WAL frame names its own series and schema epoch, and no
+//! Parquet file is ever read back, merged or replaced.
 
 #![forbid(unsafe_code)]
 #![warn(missing_debug_implementations)]
@@ -27,19 +21,14 @@ pub mod protocol;
 pub mod time;
 pub mod wal;
 
-// Optional so the embeddable engine never pulls in a C++ toolchain. One feature
-// for both sides, so a process can be a server, a client, or both.
+// Optional so the embedded engine needs no C++ toolchain.
 #[cfg(feature = "net")]
 pub mod client;
 #[cfg(feature = "net")]
 pub mod server;
 
-/// The ZeroMQ binding this crate was built against.
-///
-/// Re-exported so callers — and the integration tests — can reach raw sockets.
-/// Cargo cannot feature-gate dev-dependencies, so a `zmq` entry there would make
-/// plain `cargo test` build libzmq from source. It also pins the version: a
-/// consumer mixing its own `zmq` with ours would link two libzmq builds.
+/// Re-exported ZeroMQ binding, so callers and tests use the same libzmq build
+/// (a `zmq` dev-dependency would make plain `cargo test` build libzmq).
 #[cfg(feature = "net")]
 pub use zmq;
 

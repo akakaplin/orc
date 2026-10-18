@@ -1,7 +1,4 @@
-//! `orc-cli` — drive a running `orc-server` by hand.
-//!
-//! `send` reads newline-delimited JSON on stdin, one record per line:
-//!
+//! `orc-cli` — drive a running `orc-server`. `send` reads one JSON record per stdin line:
 //! ```text
 //! {"ts": 1786194000000000, "id": "a1", "keys": ["AAPL", 100],
 //!  "extra": {"feed": "itch"}, "data": "{\"px\":1.5}"}
@@ -20,12 +17,7 @@ struct Args {
     ingest: String,
 
     /// Control endpoint (REQ -> server REP). Defaults to the ingest port + 1.
-    ///
-    /// `Option`, not a `default_value`: a default is always present, so it would
-    /// suppress the client's port+1 derivation and `--ingest tcp://prod:5555`
-    /// would send records to prod while handshaking against localhost. Keys
-    /// travel positionally, so two hosts declaring a series in a different order
-    /// means silently swapped columns.
+    // No `default_value`: it would block deriving the port from `--ingest`.
     #[arg(long)]
     control: Option<String>,
 
@@ -67,7 +59,7 @@ fn main() -> std::process::ExitCode {
 
 fn run() -> orc::Result<()> {
     let args = Args::parse();
-    // Batch size is fixed at connect, so it has to be known before we build.
+    // Batch size is fixed at connect.
     let batch = match args.cmd {
         Cmd::Send { batch, .. } => batch,
         _ => 1,
@@ -99,12 +91,10 @@ fn print_reply(reply: orc::protocol::ControlResponse) {
     }
 }
 
-/// One JSON object per line, in the shape the module docs show.
+/// Send stdin records, one JSON object per line.
 fn send(client: &mut Client, series_name: &str) -> orc::Result<()> {
     use std::io::BufRead;
 
-    // Returns an owned handle, so the borrow ends here and `send` can take
-    // `&mut client` freely below.
     let series = client.series(series_name)?;
 
     let stdin = std::io::stdin();
@@ -118,13 +108,11 @@ fn send(client: &mut Client, series_name: &str) -> orc::Result<()> {
         let parsed: JsonRecord = match serde_json::from_str(&line) {
             Ok(r) => r,
             Err(e) => {
-                // One bad line must not abandon the rest of the stream.
+                // Skip bad lines, keep going.
                 eprintln!("orc-cli: line {line_no}: {e}");
                 continue;
             }
         };
-        // One bad line must not abandon the rest of the stream, same as a parse
-        // failure above.
         let keys: Vec<Value<'_>> = match parsed.keys.iter().map(json_to_value).collect() {
             Ok(keys) => keys,
             Err(why) => {
@@ -170,13 +158,7 @@ struct JsonRecord {
     data: String,
 }
 
-/// One JSON scalar as a key value.
-///
-/// Arrays and objects have no declared-key representation and are named as
-/// errors rather than coerced. They used to become `Value::Str("")` on the
-/// theory that the server would reject the type — but `""` is a perfectly good
-/// value for a `string` column, so an object in a string key was stored as an
-/// empty string the producer never wrote.
+/// One JSON scalar as a key value; arrays and objects are errors, not coerced.
 fn json_to_value(v: &serde_json::Value) -> Result<Value<'_>, &'static str> {
     Ok(match v {
         serde_json::Value::Null => Value::Null,

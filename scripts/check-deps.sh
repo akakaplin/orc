@@ -1,22 +1,17 @@
 #!/bin/sh
-# Assert the default build's dependencies match the documented budget.
-#
-# The point is not tidiness. The default feature set is the embeddable engine: a
-# library someone links into their own process. If ZeroMQ drifts into it, that
-# consumer suddenly needs cmake and a C++ toolchain they never asked for, and
-# nobody notices until they complain. `net` is where the transport belongs.
+# Assert the default (embeddable) build's dependencies match the documented budget.
 set -eu
 
 cd "$(dirname "$0")/.."
 
-expected='crc32fast
+expected='bytes
+crc32fast
 parquet
 serde
 serde_json
 tracing'
 
-# --depth 1 lists direct dependencies only; -e no-dev excludes dev-dependencies,
-# which never reach a consumer. No --features, so this is the default build.
+# Direct, non-dev dependencies of the default build.
 actual=$(cargo tree --depth 1 --edges no-dev --prefix none \
     | tail -n +2 \
     | awk 'NF {print $1}' \
@@ -33,8 +28,7 @@ if [ "$expected" != "$actual" ]; then
     exit 1
 fi
 
-# The ones that matter, checked by name so the failure message is obvious even
-# if the list above is edited carelessly.
+# Named explicitly so the failure is obvious even if the list above drifts.
 for forbidden in zmq clap tracing-subscriber; do
     if cargo tree --edges no-dev --prefix none \
         | awk 'NF {print $1}' | grep -qx "$forbidden"; then
@@ -43,12 +37,7 @@ for forbidden in zmq clap tracing-subscriber; do
     fi
 done
 
-# Arrow is a whole subtree rather than one crate, and parquet's `arrow` feature
-# is all-or-nothing: turning it on for ArrowWriter also pulls arrow-ipc and
-# flatbuffers, which this engine never touches. src/flush/parquet.rs writes
-# against the low-level API instead, so any arrow-* crate reappearing means
-# someone re-enabled the feature -- probably by accident, since nothing here
-# names those crates directly.
+# Any arrow-* crate means parquet's `arrow` feature was re-enabled.
 if cargo tree --edges no-dev --prefix none \
     | awk 'NF {print $1}' | grep -qE '^(arrow-|flatbuffers$)'; then
     echo "FAIL: the arrow stack is back in the default build." >&2
@@ -57,10 +46,7 @@ if cargo tree --edges no-dev --prefix none \
     exit 1
 fi
 
-# The default build must stay pure Rust. `cc` is the tell: nothing here compiles
-# C, and the compression codec (lz4_flex) was chosen over zstd precisely so an
-# embedder needs no C compiler. If `cc` appears, some dependency started building
-# native code -- which is a portability change, not a size one.
+# The default build must stay pure Rust; `cc` means something compiles C.
 if cargo tree --edges no-dev --prefix none \
     | awk 'NF {print $1}' | grep -qx cc; then
     echo "FAIL: 'cc' is in the default build -- something now compiles C." >&2
@@ -68,11 +54,7 @@ if cargo tree --edges no-dev --prefix none \
     exit 1
 fi
 
-# `--edges all` includes dev-dependencies, and this is the check the earlier
-# no-dev-only version could not make. Cargo cannot feature-gate a dev-dependency,
-# so a `zmq` entry under [dev-dependencies] silently makes plain `cargo test`
-# build libzmq from source -- the toolchain requirement `net` exists to avoid,
-# reintroduced through the one edge the guard was not looking at.
+# A zmq dev-dependency (can't be feature-gated) would make `cargo test` build libzmq.
 if cargo tree --edges all --prefix none \
     | awk 'NF {print $1}' | grep -qx zmq; then
     echo "FAIL: 'zmq' reaches the default build through a dev-dependency." >&2
@@ -81,8 +63,7 @@ if cargo tree --edges all --prefix none \
     exit 1
 fi
 
-# `net` is the library transport and must stay that way: a program embedding the
-# client has no use for an argument parser or a log formatter.
+# `net` is the library transport: no arg parser or log formatter.
 net_only=$(cargo tree --features net --edges no-dev --prefix none \
     | awk 'NF {print $1}' | grep -v '^\[' | sort -u)
 if ! printf '%s\n' "$net_only" | grep -qx zmq; then
@@ -96,7 +77,7 @@ for forbidden in clap tracing-subscriber; do
     fi
 done
 
-# And the binaries' feature must actually supply what they need.
+# `cli` must supply what the binaries need.
 cli=$(cargo tree --features cli --edges no-dev --prefix none \
     | awk 'NF {print $1}' | grep -v '^\[' | sort -u)
 for required in zmq clap tracing-subscriber; do

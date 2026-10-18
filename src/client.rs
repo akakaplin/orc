@@ -1,13 +1,5 @@
-//! ZeroMQ ingest client: a PUSH socket for records, a REQ socket for the
-//! handshake.
-//!
-//! Encodes with the same [`crate::codec`] the WAL uses, so the server appends
-//! the bytes it receives without transcoding.
-//!
-//! **Ingest is fire-and-forget.** A successful `send` means the bytes reached the
-//! local ZeroMQ queue, not that they are durable. Backpressure still works:
-//! [`OnFull::Block`] is libzmq's behaviour at the send high-water mark, so a
-//! saturated server slows producers rather than dropping silently.
+//! ZeroMQ ingest client: PUSH for records (WAL [`crate::codec`] frames), REQ for control.
+//! Fire-and-forget: a successful `send` means queued locally, not durable.
 
 use std::collections::HashMap;
 
@@ -27,11 +19,8 @@ pub enum OnFull {
     Drop,
 }
 
-/// A series resolved against the server's schema.
-///
-/// Epoch and key order are fixed at handshake time. If the server's config
-/// changes afterwards this keeps encoding under its original epoch, which is
-/// safe: every frame declares the epoch it was built with.
+/// A series resolved at handshake time; frames carry its epoch, so later
+/// server config changes are safe.
 #[derive(Debug, Clone)]
 pub struct RemoteSeries {
     name: String,
@@ -80,14 +69,12 @@ impl Default for ClientBuilder {
             control: None,
             batch: 1024,
             sndhwm: 100_000,
-            // A fallback: the handshake replaces it with the server's own.
+            // Replaced by the server's value at handshake.
             max_batch_bytes: crate::config::DEFAULT_MAX_BATCH_BYTES as usize,
-            // Non-zero so a clean exit flushes rather than discarding what
-            // libzmq still holds. Zero here is a classic silent-loss bug.
+            // Non-zero so a clean exit delivers what libzmq still holds.
             linger_ms: 2_000,
             on_full: OnFull::Block,
-            // Fine for ping, stats and the handshake. Not for `Flush`, which is
-            // synchronous and proportional to the backlog -- `control` raises it.
+            // `Flush` gets a longer one in `control`.
             control_timeout_ms: 5_000,
         }
     }
@@ -98,8 +85,7 @@ impl ClientBuilder {
         self.ingest = endpoint.to_string();
         self
     }
-    /// Control endpoint for the schema handshake. Defaults to the ingest
-    /// endpoint's port + 1, matching the server's own defaults.
+    /// Control endpoint. Defaults to the ingest port + 1.
     pub fn control(mut self, endpoint: &str) -> Self {
         self.control = Some(endpoint.to_string());
         self
@@ -120,20 +106,13 @@ impl ClientBuilder {
         self.on_full = on_full;
         self
     }
-    /// How long to wait for a control reply. Defaults to 5s.
-    ///
-    /// Not for `Flush`, which the server handles synchronously over however much
-    /// WAL has accumulated; [`Client::control`] gives that its own bound.
+    /// Control reply timeout (default 5s); `Flush` has its own, see [`Client::control`].
     pub fn control_timeout_ms(mut self, ms: i32) -> Self {
         self.control_timeout_ms = ms;
         self
     }
 
-    /// Largest message this client will put on the wire, in bytes.
-    ///
-    /// Rarely worth setting: the handshake learns the server's
-    /// `server.max_batch_bytes` and the client takes the smaller of the two, so
-    /// setting this higher cannot raise the limit the server enforces.
+    /// Largest message to send; the handshake lowers it to the server's limit.
     pub fn max_batch_bytes(mut self, bytes: usize) -> Self {
         self.max_batch_bytes = bytes.max(codec::BATCH_HEADER_BYTES + 1);
         self
@@ -154,16 +133,11 @@ impl ClientBuilder {
         };
         let req = ctx.socket(zmq::REQ).map_err(zmq_err)?;
         req.set_linger(self.linger_ms).map_err(zmq_err)?;
-        // Without a timeout a dead server makes `recv` hang forever, which
-        // turns "the server is down" into "my process is wedged".
+        // So a dead server can't hang `recv` forever.
         req.set_rcvtimeo(self.control_timeout_ms).map_err(zmq_err)?;
         req.set_sndtimeo(self.control_timeout_ms).map_err(zmq_err)?;
-        // A plain REQ socket is a strict send/recv state machine: a timed-out
-        // `recv` leaves it expecting a reply, and every later `send` fails with
-        // EFSM permanently -- one slow flush bricks the socket for the life of
-        // the process. RELAXED lets a new request replace the abandoned one;
-        // CORRELATE makes that safe by tagging replies, so a late one is
-        // discarded rather than read as the answer to the new request.
+        // After a timed-out `recv`, plain REQ fails every later send (EFSM).
+        // RELAXED allows a new request; CORRELATE discards late replies.
         req.set_req_relaxed(true).map_err(zmq_err)?;
         req.set_req_correlate(true).map_err(zmq_err)?;
         req.connect(&control_endpoint)
@@ -193,9 +167,7 @@ fn zmq_err(e: zmq::Error) -> Error {
     Error::Config(format!("zeromq: {e}"))
 }
 
-/// Receive timeout for a `Flush`, answered only once the whole backlog is on
-/// disk. Ten minutes: long enough for a real hour of WAL, short enough that a
-/// wedged server is still eventually reported.
+/// Receive timeout for a synchronous `Flush`: long enough for an hour of WAL.
 const FLUSH_TIMEOUT_MS: i32 = 600_000;
 
 /// `tcp://host:5555` -> `tcp://host:5556`, matching the server's defaults.
@@ -210,8 +182,7 @@ fn default_control_endpoint(ingest: &str) -> Result<String> {
             "cannot derive a control endpoint from {ingest:?}; pass one explicitly"
         ))
     })?;
-    // 65535 has no successor: unchecked, a debug panic and a silent `:0` in
-    // release, which connects nowhere and says nothing about why.
+    // 65535 has no successor.
     let control = port.checked_add(1).ok_or_else(|| {
         Error::Config(format!(
             "cannot derive a control endpoint from {ingest:?}: port {port} has no successor; \
@@ -232,15 +203,13 @@ pub struct Client {
     on_full: OnFull,
     stats: ClientStats,
     encoder: Encoder,
-    /// Kept so `control` can restore it after raising it for a `Flush`.
+    /// Restored by `control` after a `Flush`.
     control_timeout_ms: i32,
-    /// Kept only to name it in a timeout: the endpoint is the one fact that
-    /// turns "the socket gave up" into something actionable.
+    /// Named in timeout errors.
     control_endpoint: String,
-    /// The cap actually in force: `min(configured, whatever the server said)`.
+    /// In force: `min(configured, server's)`.
     max_batch_bytes: usize,
-    /// What the builder was given, so a re-handshake recomputes the minimum from
-    /// the caller's intent rather than from an already-lowered value.
+    /// The builder's value, so a re-handshake recomputes the minimum from it.
     configured_max_batch_bytes: usize,
 }
 
@@ -259,10 +228,7 @@ impl Client {
         ClientBuilder::default()
     }
 
-    /// Ask the server for every series' epoch and key order.
-    ///
-    /// Required before anything can be encoded: keys travel positionally, so
-    /// without the declared order there is no frame to build.
+    /// Fetch every series' epoch and key order; required before encoding.
     pub fn refresh_schema(&mut self) -> Result<()> {
         match self.control(ControlRequest::Schema)? {
             ControlResponse::Schema {
@@ -275,8 +241,6 @@ impl Client {
                         (name.clone(), RemoteSeries { name, epoch, keys })
                     })
                     .collect();
-                // The smaller of the two: the server's is the one libzmq
-                // enforces, and a server too old to report one leaves ours.
                 self.max_batch_bytes = match max_batch_bytes {
                     Some(server) => self
                         .configured_max_batch_bytes
@@ -292,11 +256,8 @@ impl Client {
         }
     }
 
-    /// Send a control request and wait for the reply.
-    ///
-    /// `Flush` gets its own receive timeout: the server runs it synchronously, so
-    /// it takes as long as the backlog does, and the default would report a
-    /// working flush as a failure while the server went on to finish it.
+    /// Send a control request and wait for the reply. `Flush` is synchronous on
+    /// the server, so it waits up to `FLUSH_TIMEOUT_MS`.
     pub fn control(&self, req: ControlRequest) -> Result<ControlResponse> {
         let slow = matches!(req, ControlRequest::Flush);
         let waited = if slow {
@@ -307,8 +268,7 @@ impl Client {
         };
         let result = self.control_inner(req, waited);
         if slow {
-            // Restore even on failure: leaving the long timeout in place would
-            // make a later `stats` against a dead server hang for minutes.
+            // Restore even on failure.
             let restore = self.req.set_rcvtimeo(self.control_timeout_ms);
             if let Err(e) = restore {
                 tracing::warn!(error = %e, "could not restore the control timeout");
@@ -328,14 +288,7 @@ impl Client {
         Ok(ControlResponse::from_bytes(&reply)?)
     }
 
-    /// Name a control-socket timeout for what it is.
-    ///
-    /// libzmq reports one as `EAGAIN`, which renders as "Resource temporarily
-    /// unavailable" — a message that sends the reader hunting for a resource
-    /// when the cause is almost always that nothing is listening at the
-    /// endpoint. That endpoint is the one fact worth printing, and the client
-    /// derives it from `--ingest` when it is not given, so it is also the one
-    /// the caller is least likely to already know.
+    /// Turn libzmq's `EAGAIN` timeout into an error naming the endpoint.
     fn control_err(&self, e: zmq::Error, what: &str, waited: i32) -> Error {
         match e {
             zmq::Error::EAGAIN => Error::Config(format!(
@@ -360,18 +313,9 @@ impl Client {
         self.schema.keys().map(String::as_str)
     }
 
-    /// Buffer one record, sending the batch once it is full — by record count or
-    /// by size, whichever comes first.
-    ///
-    /// The size bound is not a tuning knob. libzmq discards a message over the
-    /// receiver's `ZMQ_MAXMSGSIZE` *below* the application, so the server cannot
-    /// count, log or reject it and `send` still reports success — the records
-    /// just vanish. Batching by record count alone reached that with 1024
-    /// records of 8 KiB against the 8 MiB default.
-    ///
-    /// A record too large for a batch of its own is [`Error::BatchTooLarge`]:
-    /// no split will ever deliver it. A record that merely does not fit
-    /// alongside what is buffered sends those first and starts a new batch.
+    /// Buffer one record; send the batch when full by count or size. The size
+    /// bound matters: libzmq silently drops messages over the server's limit.
+    /// A record that can't fit even alone is [`Error::BatchTooLarge`].
     pub fn send(&mut self, series: &RemoteSeries, row: &Row<'_>) -> Result<()> {
         let before = self.buf.len();
         self.encoder
@@ -379,7 +323,6 @@ impl Client {
         let frame = self.buf.len() - before;
 
         if codec::BATCH_HEADER_BYTES + frame > self.max_batch_bytes {
-            // `encode` restores the buffer on its own errors; this one is ours.
             self.buf.truncate(before);
             return Err(Error::BatchTooLarge {
                 size: codec::BATCH_HEADER_BYTES + frame,
@@ -387,8 +330,7 @@ impl Client {
             });
         }
         if before > 0 && codec::BATCH_HEADER_BYTES + self.buf.len() > self.max_batch_bytes {
-            // Lift this frame out, send what it would have overflowed, put it
-            // back as the first record of the next batch.
+            // Send the earlier records; this frame starts the next batch.
             let frame = self.buf.split_off(before);
             self.flush()?;
             self.buf.extend_from_slice(&frame);
@@ -406,15 +348,12 @@ impl Client {
         self.max_batch_bytes
     }
 
-    /// Send whatever is buffered now.
-    ///
-    /// A no-op when empty, so calling it on a timer is free.
+    /// Send whatever is buffered; a no-op when empty.
     pub fn flush(&mut self) -> Result<()> {
         if self.pending == 0 {
             return Ok(());
         }
-        // Unreachable via `send`, but this is the one place bytes reach the
-        // socket, and an oversized message here is lost with no diagnostic.
+        // Unreachable via `send`; guards the one place bytes reach the socket.
         let size = codec::BATCH_HEADER_BYTES + self.buf.len();
         if size > self.max_batch_bytes {
             return Err(Error::BatchTooLarge {
@@ -436,8 +375,7 @@ impl Client {
                 self.stats.batches_sent += 1;
                 self.stats.bytes_sent += msg.len() as u64;
             }
-            // Only reachable under `OnFull::Drop`: the queue is full and we
-            // chose not to wait. Counted, because it is otherwise invisible.
+            // `OnFull::Drop` with a full queue.
             Err(zmq::Error::EAGAIN) => {
                 self.stats.records_dropped += self.pending as u64;
                 tracing::warn!(
@@ -463,9 +401,7 @@ impl Client {
 }
 
 impl Drop for Client {
-    /// Flush what is buffered before the socket goes away — otherwise a clean
-    /// exit silently discards a partial batch, the most surprising possible loss
-    /// because nothing went wrong.
+    /// Flush a partial batch so a clean exit doesn't lose it.
     fn drop(&mut self) {
         if self.pending > 0
             && let Err(e) = self.flush()

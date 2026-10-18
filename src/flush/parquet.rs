@@ -1,82 +1,54 @@
 //! Building column chunks and writing them as Parquet.
 //!
-//! This is the only place the engine's record model meets the Parquet format.
-//! One file holds exactly one `(series, epoch)` pair, so the schema here is fixed
-//! for the lifetime of a file and never has to change mid-write.
+//! One file holds one `(series, epoch)`, so its schema is fixed. Columns are
+//! `ts, id, <declared keys...>, extra, data`; `ts` is the declared sorting column.
 //!
-//! Column order is `ts, id, <declared keys...>, extra, data`. `ts` first is
-//! deliberate: it is declared as the file's sorting column, and readers prune
-//! row groups on its statistics.
-//!
-//! # Why this is written against the low-level API
-//!
-//! `ArrowWriter` would do the same job, but reaching it means `parquet/arrow`,
-//! which is all-or-nothing: twelve crates (six `arrow-*`, `arrow-ipc`'s
-//! `flatbuffers` and `bitflags`, `base64`, `num-complex`, `rustc_version`,
-//! `semver`) and five seconds of clean build, for four scalar types and a map.
-//! `arrow-ipc` is pure toll — we never touch IPC — and it embeds a ~700-byte
-//! `ARROW:schema` blob in every file.
-//!
-//! All it does for us is compute definition and repetition levels, which for
-//! this schema is the twenty lines in `MapLevels::for_rows`.
-//!
-//! The switch changed nothing structural: schema, data, row-group boundaries and
-//! statistics all compared identical against `ArrowWriter` output, and
-//! `tests/parquet_reference.rs` pins that.
+//! Written against the low-level API, not `ArrowWriter`: `parquet/arrow` costs a
+//! dozen crates and an `ARROW:schema` blob per file, only to compute the map
+//! levels in `MapLevels::for_rows`. `tests/parquet_reference.rs` pins the output.
 
 use std::fs::File;
 use std::path::Path;
 use std::sync::Arc;
 
+use bytes::Bytes;
 use parquet::basic::{
-    Compression, ConvertedType, LogicalType, Repetition, TimeUnit, Type as PhysicalType,
+    Compression, ConvertedType, Encoding, LogicalType, Repetition, TimeUnit, Type as PhysicalType,
 };
 use parquet::column::writer::ColumnWriter;
 use parquet::data_type::ByteArray;
 use parquet::file::metadata::{KeyValue, SortingColumn};
-use parquet::file::properties::WriterProperties;
+use parquet::file::properties::{EnabledStatistics, WriterProperties};
 use parquet::file::writer::SerializedFileWriter;
-use parquet::schema::types::{Type, TypePtr};
+use parquet::schema::types::{ColumnPath, Type, TypePtr};
 
 use crate::config::KeyDef;
 use crate::error::{Error, Result};
 use crate::record::{KeyType, Value};
 use crate::wal::SEGMENT_ID_DIGITS;
 
-/// Parquet key-value metadata key recording which schema epoch wrote a file.
-///
-/// Mirrors the `.eN.` tag in the filename, which is what `view.sql` generation
-/// reads. This copy survives a rename, so a moved file is still
-/// self-describing.
+/// Key-value metadata key for the schema epoch; mirrors the filename's `.eN.` tag
+/// so a renamed file stays self-describing.
 pub const EPOCH_META_KEY: &str = "orc.schema_epoch";
 
-/// Metadata key recording the series name, for the same reason.
+/// Key-value metadata key for the series name.
 pub const SERIES_META_KEY: &str = "orc.series";
 
-/// Index of the `ts` column. Fixed, and relied on by the sorting-column
-/// declaration below.
+/// Index of the `ts` column, the declared sorting column.
 const TS_COLUMN_IDX: i32 = 0;
 
-/// Compression codecs the pinned `parquet` feature set can actually write.
-///
-/// Config validates against this at load, so an unwritable codec fails
-/// immediately rather than at the first flush an hour later. Kept next to the
-/// match that implements it, so the two cannot drift.
+/// Codecs the writer supports; config validates against this at load.
 pub const SUPPORTED_COMPRESSION: [&str; 4] = ["lz4_raw", "lz4", "uncompressed", "none"];
 
 fn schema_err(what: &str, e: parquet::errors::ParquetError) -> Error {
     Error::Config(format!("building parquet schema ({what}): {e}"))
 }
 
-/// The Parquet schema for one series at one epoch.
+/// The Parquet schema for one series at one epoch, built programmatically since
+/// key names come from user config.
 ///
-/// Built programmatically, not through `parse_message_type`: key names come from
-/// user config, and a string-built schema would need escaping rules for whatever
-/// they contain.
-///
-/// **Every key column is OPTIONAL regardless of config `nullable`.** Nullability
-/// is an ingest rule; writing REQUIRED would stop a column added in a later epoch
-/// reading back as NULL from older files, breaking `view.sql`'s union.
+/// Every key column is OPTIONAL regardless of `nullable`, so a key added in a
+/// later epoch reads as NULL from older files (`view.sql`'s union needs that).
 pub fn parquet_schema(keys: &[KeyDef]) -> Result<TypePtr> {
     let mut fields: Vec<TypePtr> = Vec::with_capacity(keys.len() + 4);
 
@@ -84,15 +56,13 @@ pub fn parquet_schema(keys: &[KeyDef]) -> Result<TypePtr> {
         Type::primitive_type_builder("ts", PhysicalType::INT64)
             .with_repetition(Repetition::REQUIRED)
             .with_logical_type(Some(LogicalType::timestamp(true, TimeUnit::MICROS)))
-            // Set alongside the logical type so readers that predate logical
-            // types still see a UTC microsecond timestamp rather than an i64.
+            // Also set for readers that predate logical types.
             .with_converted_type(ConvertedType::TIMESTAMP_MICROS)
             .build()
             .map_err(|e| schema_err("ts", e))?,
     ));
 
-    // Never null: an absent id is the empty string, so `(ts, id)` dedup has one
-    // representation to compare rather than two that mean the same thing.
+    // Never null: an absent id is "", so `(ts, id)` dedup has one representation.
     fields.push(Arc::new(utf8("id", Repetition::REQUIRED)?));
 
     for k in keys {
@@ -113,10 +83,7 @@ pub fn parquet_schema(keys: &[KeyDef]) -> Result<TypePtr> {
         fields.push(Arc::new(field));
     }
 
-    // The MAP shape the Parquet spec fixes: a REQUIRED group annotated MAP,
-    // holding one REPEATED group named `key_value` with a REQUIRED `key` and an
-    // OPTIONAL `value`. The names are not ours to choose -- readers that go by
-    // the spec rather than by a writer's conventions rely on exactly these.
+    // The spec's MAP shape; readers rely on these exact names.
     let key_value = Type::group_type_builder("key_value")
         .with_repetition(Repetition::REPEATED)
         .with_fields(vec![
@@ -144,8 +111,7 @@ pub fn parquet_schema(keys: &[KeyDef]) -> Result<TypePtr> {
     ))
 }
 
-/// A UTF-8 string column. `ConvertedType::UTF8` is set alongside the logical
-/// type so readers that predate logical types still see a string.
+/// A UTF-8 string column (also `ConvertedType::UTF8` for older readers).
 fn utf8(name: &str, rep: Repetition) -> Result<Type> {
     Type::primitive_type_builder(name, PhysicalType::BYTE_ARRAY)
         .with_repetition(rep)
@@ -155,15 +121,8 @@ fn utf8(name: &str, rep: Repetition) -> Result<Type> {
         .map_err(|e| schema_err(name, e))
 }
 
-/// One declared key column: the present values, plus a definition level per row.
-///
-/// `defs` has an entry per row (1 present, 0 null); `vals` has one per *present*
-/// row. That asymmetry is the encoding — Parquet stores only the values that
-/// exist and reconstructs nulls from the levels.
-///
-/// The levels are the same shape whatever the column holds, so only the values
-/// are typed — which is what keeps each method below to one match instead of
-/// four parallel ones.
+/// One declared key column: a definition level per row (1 present, 0 null) and
+/// values for present rows only.
 #[derive(Debug)]
 struct KeyColumn {
     vals: Values,
@@ -176,7 +135,50 @@ enum Values {
     Bool(Vec<bool>),
     I64(Vec<i64>),
     F64(Vec<f64>),
-    Str(Vec<ByteArray>),
+    Str(StrColumn),
+}
+
+/// A string column: all bytes in one buffer plus end offsets. [`StrColumn::arrays`]
+/// makes `ByteArray`s as slices of one shared `Bytes` per row group.
+#[derive(Debug, Default)]
+struct StrColumn {
+    bytes: Vec<u8>,
+    ends: Vec<usize>,
+}
+
+impl StrColumn {
+    fn with_capacity(values: usize) -> Self {
+        Self {
+            bytes: Vec::new(),
+            ends: Vec::with_capacity(values),
+        }
+    }
+
+    fn push(&mut self, s: &str) {
+        self.bytes.extend_from_slice(s.as_bytes());
+        self.ends.push(self.bytes.len());
+    }
+
+    fn start(&self, i: usize) -> usize {
+        if i == 0 { 0 } else { self.ends[i - 1] }
+    }
+
+    /// Values `[range)` as `ByteArray`s sharing one buffer.
+    fn arrays(&self, range: std::ops::Range<usize>) -> Vec<ByteArray> {
+        if range.is_empty() {
+            return Vec::new();
+        }
+        let base = self.start(range.start);
+        let shared = Bytes::copy_from_slice(&self.bytes[base..self.ends[range.end - 1]]);
+        range
+            .map(|i| ByteArray::from(shared.slice(self.start(i) - base..self.ends[i] - base)))
+            .collect()
+    }
+
+    fn clear(&mut self) {
+        self.bytes.clear();
+        self.ends.clear();
+    }
 }
 
 impl KeyColumn {
@@ -186,7 +188,7 @@ impl KeyColumn {
                 KeyType::Bool => Values::Bool(Vec::with_capacity(cap)),
                 KeyType::I64 => Values::I64(Vec::with_capacity(cap)),
                 KeyType::F64 => Values::F64(Vec::with_capacity(cap)),
-                KeyType::Str => Values::Str(Vec::with_capacity(cap)),
+                KeyType::Str => Values::Str(StrColumn::with_capacity(cap)),
             },
             defs: Vec::with_capacity(cap),
         }
@@ -213,7 +215,7 @@ impl KeyColumn {
             (Values::Bool(xs), Value::Bool(x)) => xs.push(*x),
             (Values::I64(xs), Value::I64(x)) => xs.push(*x),
             (Values::F64(xs), Value::F64(x)) => xs.push(*x),
-            (Values::Str(xs), Value::Str(x)) => xs.push(ByteArray::from(x.as_bytes().to_vec())),
+            (Values::Str(xs), Value::Str(x)) => xs.push(x),
             _ => {
                 return Err(Error::TypeMismatch {
                     series: series.to_string(),
@@ -228,23 +230,15 @@ impl KeyColumn {
     }
 }
 
-/// Where each column has been written up to, so successive row groups resume
-/// correctly.
-///
-/// Values are not indexed by row — a nullable column skips nulls, and the map
-/// columns hold a variable number of entries per row. Carrying a cursor keeps
-/// splitting O(rows) instead of rescanning the prefix per group.
+/// Per-column value offsets carried across row groups (values are not indexed
+/// by row: nulls are skipped and maps vary in length).
 #[derive(Debug, Default)]
 struct Cursors {
     keys: Vec<usize>,
     extra: usize,
 }
 
-/// Accumulated rows for one `(series, epoch)`, ready to write.
-///
-/// Rows arrive sorted and deduplicated; this only materialises them. It is the
-/// first point where a record becomes owned data, which is why the sort upstream
-/// works on an index.
+/// Accumulated rows for one `(series, epoch)`, already sorted and deduplicated.
 #[derive(Debug)]
 pub struct Columns {
     series: String,
@@ -252,26 +246,20 @@ pub struct Columns {
     key_names: Vec<String>,
     rows: usize,
     ts: Vec<i64>,
-    id: Vec<ByteArray>,
+    id: StrColumn,
     keys: Vec<KeyColumn>,
-    /// Flattened map entries, and how many belong to each row. The counts are
-    /// what let a row group be cut without ever splitting a row's entries.
-    extra_keys: Vec<ByteArray>,
-    extra_values: Vec<ByteArray>,
+    /// Flattened map entries plus a count per row, so groups never split a row.
+    extra_keys: StrColumn,
+    extra_values: StrColumn,
     extra_counts: Vec<u32>,
-    data: Vec<ByteArray>,
+    data: StrColumn,
 }
 
 /// Accumulates rows into [`Columns`].
-///
-/// A separate type from `Columns` only so `finish()` marks the point after which
-/// nothing more can be appended.
 #[derive(Debug)]
 pub struct RowBuilder {
     cols: Columns,
-    /// Reusable index scratch for collapsing duplicate `extra` names, on the
-    /// rare row that arrives with any. Indices rather than borrowed pairs, so it
-    /// outlives the rows it sorts.
+    /// Index scratch for collapsing duplicate `extra` names.
     order: Vec<u32>,
 }
 
@@ -285,12 +273,12 @@ impl RowBuilder {
                 key_names: key_defs.iter().map(|k| k.name.clone()).collect(),
                 rows: 0,
                 ts: Vec::with_capacity(cap),
-                id: Vec::with_capacity(cap),
+                id: StrColumn::with_capacity(cap),
                 keys: key_defs.iter().map(|k| KeyColumn::new(k.ty, cap)).collect(),
-                extra_keys: Vec::new(),
-                extra_values: Vec::new(),
+                extra_keys: StrColumn::default(),
+                extra_values: StrColumn::default(),
                 extra_counts: Vec::with_capacity(cap),
-                data: Vec::with_capacity(cap),
+                data: StrColumn::with_capacity(cap),
             },
         })
     }
@@ -307,9 +295,8 @@ impl RowBuilder {
         self.len() == 0
     }
 
-    /// Append one row. `keys` must have exactly the declared arity: ingest
-    /// guaranteed that, so a mismatch means a frame was decoded under the wrong
-    /// epoch — an error, not a silent short row.
+    /// Append one row. A `keys` arity mismatch means the frame was decoded under
+    /// the wrong epoch, and is an error.
     pub fn append(
         &mut self,
         ts: u64,
@@ -318,8 +305,7 @@ impl RowBuilder {
         extra: &[(&str, &str)],
         data: &str,
     ) -> Result<()> {
-        // Destructured, so the `extra` scratch below and the columns are two
-        // disjoint borrows rather than two of `self`.
+        // Destructured so `order` and the columns are disjoint borrows.
         let Self { cols: c, order } = self;
         if keys.len() != c.keys.len() {
             return Err(Error::KeyArity {
@@ -328,10 +314,8 @@ impl RowBuilder {
                 got: keys.len(),
             });
         }
-        // The one place unsigned `ts` has to narrow: TIMESTAMP(MICROS) is a
-        // signed INT64. The accept window puts every real timestamp eleven orders
-        // of magnitude below the boundary (year 294247), so this is unreachable
-        // through `append` -- an error, not a silent wrap, for direct callers.
+        // TIMESTAMP(MICROS) is signed. Unreachable within the accept window, but
+        // an error rather than a wrap for direct callers.
         let ts = i64::try_from(ts).map_err(|_| {
             Error::Config(format!(
                 "ts {ts} is past the largest instant Parquet can record \
@@ -339,26 +323,17 @@ impl RowBuilder {
             ))
         })?;
         c.ts.push(ts);
-        c.id.push(ByteArray::from(id.as_bytes().to_vec()));
+        c.id.push(id);
         for (i, (column, value)) in std::iter::zip(&mut c.keys, keys).enumerate() {
             column.append(value, &c.series, &c.key_names[i])?;
         }
-        // A repeated key makes the MAP malformed, and a reader rejects the whole
-        // *file* over it rather than the one row. The codec collapses duplicates
-        // already, so this is the backstop for frames it never saw -- a
-        // hand-rolled client's, arriving through `append_raw`, which validates
-        // only the fixed prefix and never looks at `extra`.
-        //
-        // Which is why it cannot be the adjacent-only pass it used to be:
-        // sorted-by-name is the layout's contract, but a producer that ignores
-        // the contract is the whole case for a backstop, and
-        // `[("k","1"), ("z","9"), ("k","2")]` walks straight past a
-        // compare-with-previous check. The canonical case still costs one
-        // comparison pass and no allocation.
+        // Backstop for frames the codec never canonicalised (`append_raw` checks
+        // only the prefix): a repeated MAP key makes the whole file unreadable.
+        // Duplicates need not be adjacent, so sort and collapse like the codec.
         let mut kept = 0u32;
         let mut push = |k: &str, v: &str| {
-            c.extra_keys.push(ByteArray::from(k.as_bytes().to_vec()));
-            c.extra_values.push(ByteArray::from(v.as_bytes().to_vec()));
+            c.extra_keys.push(k);
+            c.extra_values.push(v);
             kept += 1;
         };
         if crate::codec::is_canonical(extra) {
@@ -369,19 +344,16 @@ impl RowBuilder {
             order.clear();
             order.extend(0..extra.len() as u32);
             order.sort_unstable_by_key(|&i| extra[i as usize]);
-            // Equal names are adjacent now, so one pass collapses each run to
-            // its first member -- the codec's rule, so a frame it produced and a
-            // frame repaired here land identically.
+            // Collapse runs to their first member, matching the codec.
             order.dedup_by(|a, b| extra[*a as usize].0 == extra[*b as usize].0);
             for &i in order.iter() {
                 let (k, v) = extra[i as usize];
                 push(k, v);
             }
         }
-        // Count 0 encodes an *empty* map, not a null one. A reader tells them
-        // apart, and "no undeclared keys" is the former.
+        // Count 0 is an empty map, not null.
         c.extra_counts.push(kept);
-        c.data.push(ByteArray::from(data.as_bytes().to_vec()));
+        c.data.push(data);
         c.rows += 1;
         Ok(())
     }
@@ -390,41 +362,52 @@ impl RowBuilder {
     pub fn finish(self) -> Result<Columns> {
         Ok(self.cols)
     }
+
+    /// Drop every accumulated row, keeping the allocations for the next batch.
+    fn clear(&mut self) {
+        let c = &mut self.cols;
+        c.rows = 0;
+        c.ts.clear();
+        c.id.clear();
+        for k in &mut c.keys {
+            k.defs.clear();
+            match &mut k.vals {
+                Values::Bool(v) => v.clear(),
+                Values::I64(v) => v.clear(),
+                Values::F64(v) => v.clear(),
+                Values::Str(v) => v.clear(),
+            }
+        }
+        c.extra_keys.clear();
+        c.extra_values.clear();
+        c.extra_counts.clear();
+        c.data.clear();
+    }
 }
 
-/// Definition and repetition levels for one row group's `extra` map — the only
-/// place in this schema where levels are not trivially all-present.
-///
-/// This is the twenty lines of arithmetic that reaching for `ArrowWriter` would
-/// have bought, so it is worth stating exactly. `key` sits inside a REPEATED
-/// group under a REQUIRED one, so its maximum definition level is 1 and its
-/// maximum repetition level is 1. `value` is OPTIONAL inside that group, so its
-/// maximum definition level is 2.
+/// Definition/repetition levels for one row group's `extra` map. Max def is 1
+/// for `key`, 2 for the OPTIONAL `value`; max rep is 1.
 ///
 /// ```text
-/// empty map    -> def 0,   rep 0   one slot standing for "no entries"
-/// entry 0      -> def 1/2, rep 0   rep 0 opens a new row
-/// entry i > 0  -> def 1/2, rep 1   rep 1 continues this row's list
+/// empty map    -> def 0,   rep 0
+/// entry 0      -> def 1/2, rep 0   (opens a row)
+/// entry i > 0  -> def 1/2, rep 1
 /// ```
 ///
-/// A row's entries are always emitted together, so a row group boundary can
-/// never land inside a list and the first record of every group is guaranteed
-/// rep 0 — which is what the format requires.
+/// A row's entries are emitted together, so every group starts at rep 0.
 #[derive(Debug)]
 struct MapLevels {
     key_defs: Vec<i16>,
     value_defs: Vec<i16>,
     reps: Vec<i16>,
-    /// Present entries across these rows: how far to advance the value cursor,
-    /// and how many values the writer will consume.
+    /// Present entries in these rows: how far to advance the value cursor.
     entries: usize,
 }
 
 impl MapLevels {
     fn for_rows(counts: &[u32]) -> Self {
         let entries: usize = counts.iter().map(|&n| n as usize).sum();
-        // An empty map still occupies one slot, so the level arrays are longer
-        // than the value arrays by the number of rows with no entries.
+        // An empty map still occupies one level slot.
         let slots = entries + counts.iter().filter(|&&n| n == 0).count();
 
         let mut out = MapLevels {
@@ -442,8 +425,7 @@ impl MapLevels {
             }
             for i in 0..count {
                 out.key_defs.push(1);
-                // A null value is never appended, so a present entry is always
-                // at the maximum definition level.
+                // Values are never null, so always max def.
                 out.value_defs.push(2);
                 out.reps.push(if i == 0 { 0 } else { 1 });
             }
@@ -456,11 +438,7 @@ fn io_err(e: parquet::errors::ParquetError) -> Error {
     Error::Config(format!("writing parquet: {e}"))
 }
 
-/// Write one BYTE_ARRAY column and close it.
-///
-/// Four of the seven leaves are byte arrays — `id`, both halves of the map, and
-/// `data` — and the open/match/close around each is identical. Only the levels
-/// differ, so they are the parameters.
+/// Write one BYTE_ARRAY column with the given levels and close it.
 fn write_bytes<W: std::io::Write + Send>(
     rg: &mut parquet::file::writer::SerializedRowGroupWriter<'_, W>,
     what: &'static str,
@@ -488,10 +466,7 @@ impl Columns {
         Arc::clone(&self.schema)
     }
 
-    /// Write rows `[start, end)` as one row group.
-    ///
-    /// Columns go to `next_column()` in schema order, each closed before the next
-    /// opens. The writer enforces it; the order here is [`parquet_schema`]'s.
+    /// Write rows `[start, end)` as one row group, columns in [`parquet_schema`] order.
     fn write_group<W: std::io::Write + Send>(
         &self,
         rg: &mut parquet::file::writer::SerializedRowGroupWriter<'_, W>,
@@ -510,13 +485,12 @@ impl Columns {
         c.close().map_err(io_err)?;
 
         // -- id: REQUIRED -----------------------------------------------------
-        write_bytes(rg, "id", &self.id[start..end], None, None)?;
+        write_bytes(rg, "id", &self.id.arrays(start..end), None, None)?;
 
         // -- declared keys: OPTIONAL, def level 1 present / 0 null ------------
         for (i, column) in self.keys.iter().enumerate() {
             let defs = &column.defs[start..end];
-            // Only present rows contributed a value, so the slice of values this
-            // group owns is as long as the number of 1s in its levels.
+            // This group's values: one per present (def 1) row.
             let present = defs.iter().filter(|&&d| d == 1).count();
             let from = cursors.keys[i];
             let to = from + present;
@@ -534,7 +508,7 @@ impl Columns {
                     .write_batch(&v[from..to], Some(defs), None)
                     .map_err(io_err)?,
                 (ColumnWriter::ByteArrayColumnWriter(w), Values::Str(v)) => w
-                    .write_batch(&v[from..to], Some(defs), None)
+                    .write_batch(&v.arrays(from..to), Some(defs), None)
                     .map_err(io_err)?,
                 _ => unreachable!("column writer disagrees with the schema we built"),
             };
@@ -548,24 +522,21 @@ impl Columns {
         let to = from + levels.entries;
         cursors.extra = to;
 
-        let keys = &self.extra_keys[from..to];
-        let values = &self.extra_values[from..to];
+        let keys = &self.extra_keys.arrays(from..to);
+        let values = &self.extra_values.arrays(from..to);
         let reps = Some(levels.reps.as_slice());
         write_bytes(rg, "extra.key", keys, Some(&levels.key_defs), reps)?;
         write_bytes(rg, "extra.value", values, Some(&levels.value_defs), reps)?;
 
         // -- data: REQUIRED ---------------------------------------------------
-        write_bytes(rg, "data", &self.data[start..end], None, None)?;
+        write_bytes(rg, "data", &self.data.arrays(start..end), None, None)?;
 
         Ok(())
     }
 }
 
-/// Writer properties for a flush output file.
-///
-/// Declaring `ts` a sorting column is not decoration: the rows really are sorted
-/// by it, and a reader that trusts the declaration prunes row groups on
-/// statistics alone. Actively harmful if the sort upstream were ever dropped.
+/// Writer properties for a flush output file. Declaring `ts` the sorting column
+/// is true only because rows are sorted upstream.
 pub fn writer_properties(
     series: &str,
     epoch: u32,
@@ -573,10 +544,7 @@ pub fn writer_properties(
     _row_group_rows: usize,
 ) -> Result<WriterProperties> {
     let codec = match compression {
-        // LZ4_RAW (codec 7, Parquet 2.9), never the deprecated LZ4 (codec 5),
-        // whose non-standard Hadoop framing is why it was deprecated. Bare
-        // "lz4" is accepted as a spelling of the same thing rather than
-        // rejected, because the one it might have meant is not one we write.
+        // LZ4_RAW, never the deprecated Hadoop-framed LZ4; "lz4" is an alias.
         "lz4_raw" | "lz4" => Compression::LZ4_RAW,
         "uncompressed" | "none" => Compression::UNCOMPRESSED,
         other => {
@@ -586,12 +554,18 @@ pub fn writer_properties(
             )));
         }
     };
-    // Note: `set_max_row_group_row_count` is deliberately NOT set. Only
-    // `ArrowWriter` consults it; `SerializedFileWriter` splits row groups
-    // wherever the caller calls `next_row_group()`, so `write_file` owns the
-    // split and setting the property here would be a claim nothing enforces.
+    // No max row group size: `SerializedFileWriter` ignores it; callers cut groups.
+    let col = |name: &str| ColumnPath::from(name);
     Ok(WriterProperties::builder()
         .set_compression(codec)
+        // No dictionary on near-unique ts/id/data; declared keys and `extra` keep it.
+        .set_column_dictionary_enabled(col("ts"), false)
+        .set_column_dictionary_enabled(col("id"), false)
+        .set_column_dictionary_enabled(col("data"), false)
+        // Sorted timestamps delta-encode into a few bits each.
+        .set_column_encoding(col("ts"), Encoding::DELTA_BINARY_PACKED)
+        // Opaque payload: min/max would prune nothing.
+        .set_column_statistics_enabled(col("data"), EnabledStatistics::None)
         .set_sorting_columns(Some(vec![SortingColumn {
             column_idx: TS_COLUMN_IDX,
             descending: false,
@@ -605,11 +579,8 @@ pub fn writer_properties(
         .build())
 }
 
-/// Write `cols` to `path` as a complete Parquet file, then fsync it.
-///
-/// The fsync matters: the flush commits the manifest while this file is still
-/// staged, then deletes the segments it came from, so contents that were not
-/// durable before the commit leave a committed range whose only copy is empty.
+/// Write `cols` to `path` as one Parquet file and fsync it. The flush streams via
+/// [`PartitionWriter`]; this is the reference it must match.
 pub fn write_file(
     path: &Path,
     cols: &Columns,
@@ -647,21 +618,99 @@ pub fn write_file(
     Ok(())
 }
 
-/// The name of a flush output file: segment range, epoch tag, extension.
-///
-/// The range makes a re-run after a crash produce the *same* filename rather than
-/// a duplicate — that is what makes flush idempotent. The epoch tag is what lets
-/// `view.sql` be regenerated without the manifest tracking files.
+/// A Parquet file streamed one row group at a time, so memory is one group.
+/// Byte-identical to [`write_file`] over the same rows (same group cuts).
+pub struct PartitionWriter {
+    writer: SerializedFileWriter<File>,
+    builder: RowBuilder,
+    group_rows: usize,
+    rows: usize,
+}
+
+impl std::fmt::Debug for PartitionWriter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PartitionWriter")
+            .field("group_rows", &self.group_rows)
+            .field("rows", &self.rows)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PartitionWriter {
+    pub fn create(
+        path: &Path,
+        series: &str,
+        epoch: u32,
+        key_defs: &[KeyDef],
+        compression: &str,
+        row_group_rows: usize,
+    ) -> Result<Self> {
+        let props = writer_properties(series, epoch, compression, row_group_rows)?;
+        let group_rows = row_group_rows.max(1);
+        // One group's capacity, capped: config bounds `row_group_rows`, not file size.
+        let builder = RowBuilder::new(series, key_defs, group_rows.min(1 << 16))?;
+        let file = File::create(path)?;
+        let writer = SerializedFileWriter::new(file, builder.schema(), Arc::new(props))
+            .map_err(|e| Error::Config(format!("opening parquet writer for {path:?}: {e}")))?;
+        Ok(Self {
+            writer,
+            builder,
+            group_rows,
+            rows: 0,
+        })
+    }
+
+    /// Append one row; a full row group is written out immediately.
+    pub fn append(
+        &mut self,
+        ts: u64,
+        id: &str,
+        keys: &[Value<'_>],
+        extra: &[(&str, &str)],
+        data: &str,
+    ) -> Result<()> {
+        self.builder.append(ts, id, keys, extra, data)?;
+        self.rows += 1;
+        if self.builder.len() >= self.group_rows {
+            self.write_group()?;
+        }
+        Ok(())
+    }
+
+    fn write_group(&mut self) -> Result<()> {
+        if self.builder.is_empty() {
+            return Ok(());
+        }
+        let cols = &self.builder.cols;
+        let mut cursors = Cursors {
+            keys: vec![0; cols.keys.len()],
+            extra: 0,
+        };
+        let mut rg = self.writer.next_row_group().map_err(io_err)?;
+        cols.write_group(&mut rg, 0, cols.rows, &mut cursors)?;
+        rg.close().map_err(io_err)?;
+        self.builder.clear();
+        Ok(())
+    }
+
+    /// Write the last row group, close and fsync; returns the row count. The fsync
+    /// matters: the flush then commits the manifest and deletes source segments.
+    pub fn finish(mut self) -> Result<usize> {
+        self.write_group()?;
+        let file = self.writer.into_inner().map_err(io_err)?;
+        file.sync_all()?;
+        Ok(self.rows)
+    }
+}
+
+/// Flush output name: segment range and epoch tag. The range makes a re-run
+/// after a crash reuse the same name, keeping flush idempotent.
 pub fn output_file_name(first_segment: u64, last_segment: u64, epoch: u32) -> String {
     format!("{first_segment:010}-{last_segment:010}.e{epoch}.parquet")
 }
 
-/// The `(first_segment, last_segment, epoch)` a flush output name encodes, or
-/// `None` if the name is not one this engine wrote.
-///
-/// Exact inverse of [`output_file_name`]. The startup sweep tells a committed
-/// file from an interrupted flush's leftovers with it, so it is strict: anything
-/// it cannot parse is left alone, which is the safe direction.
+/// Inverse of [`output_file_name`], strict: the startup sweep leaves anything it
+/// cannot parse alone.
 pub fn parse_output_file_name(name: &str) -> Option<(u64, u64, u32)> {
     let rest = name.strip_suffix(".parquet")?;
     let (range, epoch) = rest.rsplit_once(".e")?;
@@ -676,11 +725,8 @@ pub fn parse_output_file_name(name: &str) -> Option<(u64, u64, u32)> {
     ))
 }
 
-/// One zero-padded segment id from a file name.
-///
-/// `parse_segment_name`'s width rule, for its reason: `{:010}` pads but does not
-/// truncate, so an id is ten digits or more with no leading zero. Accepting `041`
-/// beside `0000000041` would mean two names for one range.
+/// One segment id from a file name, with `parse_segment_name`'s width rule (at
+/// least ten digits, no leading zero beyond ten), so a range has one name.
 fn parse_segment_field(s: &str) -> Option<u64> {
     if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
         return None;
@@ -722,6 +768,111 @@ mod tests {
         ]
     }
 
+    /// `PartitionWriter` must match `write_file` byte for byte, across group cuts.
+    #[test]
+    fn streaming_output_is_byte_identical_to_write_file() {
+        let keys = sample_keys();
+        type TestRow = (
+            u64,
+            String,
+            Vec<Value<'static>>,
+            Vec<(&'static str, &'static str)>,
+        );
+        let rows: Vec<TestRow> = (0..11u64)
+            .map(|i| {
+                let vals = vec![
+                    if i % 4 == 0 {
+                        Value::Null
+                    } else {
+                        Value::Str("AAPL")
+                    },
+                    Value::I64(i as i64),
+                    if i % 3 == 0 {
+                        Value::Null
+                    } else {
+                        Value::F64(i as f64 / 2.0)
+                    },
+                    Value::Bool(i % 2 == 0),
+                ];
+                let extra = match i % 3 {
+                    0 => vec![],
+                    1 => vec![("feed", "itch")],
+                    _ => vec![("a", "1"), ("b", "2")],
+                };
+                (1_000 + i, format!("id{i}"), vals, extra)
+            })
+            .collect();
+
+        let dir = tempfile::tempdir().unwrap();
+        let whole = dir.path().join("whole.parquet");
+        let streamed = dir.path().join("streamed.parquet");
+
+        let mut b = RowBuilder::new("s", &keys, rows.len()).unwrap();
+        for (ts, id, vals, extra) in &rows {
+            b.append(*ts, id, vals, extra, "{}").unwrap();
+        }
+        write_file(&whole, &b.finish().unwrap(), "s", 4, "lz4_raw", 4).unwrap();
+
+        let mut w = PartitionWriter::create(&streamed, "s", 4, &keys, "lz4_raw", 4).unwrap();
+        for (ts, id, vals, extra) in &rows {
+            w.append(*ts, id, vals, extra, "{}").unwrap();
+        }
+        assert_eq!(w.finish().unwrap(), rows.len());
+
+        assert_eq!(
+            std::fs::read(&streamed).unwrap(),
+            std::fs::read(&whole).unwrap()
+        );
+        assert_eq!(read_metadata(&streamed).unwrap().row_group_rows, [4, 4, 3]);
+    }
+
+    /// The per-column choices in `writer_properties`, read back from a real file.
+    #[test]
+    fn columns_are_encoded_for_what_they_hold() {
+        use parquet::file::reader::{FileReader, SerializedFileReader};
+
+        let keys = [keydef("symbol", KeyType::Str)];
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("enc.parquet");
+        let mut w = PartitionWriter::create(&path, "s", 0, &keys, "lz4_raw", 1024).unwrap();
+        for i in 0..100u64 {
+            let id = format!("id{i}");
+            w.append(1_000 + i, &id, &[Value::Str("AAPL")], &[], "{}")
+                .unwrap();
+        }
+        w.finish().unwrap();
+
+        let reader = SerializedFileReader::new(std::fs::File::open(&path).unwrap()).unwrap();
+        let rg = reader.metadata().row_group(0);
+        let col = |name: &str| {
+            (0..rg.num_columns())
+                .map(|i| rg.column(i))
+                .find(|c| c.column_path().string() == name)
+                .unwrap()
+        };
+        let has = |name: &str, enc: Encoding| col(name).encodings().any(|e| e == enc);
+
+        assert!(
+            has("ts", Encoding::DELTA_BINARY_PACKED),
+            "ts is delta-encoded"
+        );
+        for unique in ["ts", "id", "data"] {
+            assert!(
+                col(unique).dictionary_page_offset().is_none(),
+                "{unique} has no dictionary"
+            );
+        }
+        assert!(
+            col("symbol").dictionary_page_offset().is_some(),
+            "a declared key keeps its dictionary"
+        );
+        assert!(col("data").statistics().is_none(), "no statistics on data");
+        assert!(
+            col("ts").statistics().is_some(),
+            "ts keeps min/max for pruning"
+        );
+    }
+
     #[test]
     fn schema_shape_and_nullability() {
         let s = parquet_schema(&sample_keys()).unwrap();
@@ -734,8 +885,7 @@ mod tests {
         let rep = |i: usize| s.get_fields()[i].get_basic_info().repetition();
         assert_eq!(rep(0), Repetition::REQUIRED, "ts is always present");
         assert_eq!(rep(1), Repetition::REQUIRED, "absent id is \"\", not null");
-        // Every key column is optional regardless of config, so a column added
-        // in a later epoch reads as NULL from older files.
+        // Keys are OPTIONAL regardless of config.
         for i in 2..6 {
             assert_eq!(rep(i), Repetition::OPTIONAL, "key column {i}");
         }
@@ -862,8 +1012,7 @@ mod tests {
         let keys = vec![keydef("symbol", KeyType::Str)];
         let mut b = RowBuilder::new("s", &keys, 40).unwrap();
 
-        // Map cardinality cycles 0..3 so every possible offset within a row's
-        // list of entries coincides with a group boundary somewhere.
+        // Cardinality cycles 0..3 so cuts hit every offset in a row's list.
         let mut expected: Vec<Vec<(String, String)>> = Vec::new();
         for i in 0..40u64 {
             let pairs: Vec<(String, String)> = (0..(i % 4))
@@ -878,8 +1027,7 @@ mod tests {
             expected.push(pairs);
         }
         let cols = b.finish().unwrap();
-        // 3 does not divide 4, so boundaries walk through every phase of the
-        // cardinality cycle rather than always landing in the same place.
+        // Groups of 3 walk through every phase of the 4-cycle.
         write_file(&path, &cols, "s", 0, "uncompressed", 3).unwrap();
 
         let meta = read_metadata(&path).unwrap();
@@ -894,8 +1042,7 @@ mod tests {
         }
     }
 
-    /// Nulls are stored as absent values plus a level, so a group boundary must
-    /// advance the value cursor by the number of *present* rows, not all rows.
+    /// Group cuts must advance value cursors by present rows only.
     #[test]
     fn a_row_group_boundary_keeps_nulls_aligned() {
         let dir = tempfile::tempdir().unwrap();
@@ -903,8 +1050,7 @@ mod tests {
         let keys = vec![keydef("a", KeyType::I64), keydef("b", KeyType::Str)];
         let mut b = RowBuilder::new("s", &keys, 30).unwrap();
         for i in 0..30u64 {
-            // Two columns with different null patterns, so a shared cursor or an
-            // off-by-one in either would shift values onto the wrong rows.
+            // Different null patterns per column catch a shared or off-by-one cursor.
             let a = if i % 3 == 0 {
                 Value::Null
             } else {
@@ -932,8 +1078,7 @@ mod tests {
         }
     }
 
-    /// The startup sweep deletes from `series/` on the strength of this parse,
-    /// so a name it misreads is a file wrongly kept or wrongly removed.
+    /// The startup sweep deletes files based on this parse.
     #[test]
     fn output_file_names_round_trip_and_reject_everything_else() {
         for (first, last, epoch) in [(1u64, 2u64, 0u32), (41, 42, 7), (0, u64::MAX, u32::MAX)] {
@@ -963,10 +1108,7 @@ mod tests {
         }
     }
 
-    /// The codec collapses duplicates on its way in, but `append_raw` validates
-    /// only a frame's fixed prefix — so a hand-rolled client's frame reaches the
-    /// builder unexamined. A repeated MAP key is not a value a reader can make
-    /// sense of, and it costs the whole file, not the row.
+    /// Backstop for frames that reach the builder via `append_raw`, uncanonicalised.
     #[test]
     fn a_repeated_extra_key_cannot_reach_the_file() {
         let dir = tempfile::tempdir().unwrap();
@@ -974,13 +1116,9 @@ mod tests {
         let mut b = RowBuilder::new("s", &[], 4).unwrap();
         b.append(1, "a", &[], &[("k", "1"), ("k", "2"), ("z", "9")], "")
             .unwrap();
-        // The row after it must stay aligned: the map columns are flattened, so
-        // dropping an entry has to be reflected in this row's count or every
-        // later row reads someone else's entries.
+        // The next row must stay aligned with the flattened map columns.
         b.append(2, "b", &[], &[("k", "3")], "").unwrap();
-        // Duplicates that are not adjacent. Sorted-by-name is the frame layout's
-        // contract, but a producer that ignores it is exactly what a backstop is
-        // for -- and a compare-with-previous check walks straight past this.
+        // Non-adjacent duplicates.
         b.append(3, "c", &[], &[("k", "1"), ("z", "9"), ("k", "2")], "")
             .unwrap();
         // ...including when the run wraps the whole row.
@@ -995,8 +1133,7 @@ mod tests {
         ];
         assert_eq!(rows[0].extra, kz);
         assert_eq!(rows[1].extra, [("k".to_string(), "3".to_string())]);
-        // Repaired into canonical order, first-of-run winning -- the same rule
-        // and the same result the codec would have produced.
+        // Canonical order, first of run wins: same as the codec.
         assert_eq!(rows[2].extra, kz);
         assert_eq!(
             rows[3].extra,
@@ -1022,18 +1159,12 @@ mod tests {
 
     #[test]
     fn unsupported_compression_is_rejected_before_any_io() {
-        // Compiled out, so it must fail at config load rather than at the first
-        // flush an hour later.
+        // Compiled out, so rejected at config load.
         assert!(writer_properties("s", 0, "brotli", 128).is_err());
         assert!(writer_properties("s", 0, "zstd", 128).is_err());
     }
 
-    /// The list config validates against and the match that implements it must
-    /// agree in both directions.
-    ///
-    /// They used to be two separate lists and had already drifted: config
-    /// accepted `"none"` but not `"uncompressed"`, so a codec the writer handles
-    /// fine was refused at load. One list, checked both ways, is the fix.
+    /// The advertised list and the writer must agree both ways.
     #[test]
     fn every_advertised_codec_can_actually_be_written() {
         for name in SUPPORTED_COMPRESSION {
@@ -1051,9 +1182,7 @@ mod tests {
         }
     }
 
-    /// LZ4_RAW (codec 7), never the deprecated LZ4 (codec 5) whose non-standard
-    /// Hadoop framing is why it was deprecated. Readers treat them differently,
-    /// so writing the wrong one is a compatibility bug, not a performance one.
+    /// LZ4_RAW (codec 7), never deprecated LZ4 (codec 5): readers treat them differently.
     #[test]
     fn lz4_means_lz4_raw() {
         for name in ["lz4", "lz4_raw"] {
@@ -1066,8 +1195,7 @@ mod tests {
         }
     }
 
-    /// A zero-row file is never written by the flush (an empty flush is a
-    /// no-op), but the writer must not produce a corrupt file if it ever is.
+    /// The flush never writes zero rows, but the result must still be a valid file.
     #[test]
     fn zero_rows_writes_a_readable_empty_file() {
         let dir = tempfile::tempdir().unwrap();

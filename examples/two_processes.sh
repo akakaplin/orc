@@ -1,18 +1,8 @@
 #!/usr/bin/env bash
-#
-# Two processes, one data directory.
-#
-#   1. `embedded_server` opens the engine, writes five timestamps to it from an
-#      in-process thread, and serves a ZeroMQ socket at the same time.
-#   2. `remote_writer` connects from outside and writes five more.
-#   3. `orc-cli` reads the counters back and asks the server to stop.
-#
-# Both writers' records end up in the same Parquet files, which is the point:
-# embedding the engine and talking to it over a socket are the same write path.
-#
-#   ./examples/two_processes.sh
-#
-# Leaves nothing behind unless KEEP=1 is set.
+# Two processes, one data directory: `embedded_server` writes in-process and
+# serves ZeroMQ, `remote_writer` writes over the socket, `orc-cli` reads stats
+# and stops the server. Both writers land in the same Parquet files.
+# Set KEEP=1 to keep the data directory.
 
 set -euo pipefail
 
@@ -40,8 +30,7 @@ echo "==> starting the embedded server on $INGEST"
 "$BIN/examples/embedded_server" "$DATA" "$INGEST" "$CONTROL" &
 SERVER_PID=$!
 
-# The socket is not up the instant the process is, so poll rather than sleep a
-# guessed amount. `ping` is there for exactly this.
+# Poll until the socket is up.
 echo "==> waiting for the control socket"
 for _ in $(seq 100); do
     if "$BIN/orc-cli" --ingest "$INGEST" ping >/dev/null 2>&1; then

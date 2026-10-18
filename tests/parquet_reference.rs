@@ -1,21 +1,5 @@
-//! The observable Parquet contract, pinned.
-//!
-//! Every assertion here was checked against `ArrowWriter` output before the
-//! writer was rewritten to use the low-level API: the same three fixtures were
-//! produced by both, and 2244 lines of dumped schema, row-group boundaries,
-//! statistics, key-value metadata, data and per-row map cardinality compared
-//! identical. Not a byte comparison — page layout and compression framing are
-//! free to differ — but everything a reader can actually observe.
-//!
-//! That comparison cannot live in the repository, because it needs the Arrow
-//! writer that was removed. What it established can, and this is it. If any of
-//! these change, files this engine writes stop looking like files it used to
-//! write — which readers, and the `view.sql` union across epochs, both depend on.
-//!
-//! The fixtures were zstd-compressed when the comparison ran; the tests below
-//! write LZ4_RAW, which the engine switched to afterwards. Nothing here depends
-//! on the codec — that is the point of comparing observable structure rather
-//! than bytes.
+//! The reader-observable Parquet contract (schema, row groups, metadata, values),
+//! matching what `ArrowWriter` produced. Readers and `view.sql` depend on it.
 
 use std::path::Path;
 
@@ -45,10 +29,7 @@ fn all_types() -> Vec<KeyDef> {
     ]
 }
 
-/// Leaf column paths, in order. This is what a reader walks, and the MAP's
-/// `key_value` / `key` / `value` names are fixed by the Parquet spec rather
-/// than chosen by us — a reader that goes by the spec finds a map only if they
-/// are exactly these.
+/// Leaf column paths, in order; the MAP's inner names are fixed by the Parquet spec.
 #[test]
 fn the_leaf_columns_are_exactly_these_in_exactly_this_order() {
     let dir = tempfile::tempdir().unwrap();
@@ -85,8 +66,7 @@ fn the_leaf_columns_are_exactly_these_in_exactly_this_order() {
     );
 }
 
-/// `ts` first is load-bearing: it is declared the sorting column by index, so
-/// moving it would silently mislabel whichever column took its place.
+/// The sorting column is declared by index, so `ts` must stay first.
 #[test]
 fn ts_is_column_zero_and_declared_sorted_ascending() {
     let dir = tempfile::tempdir().unwrap();
@@ -101,7 +81,7 @@ fn ts_is_column_zero_and_declared_sorted_ascending() {
     assert_eq!(meta.sorting_columns[0].column_idx, 0);
     assert!(!meta.sorting_columns[0].descending);
 
-    // Both mirror the `.eN.` filename tag, so a moved file stays self-describing.
+    // Mirror the `.eN.` filename tag.
     assert_eq!(
         meta.key_value.get(EPOCH_META_KEY).map(String::as_str),
         Some("3")
@@ -116,9 +96,7 @@ fn ts_is_column_zero_and_declared_sorted_ascending() {
     );
 }
 
-/// Nothing but the two orc keys. `ArrowWriter` also embedded a ~700-byte
-/// `ARROW:schema` IPC blob in every file; dropping it is the one intentional
-/// difference from the old output, and it is pure overhead removed.
+/// Only the two orc keys (no `ARROW:schema` blob).
 #[test]
 fn no_writer_specific_metadata_is_embedded() {
     let dir = tempfile::tempdir().unwrap();
@@ -133,10 +111,7 @@ fn no_writer_specific_metadata_is_embedded() {
     assert_eq!(keys, [EPOCH_META_KEY, SERIES_META_KEY]);
 }
 
-/// Row groups are split by the writer itself, since the low-level file writer
-/// ignores `max_row_group_row_count`. The boundaries must fall exactly where
-/// the configured count says, or a reader's row-group pruning covers the wrong
-/// rows.
+/// The writer splits row groups itself (the low-level writer ignores the setting).
 #[test]
 fn row_groups_split_exactly_at_the_configured_count() {
     let dir = tempfile::tempdir().unwrap();
@@ -168,12 +143,8 @@ fn row_groups_split_exactly_at_the_configured_count() {
     }
 }
 
-/// The single hardest property in the writer.
-///
-/// Values are stored column-major with nulls elided and map entries flattened,
-/// so cutting a row group means advancing a different number of values in every
-/// column. An off-by-one anywhere shifts data onto neighbouring rows — which
-/// still produces a readable file, just a wrong one.
+/// Nulls are elided and maps flattened, so each column advances differently at a
+/// row-group cut; an off-by-one would shift values onto neighbouring rows.
 #[test]
 fn every_value_stays_on_its_own_row_across_group_boundaries() {
     let dir = tempfile::tempdir().unwrap();
@@ -181,9 +152,7 @@ fn every_value_stays_on_its_own_row_across_group_boundaries() {
     let keys = all_types();
     let mut b = RowBuilder::new("trades", &keys, 200).unwrap();
 
-    // Null patterns with pairwise-coprime periods, and map cardinality on a
-    // fourth, so no single boundary offset can hide a misalignment.
-    /// What one row should read back as: id, positional keys, map entries.
+    // Coprime null/map periods so no boundary offset hides a misalignment.
     type Expected = (String, Vec<Option<String>>, Vec<(String, String)>);
     let mut want: Vec<Expected> = Vec::new();
     for i in 0..200i64 {
@@ -226,8 +195,7 @@ fn every_value_stays_on_its_own_row_across_group_boundaries() {
             pairs,
         ));
     }
-    // 9 shares no factor with 2, 3, 5, 7 or 4, so boundaries walk through every
-    // phase of every pattern above.
+    // 9 is coprime with every period above.
     write_file(&path, &b.finish().unwrap(), "trades", 0, "uncompressed", 9).unwrap();
 
     assert_eq!(read_metadata(&path).unwrap().row_group_rows.len(), 23);
@@ -242,9 +210,7 @@ fn every_value_stays_on_its_own_row_across_group_boundaries() {
     }
 }
 
-/// An empty map and a null map are different values to a reader, and "this
-/// record had no undeclared keys" is the former. The map column is REQUIRED
-/// precisely so the distinction cannot collapse.
+/// No undeclared keys is an empty map, not null; the map column is REQUIRED.
 #[test]
 fn an_absent_map_reads_back_empty_rather_than_null() {
     let dir = tempfile::tempdir().unwrap();
@@ -270,9 +236,7 @@ fn an_absent_map_reads_back_empty_rather_than_null() {
     );
 }
 
-/// Empty strings are values, not nulls, everywhere they can appear. `id` in
-/// particular: an absent id is `""`, which is what gives `(ts, id)` dedup one
-/// representation to compare instead of two.
+/// Empty strings are values, not nulls; an absent id is `""` for `(ts, id)` dedup.
 #[test]
 fn empty_strings_are_values_and_never_become_nulls() {
     let dir = tempfile::tempdir().unwrap();
@@ -296,8 +260,7 @@ fn empty_strings_are_values_and_never_become_nulls() {
     assert_eq!(rows[1].keys[0], None, "and a real null is still null");
 }
 
-/// Extreme and awkward scalars round-trip exactly. These went through the Arrow
-/// builders before; nothing about the encoding should have changed.
+/// Extreme scalars and non-ASCII strings round-trip exactly.
 #[test]
 fn edge_case_scalars_survive_verbatim() {
     let dir = tempfile::tempdir().unwrap();
@@ -334,7 +297,6 @@ fn edge_case_scalars_survive_verbatim() {
         rows[1].keys[0].as_deref(),
         Some(i64::MAX.to_string()).as_deref()
     );
-    // Non-ASCII must survive in ids, map keys, map values and data alike.
     assert_eq!(rows[0].id, "\u{1F600}");
     assert_eq!(rows[0].data, "\u{4F60}\u{597D}");
     assert_eq!(
@@ -343,8 +305,7 @@ fn edge_case_scalars_survive_verbatim() {
     );
 }
 
-/// A series with no declared keys at all is a legitimate config, and the schema
-/// must still carry ts, id, extra and data.
+/// A series with no declared keys still has ts, id, extra and data.
 #[test]
 fn a_series_with_no_declared_keys_still_has_the_four_fixed_columns() {
     let dir = tempfile::tempdir().unwrap();

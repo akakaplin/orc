@@ -1,8 +1,5 @@
-//! ZeroMQ ingest server: a PULL socket for records, a REP socket for control.
-//!
-//! Sharing [`crate::codec`] with the client pays off here: a received batch is
-//! already in WAL frame format, so it is validated and copied straight in,
-//! crossing the process boundary exactly once.
+//! ZeroMQ ingest server: PULL for records, REP for control. Batches arrive in
+//! WAL frame format ([`crate::codec`]), so they are validated and copied straight in.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -14,16 +11,10 @@ use crate::engine::Engine;
 use crate::error::{Error, Result};
 use crate::protocol::{ControlRequest, ControlResponse, FlushPayload, SeriesSchema, StatsPayload};
 
-/// How long a poll waits before looping. Bounds shutdown latency without
-/// spinning: the loop is otherwise entirely blocked in `zmq_poll`.
+/// Poll timeout; bounds shutdown latency.
 const POLL_TIMEOUT_MS: i64 = 100;
 
-/// Batches taken from the ingest socket per poll wakeup.
-///
-/// An unbounded drain to `EAGAIN` never returns under a producer faster than the
-/// WAL can absorb, so the control socket is never polled again and `ping`,
-/// `stats`, `flush` and `shutdown` all hang. A bounded burst keeps ingest batched
-/// while giving control a turn.
+/// Batches read per poll wakeup; bounded so a fast producer can't starve control.
 const MAX_BATCHES_PER_POLL: usize = 1024;
 
 /// How long `shutdown` keeps draining the ingest queue before giving up.
@@ -41,8 +32,7 @@ pub struct Server {
     stop: Arc<AtomicBool>,
     batches: AtomicU64,
     max_record_bytes: usize,
-    /// Reported in the schema handshake, so a client can bound its batches by
-    /// the limit libzmq will actually enforce against it.
+    /// Reported in the schema handshake.
     max_batch_bytes: u64,
 }
 
@@ -56,28 +46,16 @@ impl std::fmt::Debug for Server {
 }
 
 impl Server {
-    /// Bind both sockets.
-    ///
-    /// Loopback by default. The ingest socket has no authentication, so binding a
-    /// routable interface is a deliberate decision — with a private network or
-    /// libzmq's CURVE in front of it.
+    /// Bind both sockets. There is no authentication, so keep them on loopback
+    /// or a private network.
     pub fn bind(engine: Arc<Engine>, config: &Config) -> Result<Server> {
         let ctx = zmq::Context::new();
 
         let ingest = ctx.socket(zmq::PULL).map_err(zmq_err)?;
-        // A high-water mark is backpressure, not a leak: when it fills, PUSH
-        // clients block instead of the server buffering without bound.
+        // Backpressure: a full queue blocks PUSH clients.
         ingest.set_rcvhwm(config.server.rcv_hwm).map_err(zmq_err)?;
-        // The high-water mark bounds message *count*, not size, and libzmq's
-        // size default is unlimited -- so one hostile message would be allocated
-        // in full before a frame inside it was looked at, then written to a
-        // single segment for the flush to read whole.
-        //
-        // Enforced below the application: over TCP libzmq drops the *connection*,
-        // not just the message, so anything else that peer had in flight goes
-        // with it and neither end gets a diagnostic. That is why the limit is
-        // reported in the schema handshake — a client bounding its own batches is
-        // the only place the refusal can carry a reason.
+        // Bounds message size (the HWM only bounds count). libzmq drops
+        // oversized messages silently, hence the limit is sent in the handshake.
         ingest
             .set_maxmsgsize(config.server.max_batch_bytes)
             .map_err(zmq_err)?;
@@ -112,13 +90,8 @@ impl Server {
         Arc::clone(&self.stop)
     }
 
-    /// Serve until a `Shutdown` request or a `stop_handle` flip.
-    ///
-    /// A socket error ends the loop but never skips the shutdown drain: a `?`
-    /// straight out of the loop body would take the drain and the engine close
-    /// with it, discarding whatever ZeroMQ had buffered. The loop's error is
-    /// still what the caller gets; shutdown's only surfaces if there is no
-    /// earlier one to lose.
+    /// Serve until `Shutdown` or a `stop_handle` flip. Always drains and closes,
+    /// even after a socket error; the loop's error takes precedence.
     pub fn run(&self) -> Result<()> {
         let outcome = self.serve();
         let closed = self.shutdown();
@@ -134,7 +107,6 @@ impl Server {
                 self.ingest.as_poll_item(zmq::POLLIN),
                 self.control.as_poll_item(zmq::POLLIN),
             ];
-            // EINTR is not an error here; a signal during poll just means loop.
             match zmq::poll(&mut items, POLL_TIMEOUT_MS) {
                 Ok(_) => {}
                 Err(zmq::Error::EINTR) => continue,
@@ -150,10 +122,7 @@ impl Server {
         Ok(())
     }
 
-    /// Read up to [`MAX_BATCHES_PER_POLL`] queued batches, not just one.
-    ///
-    /// One message per wakeup would cap throughput; an unbounded drain would
-    /// starve the control socket, including the `Shutdown` that would stop it.
+    /// Read up to [`MAX_BATCHES_PER_POLL`] queued batches.
     fn drain_ingest(&self) -> Result<()> {
         for _ in 0..MAX_BATCHES_PER_POLL {
             match self.ingest.recv_bytes(zmq::DONTWAIT) {
@@ -169,11 +138,7 @@ impl Server {
         Ok(())
     }
 
-    /// Empty the ingest queue on the way out, but not forever.
-    ///
-    /// Drained because the loop may have been woken by the control socket with
-    /// records still buffered, and closing would discard them unannounced.
-    /// Deadlined because producers do not stop when the server decides to.
+    /// Drain queued ingest before closing, up to [`SHUTDOWN_DRAIN`].
     fn drain_for_shutdown(&self) -> Result<()> {
         let deadline = Instant::now() + SHUTDOWN_DRAIN;
         loop {
@@ -187,9 +152,6 @@ impl Server {
                 Err(e) => return Err(zmq_err(e)),
             }
             if Instant::now() >= deadline {
-                // Anything still queued is dropped, which is worth saying out
-                // loud -- those senders got no acknowledgement either way, but
-                // an operator reading the log should not have to infer it.
                 tracing::warn!(
                     "ingest was still arriving after {SHUTDOWN_DRAIN:?} of draining; \
                      closing with records left in the queue"
@@ -199,10 +161,8 @@ impl Server {
         }
     }
 
-    /// Validate a batch header and hand the frames to the engine.
-    ///
-    /// Never fatal: ingest is fire-and-forget, so there is nobody to return an
-    /// error to and one bad client must not stop the server.
+    /// Validate a batch header and append its frames. Never fatal: one bad
+    /// client must not stop the server.
     fn ingest_batch(&self, bytes: &[u8]) {
         let (count, rest) = match codec::parse_batch_header(bytes) {
             Ok(count) => (count, &bytes[codec::BATCH_HEADER_BYTES..]),
@@ -213,10 +173,7 @@ impl Server {
         };
         match self.engine.append_raw(rest) {
             Ok(res) => {
-                // `count` is a hint, not a length -- but it is the only
-                // statement of how many records the sender thought it sent, so a
-                // shortfall is worth naming. Without it a batch cut short at its
-                // first frame reports "1 rejected" for a thousand lost records.
+                // `count` is the sender's claim; report any shortfall.
                 let seen = res.accepted + res.rejected;
                 if res.rejected > 0 || seen < count as usize {
                     tracing::warn!(
@@ -241,8 +198,7 @@ impl Server {
         };
         let reply = match ControlRequest::from_bytes(&msg) {
             Ok(req) => self.handle(req),
-            // REQ/REP is lockstep: a reply is mandatory even for garbage, or the
-            // client blocks forever waiting for one.
+            // REQ/REP needs a reply even for garbage.
             Err(e) => ControlResponse::error(format_args!("unparseable request: {e}")),
         };
         let bytes = reply
@@ -273,9 +229,7 @@ impl Server {
                 series: self.schema(),
                 max_batch_bytes: Some(self.max_batch_bytes),
             },
-            // Not implemented rather than silently accepted: adopting a config
-            // means rebuilding the handle table, and pretending to succeed would
-            // leave clients encoding against a schema the server never took.
+            // Refused rather than faked: clients would encode against a schema never adopted.
             ControlRequest::ReloadConfig => ControlResponse::error(
                 "reload-config is not implemented yet; restart the server to adopt a new config",
             ),
@@ -286,7 +240,7 @@ impl Server {
         }
     }
 
-    /// Every series' epoch and positional key list — the client handshake.
+    /// Every series' epoch and key order — the client handshake.
     fn schema(&self) -> Vec<SeriesSchema> {
         let mut out: Vec<SeriesSchema> = self
             .engine
@@ -297,13 +251,11 @@ impl Server {
                 keys: h.keys().to_vec(),
             })
             .collect();
-        // Stable order so a client diffing two handshakes sees real changes.
         out.sort_by(|a, b| a.name.cmp(&b.name));
         out
     }
 
-    /// Drain what ZeroMQ already buffered, then close cleanly. Deadlined, since a
-    /// live producer would otherwise keep refilling the queue.
+    /// Drain what ZeroMQ buffered, then close the engine.
     fn shutdown(&self) -> Result<()> {
         tracing::info!("draining the ingest queue before exit");
         self.drain_for_shutdown()?;
@@ -320,7 +272,7 @@ impl Server {
         self.batches.load(Ordering::Relaxed)
     }
 
-    /// The bound ingest endpoint, resolved. Useful when binding to port 0.
+    /// The resolved ingest endpoint (useful with port 0).
     pub fn ingest_endpoint(&self) -> Result<String> {
         self.ingest
             .get_last_endpoint()
@@ -336,7 +288,7 @@ impl Server {
             .map(|r| r.unwrap_or_else(|bytes| String::from_utf8_lossy(&bytes).into_owned()))
     }
 
-    /// Records accepted so far, for tests and diagnostics.
+    /// The configured `limits.max_record_bytes`.
     pub fn max_record_bytes(&self) -> usize {
         self.max_record_bytes
     }

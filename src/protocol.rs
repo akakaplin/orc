@@ -1,12 +1,6 @@
-//! The control-socket protocol, shared by the server and the client.
-//!
-//! Ingest is a binary frame stream (see [`crate::codec`]) because it runs per
-//! record. Control is JSON over request/reply because it runs per *connection* —
-//! a handshake, an occasional flush, a stats scrape. Nothing here is hot, so
-//! legibility wins: an operator can drive the whole surface with `nc`.
-//!
-//! Compiled outside the `net` feature that gates the sockets: these are plain
-//! serde types, so speaking the protocol without our client needs no ZeroMQ.
+//! Control-socket protocol: JSON request/reply, shared by server and client.
+//! Ingest is binary (see [`crate::codec`]); control is rare, so it stays readable.
+//! Plain serde types, compiled without the `net` feature.
 
 use serde::{Deserialize, Serialize};
 
@@ -23,23 +17,16 @@ pub enum ControlRequest {
     Stats,
     /// Flush now, synchronously. Returns once the manifest has committed.
     Flush,
-    /// Every series' current epoch and key list — the connect handshake. A
-    /// client encodes keys positionally, so it cannot build a frame until it
-    /// knows the order and the epoch to stamp. One round trip at startup.
+    /// Every series' epoch and key order — the connect handshake, needed to encode frames.
     Schema,
     /// Re-read `config.json` and adopt it.
     ReloadConfig,
-    /// Drain and exit. The engine is crash-safe by construction, so this is a
-    /// convenience — but it is the difference between stopping at a known-clean
-    /// point and stopping wherever the process happened to be.
+    /// Drain and exit at a clean point (the engine is crash-safe regardless).
     Shutdown,
 }
 
-/// A reply on the control socket.
-///
-/// `Error` is a variant rather than a transport-level failure: REQ/REP has no
-/// other channel, and a socket error would leave the client unable to tell a
-/// rejected request from a dead server.
+/// A reply on the control socket. `Error` is a reply, so a rejected request is
+/// distinguishable from a dead server.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "kebab-case")]
 pub enum ControlResponse {
@@ -50,13 +37,8 @@ pub enum ControlResponse {
     Flushed(FlushPayload),
     Schema {
         series: Vec<SeriesSchema>,
-        /// The server's `server.max_batch_bytes`, so a client can bound its
-        /// batches by the limit that is actually enforced.
-        ///
-        /// libzmq drops an oversized message *below* the application: neither
-        /// side can log it, so a client guessing this wrong loses records
-        /// silently. `Option` so a client can still talk to a server that
-        /// predates the field.
+        /// The enforced `server.max_batch_bytes`; libzmq drops oversized
+        /// messages silently. `None` from older servers.
         #[serde(default)]
         max_batch_bytes: Option<u64>,
     },
@@ -76,18 +58,13 @@ pub struct SeriesSchema {
     pub keys: Vec<KeyDef>,
 }
 
-/// Counters, as the control socket reports them.
-///
-/// [`Stats`] flattened — so the JSON stays one flat object — plus the one
-/// counter the engine cannot know, because it belongs to the socket rather than
-/// to the log.
+/// [`Stats`] flattened, plus the socket-side batch counter.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct StatsPayload {
     #[serde(flatten)]
     pub engine: Stats,
-    /// Batches received on the ingest socket. Compared against a client's own
-    /// send count, this is the only way to observe fire-and-forget loss.
+    /// Batches received on the ingest socket; compare with client sends to see loss.
     pub batches_received: u64,
 }
 
@@ -101,8 +78,7 @@ pub struct FlushPayload {
 }
 
 impl ControlRequest {
-    /// Encode for the wire. Infallible in practice, but surfaced rather than
-    /// unwrapped so a server never panics on a reply it built itself.
+    /// Encode for the wire.
     pub fn to_bytes(&self) -> Result<Vec<u8>, serde_json::Error> {
         serde_json::to_vec(self)
     }
@@ -121,7 +97,6 @@ impl ControlResponse {
         serde_json::from_slice(bytes)
     }
 
-    /// Convenience for turning any engine error into a reply.
     pub fn error(e: impl std::fmt::Display) -> Self {
         ControlResponse::Error {
             message: e.to_string(),
@@ -147,7 +122,6 @@ mod tests {
             let bytes = req.to_bytes().unwrap();
             assert_eq!(ControlRequest::from_bytes(&bytes).unwrap(), req);
         }
-        // Kebab-case on the wire, so `reload-config` is what an operator types.
         assert_eq!(
             String::from_utf8(ControlRequest::ReloadConfig.to_bytes().unwrap()).unwrap(),
             r#"{"op":"reload-config"}"#
@@ -172,8 +146,7 @@ mod tests {
         assert_eq!(ControlResponse::from_bytes(&bytes).unwrap(), reply);
     }
 
-    /// Both fields were added after the first release, so upgrading the client
-    /// before the server must not brick the handshake.
+    /// A newer client must still parse an older server's replies.
     #[test]
     fn a_reply_without_the_newer_fields_still_parses() {
         let schema = ControlResponse::from_bytes(br#"{"status":"schema","series":[]}"#).unwrap();

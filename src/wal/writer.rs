@@ -1,50 +1,24 @@
-//! The append path and the committer thread — where the latency budget lives.
+//! The append path and the committer thread.
 //!
-//! Two threads share one segment file and the split between them is the whole
-//! design:
+//! - **Appenders** `memcpy` an encoded frame into a 256 KiB `BufWriter` under a
+//!   mutex (~125 ns median). Tail latency: the appender that fills the buffer
+//!   pays the `write(2)` with the lock held, and segment rolls fsync with it held.
+//! - **The committer** flushes and fsyncs every `fsync_interval_ms` or once
+//!   `fsync_bytes` accumulate, rolls past `segment_max_bytes`, and heartbeats the
+//!   directory lock.
 //!
-//! - **The caller's thread** encodes the frame (before this module sees it),
-//!   takes a `Mutex<BufWriter<File>>`, `memcpy`s the bytes in, and leaves. No
-//!   channel, no allocation, and in the steady state no syscall: the `BufWriter`
-//!   absorbs the write and the uncontended lock costs ~20 ns.
-//! - **The committer thread** owns durability. Every `fsync_interval_ms`, or once
-//!   `fsync_bytes` of dirty data accumulate, it flushes and fsyncs; past
-//!   `segment_max_bytes` it rolls. It also heartbeats the directory lock, being
-//!   the one thread alive for exactly as long as the engine is writing.
+//! A process crash or a power cut can lose up to one group-commit window:
+//! buffered bytes live in process memory. `append` returning means "in this
+//! process", not "on disk".
 //!
-//! A process crash loses nothing already appended — the bytes are in the page
-//! cache. A power cut loses at most one group-commit window.
+//! The group-commit fsync runs outside the lock, on a second descriptor, so disk
+//! stalls stay off the append path. A roll is the exception: the outgoing segment
+//! is fsynced under the lock before its successor exists, because recovery scans
+//! only the tail. A torn write (partial `write_all`) refuses appends until the
+//! segment is sealed; the committer retries the roll every tick.
 //!
-//! # The group-commit fsync happens outside the append lock
-//!
-//! The committer flushes the `BufWriter` under the lock (a `memcpy` and at most
-//! one `write(2)`), releases it, and fsyncs through a *second descriptor*.
-//! Holding the mutex across the fsync would put disk stalls on every appender's
-//! critical path — the exact latency this thread exists to avoid. Ordering still
-//! holds: the `write` returned before the lock was dropped, so the fsync covers
-//! at least the bytes counted, and covering more is free.
-//!
-//! **A segment roll is the exception.** A roll fsyncs the outgoing
-//! segment, then creates the incoming one — a second fsync plus a directory
-//! fsync — with the append lock held for all three. Not an oversight: recovery
-//! scans only the tail, and may do so *because* a sealed segment is fully durable
-//! before its successor exists. Moving either fsync out would let an appender
-//! write into the new segment while the old one is unsynced. The cost is one
-//! stall per `segment_max_bytes`, invisible at the 64 MiB default.
-//!
-//! **A roll is also the only way out of a torn write.** If `write_all` fails
-//! part-way the segment ends mid-frame, and appending past it would bury the
-//! fragment where the flush's scan stops and abandons every record behind. So
-//! appends are refused until it is sealed — but only until: the committer retries
-//! every tick, so a disk that fills and drains recovers without a restart.
-//!
-//! # The WAL is deliberately not size-capped
-//!
-//! Ingest never refuses a record over accumulated WAL. If the flush stalls the
-//! log grows and the filesystem is the only limit. A byte ceiling would trade a
-//! recoverable operational problem — visible in [`WalStats`] and
-//! [`crate::wal::total_bytes`] long before the volume fills — for an ingest
-//! outage, and every record is on disk either way.
+//! The WAL is deliberately uncapped: a stalled flush shows as growth in
+//! [`WalStats`] and [`crate::wal::total_bytes`], not as an ingest outage.
 
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Write};
@@ -60,30 +34,20 @@ use crate::error::{Error, Result};
 use crate::wal::recovery::{LOCK_HEARTBEAT_MS, touch_lock};
 use crate::wal::{FIRST_SEGMENT, fsync_dir, segment_name, wal_dir};
 
-/// Capacity of the `BufWriter` in front of the segment file.
-///
-/// Big enough (sixteen maximum-size records) that an appender's `write_all` is
-/// almost always a `memcpy`, small enough that the `write(2)` it eventually costs
-/// some unlucky caller is one page-aligned chunk. Durability does not depend on
-/// it: the committer flushes on a timer.
+/// Capacity of the `BufWriter` in front of the segment file: sixteen max-size
+/// records, so an append is almost always just a `memcpy`.
 const WRITE_BUFFER_BYTES: usize = 256 * 1024;
 
 /// How to open a WAL writer.
-///
-/// A struct rather than four positional arguments: `first_segment` and
-/// `heartbeat` both come from recovery, and swapping two `u64`s would produce a
-/// subtly wrong engine rather than a compile error.
 #[derive(Debug, Clone)]
 pub struct WalOptions {
     /// Root of the on-disk layout; segments land in `<data_dir>/wal/`.
     pub data_dir: PathBuf,
     pub wal: WalConfig,
-    /// The id of the segment to create. Must be greater than every id already
-    /// in `wal/` — [`crate::wal::recovery::Recovery::next_segment`] computes it.
+    /// Segment to create; must exceed every id in `wal/`
+    /// (see [`crate::wal::recovery::Recovery::next_segment`]).
     pub first_segment: u64,
-    /// The `LOCK` file to keep fresh, if this writer owns the directory lock.
-    /// The committer touches it about once a second; a lock older than
-    /// [`crate::wal::recovery::LOCK_STALE_MS`] is treated as abandoned.
+    /// The `LOCK` file the committer keeps fresh, if this writer owns it.
     pub heartbeat: Option<PathBuf>,
 }
 
@@ -110,23 +74,17 @@ pub struct WalStats {
     pub dirty_bytes: u64,
     /// Frame bytes this writer has accepted since it was opened.
     pub appended_bytes: u64,
-    /// Successful fsyncs, and failures. A rising failure count with a rising
-    /// `dirty_bytes` is a dying disk, and is visible here before it is visible
-    /// as data loss.
+    /// Successful and failed fsyncs.
     pub fsyncs: u64,
     pub fsync_failures: u64,
-    /// Epoch microseconds of the last successful fsync; 0 if there has not been
-    /// one. Idle engines do not fsync, so a stale value is not by itself a
-    /// fault — compare it against `dirty_bytes`.
+    /// Epoch µs of the last successful fsync, 0 if none. Idle engines don't
+    /// fsync, so judge staleness against `dirty_bytes`.
     pub last_fsync_us: i64,
     /// True once [`WalWriter::close`] has run; every further append fails.
     pub closed: bool,
 }
 
-/// The active segment, plus the thread that makes it durable.
-///
-/// Every method takes `&self`, so the engine can share one `Arc<WalWriter>` and
-/// appenders contend only on the single mutex the design is built around.
+/// The active segment plus the committer thread. All methods take `&self`.
 #[derive(Debug)]
 pub struct WalWriter {
     shared: Arc<Shared>,
@@ -139,32 +97,22 @@ struct Shared {
     cfg: WalConfig,
     heartbeat: Option<PathBuf>,
     state: Mutex<State>,
-    /// Woken by an appender that has crossed `fsync_bytes` or filled a segment,
-    /// and by `close`. Without it those thresholds would only be noticed at the
-    /// next interval tick, which at a high ingest rate is most of a segment
-    /// late.
+    /// Wakes the committer early: `fsync_bytes` crossed, segment full, or close.
     wake: Condvar,
     fsyncs: AtomicU64,
     fsync_failures: AtomicU64,
     last_fsync_us: AtomicI64,
-    /// When the last commit failure was logged. A disk that stays broken fails
-    /// on every tick, and one line per attempt buries the first -- which is the
-    /// one that says what actually happened.
+    /// When the last commit failure was logged (rate limit).
     last_failure_log_us: AtomicI64,
 }
 
 #[derive(Debug)]
 struct State {
-    /// `None` once closed. Appending to a writer in that state is an error,
-    /// never silent.
+    /// `None` once closed; appends then fail.
     open: Option<Active>,
     stop: bool,
     appended: u64,
-    /// Set when a partial write left a torn frame and the roll that would seal
-    /// it failed. Appends are refused while it is set — the damage has to stay
-    /// confined to a tail nobody writes to again — and the committer clears it
-    /// on the first roll that succeeds. Closing the writer instead, which is
-    /// what used to happen, needed a restart to undo.
+    /// A torn frame awaits sealing: appends are refused until a roll succeeds.
     needs_roll: bool,
 }
 
@@ -172,8 +120,7 @@ struct State {
 struct Active {
     id: u64,
     file: BufWriter<File>,
-    /// A second descriptor on the same file, so the committer can fsync after
-    /// releasing the append lock. `Arc` because it outlives the guard.
+    /// Second descriptor, so the committer can fsync without the append lock.
     sync: Arc<File>,
     /// Bytes written to the file, header included.
     bytes: u64,
@@ -187,11 +134,8 @@ impl Active {
     }
 }
 
-/// Take a lock, ignoring poisoning.
-///
-/// A panic under the append lock cannot corrupt what this protects — the critical
-/// sections are a `memcpy` and two counter updates — and refusing every later
-/// append because an unrelated thread panicked turns a bug into data loss.
+/// Take a lock, ignoring poisoning: the critical sections can't leave it
+/// inconsistent, and refusing all later appends would turn a bug into data loss.
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
@@ -215,25 +159,16 @@ fn now_us() -> i64 {
 }
 
 impl WalWriter {
-    /// Create `<data_dir>/wal/`, open segment `first_segment`, and start the
-    /// committer.
-    ///
-    /// The segment exists and is durable before this returns, so the first
-    /// append never pays for file creation.
+    /// Create `wal/`, durably create segment `first_segment`, start the committer.
     pub fn open(opts: WalOptions) -> Result<WalWriter> {
         let dir = wal_dir(&opts.data_dir);
         std::fs::create_dir_all(&dir)?;
-        // `wal/` itself is a name in `data_dir`, and needs the same treatment as
-        // the segments inside it.
         fsync_dir(&opts.data_dir)?;
 
         let shared = Arc::new(Shared {
             dir,
-            // Clamped in one place, so both the appender and the committer read
-            // the same numbers. `Config::validate` rejects all three degenerate
-            // values, so this is unreachable through `Engine::open` — but this
-            // type is public and takes a `WalConfig` directly, and a zero
-            // reaching the committer spins a core rather than failing.
+            // `Config::validate` already rejects these, but this type is public
+            // and a zero would spin the committer.
             cfg: WalConfig {
                 fsync_interval_ms: opts.wal.fsync_interval_ms.max(1),
                 fsync_bytes: opts.wal.fsync_bytes.max(1),
@@ -270,17 +205,12 @@ impl WalWriter {
         })
     }
 
-    /// Append one already-encoded frame.
-    ///
-    /// Never inspects the bytes: that is what lets the server pass on frames a
-    /// client encoded, and what keeps the critical section to a `memcpy`.
+    /// Append one already-encoded frame; the bytes are not inspected.
     pub fn append(&self, frame: &[u8]) -> Result<()> {
         self.append_bytes(frame)
     }
 
-    /// Append several already-encoded frames laid out back to back, under one
-    /// lock acquisition — the shape a ZeroMQ ingest message already has, so a
-    /// batch is copied from the socket buffer into the WAL exactly once.
+    /// Append back-to-back encoded frames under one lock acquisition.
     pub fn append_batch(&self, frames: &[u8]) -> Result<()> {
         self.append_bytes(frames)
     }
@@ -288,12 +218,8 @@ impl WalWriter {
     fn append_bytes(&self, bytes: &[u8]) -> Result<()> {
         let wake = {
             let mut guard = lock(&self.shared.state);
-            // Reborrowed once, so `state.open` and `state.appended` are two
-            // disjoint fields rather than two borrows of the guard.
             let state = &mut *guard;
             if state.needs_roll {
-                // Appending past the torn frame would bury it mid-file, where
-                // the flush's scan stops and abandons every record after it.
                 return Err(torn());
             }
             let Some(active) = state.open.as_mut() else {
@@ -310,21 +236,13 @@ impl WalWriter {
                         || size >= self.shared.cfg.segment_max_bytes
                 }
                 Err(e) => {
-                    // `write_all` can fail having written part of the frame,
-                    // which would leave a torn record in the *middle* of a
-                    // segment -- where the flush stops at it and abandons
-                    // everything after. Rolling confines the damage to the tail
-                    // of a segment nobody will write to again, which is the
-                    // exact shape the format is built to survive.
+                    // A partial write may have left a torn frame; roll so it
+                    // stays at a segment's tail, never mid-segment.
                     tracing::error!(error = %e, "wal append failed; sealing the segment to confine the torn frame");
-                    // Set before the attempt, cleared only on success.
                     state.needs_roll = true;
                     match self.shared.roll(state) {
                         Ok(_) => state.needs_roll = false,
-                        // Deliberately not `state.open = None`: the usual cause
-                        // is the disk that just failed the write, and it may
-                        // clear. The committer retries every tick, where closing
-                        // the writer made a transient ENOSPC cost a restart.
+                        // Not closing: the disk may recover; the committer retries.
                         Err(roll) => tracing::error!(
                             error = %roll,
                             "could not seal the torn segment; appends are refused until the committer can"
@@ -335,20 +253,15 @@ impl WalWriter {
             }
         };
 
-        // Outside the lock: waking a waiter is a futex syscall, and the
-        // committer would only have to wait for us to release it anyway.
+        // Notify outside the lock.
         if wake {
             self.shared.wake.notify_one();
         }
         Ok(())
     }
 
-    /// Close the active segment and open the next one.
-    ///
-    /// What the flush calls before it starts: everything appended so far is in a
-    /// sealed, immutable segment while ingest runs on into the new one. Returns
-    /// the id sealed, or `None` for an empty segment — sealing those would mint
-    /// an empty file per interval on an idle series, forever.
+    /// Seal the active segment and open the next; called by the flush. Returns
+    /// the sealed id, or `None` if the segment is empty (nothing is rolled).
     pub fn seal(&self) -> Result<Option<u64>> {
         let mut guard = lock(&self.shared.state);
         let state = &mut *guard;
@@ -358,18 +271,14 @@ impl WalWriter {
         if active.bytes == SEGMENT_HEADER_BYTES as u64 {
             return Ok(None);
         }
-        // `roll_now`, so a seal that lands while a roll is owed resolves it
-        // rather than leaving ingest refused behind a flag whose reason is gone.
+        // `roll_now` also clears a pending `needs_roll`.
         let id = roll_now(&self.shared, state)?;
         tracing::debug!(segment = id, "sealed wal segment");
         Ok(Some(id))
     }
 
-    /// Stop the committer, fsync what is outstanding, and release the segment.
-    ///
-    /// Idempotent, and called by [`Drop`]: a forgotten `close()` must not be a
-    /// lost-data bug. Afterwards every append fails rather than writing to a file
-    /// nobody will fsync.
+    /// Stop the committer and fsync what is outstanding. Idempotent; also run by
+    /// [`Drop`]. Later appends fail.
     pub fn close(&self) -> Result<()> {
         lock(&self.shared.state).stop = true;
         self.shared.wake.notify_all();
@@ -418,11 +327,7 @@ impl WalWriter {
         lock(&self.shared.state).open.as_ref().map_or(0, |a| a.id)
     }
 
-    /// Put the writer into the state a partial `write(2)` leaves behind.
-    ///
-    /// A real torn write needs the disk to fail mid-frame, which no safe-Rust
-    /// test can arrange. The detection is one `match` arm; what is worth pinning
-    /// is the recovery.
+    /// Simulate the state a failed partial `write(2)` leaves behind.
     #[cfg(test)]
     pub(crate) fn force_needs_roll(&self) {
         lock(&self.shared.state).needs_roll = true;
@@ -438,16 +343,9 @@ impl Drop for WalWriter {
 }
 
 impl Shared {
-    /// Create and durably register a new segment file.
-    ///
-    /// The order is the durability rule: write the header, fsync the *file* so
-    /// the bytes are real, fsync the *directory* so the file's existence is.
-    /// Without the last step a power cut loses a freshly-rolled segment whose
-    /// every record was fsynced — durable records, no name reaching them.
-    ///
-    /// `create_new`, not `create`: an id that already exists means recovery and
-    /// the writer disagree about the tail, and overwriting would destroy
-    /// unflushed records.
+    /// Create a segment: write the header, fsync the file, then fsync the
+    /// directory so the name survives a power cut. `create_new` so an existing
+    /// id (unflushed records) is never overwritten.
     fn create_segment(&self, id: u64) -> Result<Active> {
         let path = self.dir.join(segment_name(id));
         let mut file = OpenOptions::new()
@@ -472,11 +370,7 @@ impl Shared {
         })
     }
 
-    /// Make everything written to `active` durable, holding the append lock.
-    ///
-    /// For the rare transitions — sealing, rolling, closing — where simplicity
-    /// beats concurrency. `sync_all`, not `sync_data`: these are the points where
-    /// the file's length must be as durable as its contents.
+    /// Flush and `sync_all` under the append lock; for seal, roll and close only.
     fn sync_in_lock(&self, active: &mut Active) -> std::io::Result<()> {
         active.file.flush()?;
         active.sync.sync_all()?;
@@ -485,12 +379,9 @@ impl Shared {
         Ok(())
     }
 
-    /// Seal the active segment and open its successor. Returns the sealed id.
-    ///
-    /// The order matters twice. The old segment is synced **before** the new one
-    /// exists, because recovery never scans a sealed segment and trusts exactly
-    /// this. And the new one is created before the old handle is dropped, so a
-    /// failure leaves a working segment rather than a dead engine.
+    /// Seal the active segment and open its successor; returns the sealed id.
+    /// The old one is synced before the new one exists (recovery relies on it),
+    /// and is kept open until the new one is created, so a failure is harmless.
     fn roll(&self, state: &mut State) -> Result<u64> {
         let active = state.open.as_mut().ok_or_else(closed)?;
         self.sync_in_lock(active)?;
@@ -508,9 +399,7 @@ impl Shared {
 
     fn note_failure(&self, e: &std::io::Error, what: &str) {
         let failures = self.fsync_failures.fetch_add(1, Ordering::Relaxed) + 1;
-        // Always counted, at most once a second logged. `fsync_failures` is the
-        // signal an operator alerts on; the log is for reading afterwards, and a
-        // million identical lines make it useless for that.
+        // Always counted; logged at most once a second.
         let now = now_us();
         let last = self.last_failure_log_us.load(Ordering::Relaxed);
         if failures == 1 || now.saturating_sub(last) >= 1_000_000 {
@@ -524,8 +413,7 @@ impl Shared {
     }
 }
 
-/// Roll, and clear the "a roll is owed" flag if it worked. Pairing them keeps a
-/// caller from clearing it on a roll that failed.
+/// Roll, clearing `needs_roll` only on success.
 fn roll_now(shared: &Shared, state: &mut State) -> Result<u64> {
     let id = shared.roll(state)?;
     state.needs_roll = false;
@@ -536,8 +424,7 @@ fn roll_now(shared: &Shared, state: &mut State) -> Result<u64> {
 fn committer(shared: Arc<Shared>) {
     let interval = Duration::from_millis(shared.cfg.fsync_interval_ms.max(1));
     let beat_every = Duration::from_millis(LOCK_HEARTBEAT_MS);
-    // Heartbeat and commit share this thread, so the wait must suit both: a
-    // `fsync_interval_ms` of minutes must still leave the lock looking alive.
+    // Wake often enough for both commit and lock heartbeat.
     let tick = match shared.heartbeat {
         Some(_) => interval.min(beat_every),
         None => interval,
@@ -545,8 +432,7 @@ fn committer(shared: Arc<Shared>) {
 
     let mut last_sync = Instant::now();
     let mut last_beat = Instant::now();
-    // Set when an fsync fails: the next tick must retry even if no new bytes
-    // arrived, or a transient error would leave data unsynced indefinitely.
+    // After a failure, retry next tick even with no new bytes.
     let mut retry = false;
 
     loop {
@@ -555,9 +441,6 @@ fn committer(shared: Arc<Shared>) {
             let (mut state, _) = shared
                 .wake
                 .wait_timeout_while(state, tick, |s| {
-                    // Sleep until the interval expires, unless there is already
-                    // a reason not to: enough dirty bytes, a full segment, or a
-                    // shutdown.
                     !s.stop
                         && s.open.as_ref().is_some_and(|a| {
                             a.dirty() < shared.cfg.fsync_bytes
@@ -599,8 +482,7 @@ fn committer(shared: Arc<Shared>) {
                     last_sync = Instant::now();
                     shared.note_fsync();
                     let mut state = lock(&shared.state);
-                    // Only credit the segment we actually synced: a `seal` may
-                    // have swapped in a new one while the lock was free.
+                    // A `seal` may have swapped segments while unlocked.
                     if let Some(active) = state.open.as_mut()
                         && active.id == id
                     {
@@ -614,10 +496,7 @@ fn committer(shared: Arc<Shared>) {
             }
         }
 
-        // A failed commit leaves `synced` put, so `dirty()` stays above
-        // `fsync_bytes`, the wait predicate is already false, and
-        // `wait_timeout_while` returns without parking -- the retry would run
-        // flat out on a broken disk. Same hazard and same fix as the roll below.
+        // The wait predicate may not park us after a failure; don't spin.
         if retry {
             std::thread::sleep(tick);
         }
@@ -628,18 +507,12 @@ fn committer(shared: Arc<Shared>) {
                 .open
                 .as_ref()
                 .is_some_and(|a| a.bytes >= shared.cfg.segment_max_bytes);
-            // `needs_roll`: an append tore a frame and could not seal the
-            // segment itself, so ingest is refused until this succeeds.
             if (full || state.needs_roll)
                 && let Err(e) = roll_now(&shared, &mut state)
             {
                 tracing::error!(error = %e, "rolling to a new wal segment failed; still writing to the old one");
                 drop(state);
-                // The segment is over its limit (or torn), so the wait predicate
-                // will not park us: without this the retry would spin a core for
-                // as long as the disk stays full. For the `full` case ingest
-                // keeps working throughout -- an oversized segment costs startup
-                // scan time, not correctness.
+                // Same: a full or torn segment won't park us. Don't spin.
                 std::thread::sleep(tick);
             }
         }
@@ -649,8 +522,7 @@ fn committer(shared: Arc<Shared>) {
         {
             last_beat = Instant::now();
             if let Err(e) = touch_lock(path) {
-                // Not fatal on its own, but it is how a live engine's lock goes
-                // stale and gets taken over by a second one.
+                // Left unfixed, a second engine may take over the stale lock.
                 tracing::warn!(error = %e, path = %path.display(), "could not refresh the directory lock");
             }
         }
@@ -719,8 +591,7 @@ mod tests {
         ids
     }
 
-    /// Poll until `f` holds, or fail. Used where the committer thread, not the
-    /// caller, is what makes something happen.
+    /// Poll until `f` holds, or fail.
     fn eventually(what: &str, mut f: impl FnMut() -> bool) {
         let deadline = Instant::now() + Duration::from_secs(10);
         while Instant::now() < deadline {
@@ -751,13 +622,11 @@ mod tests {
 
     #[test]
     fn a_dropped_writer_still_flushes() {
-        // A forgotten close() must not be a lost-data bug.
         let dir = tempfile::tempdir().unwrap();
         {
             let w = WalWriter::open(opts(dir.path(), cfg(60_000, 1 << 30, 1 << 30))).unwrap();
             w.append(&frame("only")).unwrap();
-            // No close(), no fsync interval short enough to have fired: Drop is
-            // the only thing that can have written these bytes out.
+            // No close() and no interval fsync: only Drop can write this out.
         }
         assert_eq!(read_back(dir.path()), ["only"]);
     }
@@ -817,12 +686,9 @@ mod tests {
     #[test]
     fn rolling_produces_sequential_ten_digit_segments() {
         let dir = tempfile::tempdir().unwrap();
-        // One frame is ~50 bytes, so a 200-byte segment fills every few records.
         let w = WalWriter::open(opts(dir.path(), cfg(1, 1 << 30, 200))).unwrap();
 
-        // A roll seals the active segment, it does not split it, so the records
-        // have to arrive across several commit windows for several segments to
-        // exist -- which is also what actually happens under a live ingest.
+        // A roll seals, it doesn't split, so spread records over several windows.
         let mut expected = Vec::new();
         for round in 0..3 {
             let before = w.segment();
@@ -839,8 +705,6 @@ mod tests {
 
         let ids = list_segments(dir.path()).unwrap();
         assert_eq!(ids.len(), 4, "three rolls, plus the segment left active");
-        // Sequential from the first id with no gaps: the flush consumes them in
-        // this order, and a gap would look like a lost segment.
         assert_eq!(ids, vec![1, 2, 3, 4]);
 
         for id in &ids {
@@ -850,7 +714,6 @@ mod tests {
             assert_eq!(name.len(), "0000000001.wal".len());
             assert!(path.exists());
         }
-        // Rolling is not allowed to lose or reorder a single record.
         assert_eq!(read_back(dir.path()), expected);
     }
 
@@ -873,8 +736,7 @@ mod tests {
     #[test]
     fn a_full_buffer_wakes_the_committer_early() {
         let dir = tempfile::tempdir().unwrap();
-        // An interval long enough that only the byte threshold can explain a
-        // commit inside the test's lifetime.
+        // Long interval: only the byte threshold can trigger a commit.
         let w = WalWriter::open(opts(dir.path(), cfg(60_000, 256, 1 << 30))).unwrap();
         for i in 0..64 {
             w.append(&frame(&format!("rec-{i}"))).unwrap();
@@ -900,8 +762,6 @@ mod tests {
 
     #[test]
     fn an_id_that_already_exists_is_refused_rather_than_overwritten() {
-        // Only reachable if recovery and the writer disagree about the tail, and
-        // the file it would clobber holds unflushed records.
         let dir = tempfile::tempdir().unwrap();
         let w = WalWriter::open(opts(dir.path(), cfg(5, 4096, 1 << 20))).unwrap();
         w.append(&frame("a")).unwrap();
@@ -913,8 +773,7 @@ mod tests {
 
     #[test]
     fn a_crash_and_restart_resumes_past_the_amended_tail() {
-        // The whole of M2b and M3 end to end: write, die mid-record, recover,
-        // and keep writing. The restart must cost exactly the torn record.
+        // Write, tear the last record, recover, keep writing: lose only that record.
         let dir = tempfile::tempdir().unwrap();
         let w = WalWriter::open(opts(dir.path(), cfg(5, 4096, 1 << 20))).unwrap();
         for i in 0..10 {
@@ -940,9 +799,7 @@ mod tests {
         );
         assert_eq!(r.next_segment, FIRST_SEGMENT + 1);
 
-        // The recovered tail is never reopened for append: the writer always
-        // starts a fresh file, so every segment on disk is either sealed intact
-        // or was amended once and then left alone.
+        // The recovered tail is never reopened; the writer starts a fresh file.
         let w = WalWriter::open(WalOptions {
             first_segment: r.next_segment,
             ..opts(dir.path(), cfg(5, 4096, 1 << 20))
@@ -962,14 +819,11 @@ mod tests {
 
     #[test]
     fn every_record_from_every_thread_is_present_exactly_once() {
-        // The whole design rests on one shared mutex: N threads, one file, and
-        // no record may be lost, duplicated, or interleaved into another's.
         const THREADS: usize = 8;
         const PER_THREAD: usize = 1_000;
 
         let dir = tempfile::tempdir().unwrap();
-        // Small segments, so the committer is rolling underneath the appenders
-        // for the whole run.
+        // Small segments, so the committer rolls under the appenders.
         let w = Arc::new(WalWriter::open(opts(dir.path(), cfg(1, 4096, 16 * 1024))).unwrap());
 
         std::thread::scope(|scope| {
@@ -999,8 +853,6 @@ mod tests {
         );
     }
 
-    /// The refusal used to be permanent: the writer closed itself, so a full
-    /// disk that drained still needed a restart. What matters is the recovery.
     #[test]
     fn a_torn_segment_refuses_appends_and_the_committer_recovers_it() {
         let dir = tempfile::tempdir().unwrap();
@@ -1020,14 +872,10 @@ mod tests {
         w.append(&frame("after")).unwrap();
         w.close().unwrap();
 
-        // The torn segment is sealed intact and the new one holds what came
-        // next -- no record was lost and none was written past the tear.
         assert_eq!(read_back(dir.path()), ["before", "after"]);
         assert_eq!(list_segments(dir.path()).unwrap().len(), 2);
     }
 
-    /// `seal` is the other way out: a flush that lands while a roll is owed
-    /// resolves it, rather than leaving ingest refused behind a stale flag.
     #[test]
     fn sealing_also_clears_a_pending_roll() {
         let dir = tempfile::tempdir().unwrap();
@@ -1045,7 +893,6 @@ mod tests {
 
     #[test]
     fn a_batch_lands_as_the_frames_it_contains() {
-        // The server's path: many frames, one lock acquisition, no transcoding.
         let dir = tempfile::tempdir().unwrap();
         let w = WalWriter::open(opts(dir.path(), cfg(5, 4096, 1 << 20))).unwrap();
 

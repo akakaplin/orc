@@ -1,12 +1,8 @@
-//! Generating a DuckDB view that hides schema evolution from readers.
+//! `series/<name>/view.sql`: a DuckDB view hiding schema evolution.
 //!
-//! `orc` is write-only, so it cannot help readers at query time. What it can do
-//! is emit the SQL they would otherwise write themselves and get subtly wrong.
-//! Each flush regenerates `series/<name>/view.sql`, which unions every epoch by
-//! name and coalesces promoted keys against `extra`.
-//!
-//! Derived: pure text, reconstructible from the manifest plus the epoch tags in
-//! the filenames, so a crash while writing it costs nothing.
+//! Regenerated each flush; unions all epochs by name and coalesces keys that
+//! were undeclared in some epoch against `extra`. Derived from the manifest,
+//! so losing it in a crash is harmless.
 
 use std::collections::BTreeSet;
 
@@ -14,13 +10,11 @@ use crate::config::KeyDef;
 use crate::manifest::EpochSchema;
 use crate::record::KeyType;
 
-/// SQL string literal quoting: double any embedded single quote.
 fn sql_str(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
 }
 
-/// The DuckDB type a declared key reads back as, matching what
-/// [`crate::flush::parquet::parquet_schema`] writes.
+/// Must match [`crate::flush::parquet::parquet_schema`].
 fn duckdb_type(ty: KeyType) -> &'static str {
     match ty {
         KeyType::Bool => "BOOLEAN",
@@ -30,20 +24,13 @@ fn duckdb_type(ty: KeyType) -> &'static str {
     }
 }
 
-/// Quote an identifier for DuckDB, doubling embedded double quotes.
-///
-/// Always quoted, not quoted-if-needed: key names come from user config, and a
-/// column called `select` would otherwise be a syntax error.
+/// Always quoted: key names come from user config and may be SQL keywords.
 fn sql_ident(s: &str) -> String {
     format!("\"{}\"", s.replace('"', "\"\""))
 }
 
-/// Generate the `CREATE VIEW` text for one series.
-///
-/// `history` is the series' full epoch history, oldest first. A key present in
-/// *every* epoch is selected directly; one missing from any epoch is coalesced
-/// against `extra`, because that is where its values landed in the epochs where
-/// it was undeclared.
+/// `CREATE VIEW` for one series. `history` is oldest first. A key missing
+/// from any epoch is coalesced against `extra`, where its values landed then.
 pub fn view_sql(series: &str, history: &[EpochSchema]) -> String {
     let mut all_keys: Vec<&KeyDef> = Vec::new();
     for epoch in history {
@@ -83,16 +70,8 @@ pub fn view_sql(series: &str, history: &[EpochSchema]) -> String {
         if present_everywhere {
             sql.push_str(&format!("  {ident},\n"));
         } else {
-            // Declared in some epochs, in `extra` in the others.
-            //
-            // The cast is not optional: `extra`'s values are UTF-8, and DuckDB
-            // refuses to coalesce BIGINT against VARCHAR ("an explicit cast is
-            // required"), so without it the file does not run at all once a
-            // non-string key is promoted.
-            //
-            // `try_cast`, not `cast`: the `extra` half is whatever a producer
-            // wrote, and a plain cast turns one unparseable value into a
-            // Conversion Error that fails the whole query.
+            // DuckDB won't coalesce typed vs VARCHAR, so cast `extra`; `try_cast`
+            // so one unparseable producer value doesn't fail the whole query.
             let ty = duckdb_type(k.ty);
             sql.push_str(&format!(
                 "  coalesce({ident}, try_cast(extra[{}] AS {ty})) AS {ident},\n",
@@ -109,8 +88,7 @@ pub fn view_sql(series: &str, history: &[EpochSchema]) -> String {
     sql
 }
 
-/// Names of every column the generated view exposes, in order — so a caller can
-/// describe a series without parsing SQL.
+/// Columns the generated view exposes, in order.
 pub fn view_columns(history: &[EpochSchema]) -> Vec<String> {
     let mut seen = BTreeSet::new();
     let mut cols = vec!["ts".to_string(), "id".to_string()];
@@ -159,9 +137,7 @@ mod tests {
 
     #[test]
     fn promoted_key_is_coalesced_against_extra() {
-        // `venue` was undeclared at epoch 0 (so its values are in `extra`) and
-        // declared at epoch 1. Reading both halves as one column is the whole
-        // reason this file is generated.
+        // `venue`: in `extra` at epoch 0, declared at epoch 1.
         let h = [epoch(0, &["symbol"]), epoch(1, &["symbol", "venue"])];
         let sql = view_sql("trades", &h);
         assert!(sql.contains("  \"symbol\",\n"), "stable key: {sql}");
@@ -171,9 +147,7 @@ mod tests {
         );
     }
 
-    /// The `extra` half of a coalesce is always UTF-8, so without a cast back to
-    /// the declared type DuckDB resolves the column to VARCHAR — promoting an
-    /// `i64` key would silently turn `size > 9` into a string comparison.
+    /// Without the cast, a promoted `i64` key would compare as a string.
     #[test]
     fn a_promoted_key_keeps_the_type_its_config_declares() {
         for (ty, sql_type) in [
@@ -204,8 +178,7 @@ mod tests {
 
     #[test]
     fn demoted_key_is_also_coalesced() {
-        // Same mechanism in reverse: declared at epoch 0, dropped at epoch 1, so
-        // later values arrive in `extra`.
+        // Declared at epoch 0, dropped at epoch 1.
         let h = [epoch(0, &["venue"]), epoch(1, &[])];
         let sql = view_sql("trades", &h);
         assert!(
@@ -216,10 +189,8 @@ mod tests {
 
     #[test]
     fn identifiers_and_literals_are_quoted() {
-        // A key named after a SQL keyword, and one with a quote in it, must not
-        // produce a syntax error or an injection. Two epochs, so the quoted key
-        // takes the coalesce path and its name appears as a string literal as
-        // well as an identifier -- the two escapings differ.
+        // Keyword and quote in names; the coalesce path escapes the name both
+        // as identifier and as literal.
         let h = [epoch(0, &["select"]), epoch(1, &["select", "it's"])];
         let sql = view_sql("odd\"name", &h);
         assert!(sql.contains("\"select\","), "keyword as ident: {sql}");

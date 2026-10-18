@@ -15,11 +15,7 @@ const DEFAULT_DATA_DIR: &str = "./data";
 #[command(name = "orc-server", version, about)]
 struct Args {
     /// Data directory. Overrides `data_dir` in the config file.
-    ///
-    /// `Option`, not a `default_value`, so "not passed" differs from "passed the
-    /// default". With a default the override fires unconditionally, and
-    /// `--config /etc/orc/config.json` silently ignores that file's own
-    /// `data_dir`.
+    // No `default_value`: it would always override the config's `data_dir`.
     #[arg(long)]
     data: Option<PathBuf>,
 
@@ -44,12 +40,7 @@ fn main() -> std::process::ExitCode {
     }
 }
 
-/// `RUST_LOG` as a bare level: `error`, `warn`, `info`, `debug` or `trace`.
-///
-/// Not `EnvFilter`: per-target directives cost five crates, and one binary
-/// logging from one crate has no targets to discriminate between. Anything else
-/// is reported rather than ignored — a filter that quietly does nothing is worse
-/// than no filter.
+/// `RUST_LOG` as a bare level (no `EnvFilter`); anything else warns and uses info.
 fn log_level() -> tracing::Level {
     use std::str::FromStr;
 
@@ -78,10 +69,7 @@ fn run() -> orc::Result<()> {
     });
 
     let mut config = Config::load(&config_path)?;
-    // `--data` wins over the file's own `data_dir`, which is self-referential:
-    // honouring it over the path we were pointed at is how a server reads one
-    // directory's config and writes another's. Absent the flag the file decides,
-    // which is the only way `--config` alone can work.
+    // `--data` wins; without it the config file's `data_dir` decides.
     if let Some(data) = &args.data {
         if data != &config.data_dir {
             tracing::info!(

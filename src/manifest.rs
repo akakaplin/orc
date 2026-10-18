@@ -1,14 +1,8 @@
 //! `manifest.json` — schema history and the flush commit point.
 //!
-//! The manifest holds the two things that cannot be recovered by looking at the
-//! data directory: what each series' key list was at each schema epoch, and how
-//! far the flush has got.
-//!
-//! It is deliberately **O(epochs), never O(files)**. A file inventory would grow
-//! ~8,760 entries per series per year and be rewritten on the crash-critical path
-//! every hour; the epoch tag in each filename (`…-….e7.parquet`) carries the
-//! file→schema association instead, so a series whose keys never change keeps one
-//! history entry forever.
+//! Holds what the data directory cannot tell us: each series' keys per schema
+//! epoch, and how far the flush has got. Size is O(epochs), never O(files): the
+//! epoch tag in each filename (`….e7.parquet`) links files to schemas.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -20,49 +14,34 @@ use crate::error::{Error, Result};
 
 /// Committed manifest filename, relative to `data_dir`.
 pub const MANIFEST_FILE: &str = "manifest.json";
-/// Staging filename. Lives next to the manifest, not in `tmp/`, so the rename
-/// is guaranteed to stay within one filesystem and therefore atomic.
+/// Staging filename, next to the manifest so the rename stays atomic.
 pub const MANIFEST_TMP_FILE: &str = "manifest.json.tmp";
 
 /// One entry of a series' schema history.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EpochSchema {
     pub epoch: u32,
-    /// The declared keys in force at this epoch, in positional order. Frames
-    /// stamped with this epoch are decoded against exactly this list.
+    /// Keys in positional order; frames stamped with this epoch decode against it.
     pub keys: Vec<KeyDef>,
 }
 
-/// The contents of `manifest.json`.
-///
-/// Unknown fields are tolerated, unlike in `Config`: the engine writes this, so
-/// the useful property is that an older binary can read a newer one's manifest.
+/// The contents of `manifest.json`. Unknown fields are tolerated so an older
+/// binary can read a newer manifest.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Manifest {
-    /// Per-series schema history, oldest epoch first. `BTreeMap` so the
-    /// serialized file has a stable key order and a diff between two commits
-    /// shows only what actually changed.
+    /// Per-series schema history, oldest first (`BTreeMap` for stable output).
     pub series: BTreeMap<String, Vec<EpochSchema>>,
-    /// Every WAL segment with `id <= last_flushed_segment` is durable in
-    /// Parquet and is deleted at startup.
+    /// WAL segments with `id <= last_flushed_segment` are durable in Parquet.
     pub last_flushed_segment: u64,
-    /// When the last flush committed, in epoch microseconds.
-    ///
-    /// The next flush is scheduled relative to *this*, not to process start: an
-    /// engine restarting every few minutes would otherwise never reach an hourly
-    /// timer. `None` means never flushed, making the first startup flush
-    /// unconditional.
+    /// Last flush commit time (epoch µs). The next flush is scheduled from this,
+    /// not process start, so frequent restarts still flush. `None`: never flushed.
     pub last_flush_at: Option<u64>,
 }
 
 impl Manifest {
-    /// Read `<data_dir>/manifest.json`, tolerating a fresh directory.
-    ///
-    /// A missing file is not an error — it is what an unopened data directory
-    /// looks like. Any `manifest.json.tmp` is discarded first: it can only come
-    /// from a crash between the staging write and the rename, so the flush it
-    /// belonged to never committed and its segments will be replayed.
+    /// Read `<data_dir>/manifest.json`; a missing file yields the default. A
+    /// leftover `manifest.json.tmp` is from an uncommitted flush and is deleted.
     pub fn load(data_dir: impl AsRef<Path>) -> Result<Manifest> {
         let data_dir = data_dir.as_ref();
         let tmp = data_dir.join(MANIFEST_TMP_FILE);
@@ -83,36 +62,17 @@ impl Manifest {
         serde_json::from_str(&text).map_err(|e| Error::Config(format!("{}: {e}", path.display())))
     }
 
-    /// Is there a committed manifest in this directory?
-    ///
-    /// [`Manifest::load`] cannot answer this — a fresh directory and one whose
-    /// manifest went missing both come back as [`Manifest::default`] — and the
-    /// two call for opposite responses. The second has lost the only record of
-    /// how far the flush got, and
-    /// [`sweep_uncommitted`](crate::flush::planner::sweep_uncommitted) would read
-    /// the resulting `last_flushed_segment: 0` as "every Parquet file here is
-    /// uncommitted".
+    /// Is there a committed manifest? [`Manifest::load`] returns the default for
+    /// both a fresh and a lost manifest; a lost one must not reach
+    /// [`sweep_uncommitted`](crate::flush::planner::sweep_uncommitted), which
+    /// would treat everything as uncommitted.
     pub fn exists(data_dir: impl AsRef<Path>) -> bool {
         data_dir.as_ref().join(MANIFEST_FILE).is_file()
     }
 
-    /// Atomically replace `<data_dir>/manifest.json`.
-    ///
-    /// **This is the flush commit point, and the order below is the durability
-    /// guarantee — it must be exactly:**
-    ///
-    /// 1. write `manifest.json.tmp`
-    /// 2. `fsync` that file — otherwise the rename can be durable while the
-    ///    bytes it points at are not, and a power cut leaves a committed
-    ///    manifest with truncated or zero-filled contents
-    /// 3. `rename` over `manifest.json` — atomic, so a reader sees either the
-    ///    whole old manifest or the whole new one, never a half-written file
-    /// 4. `fsync` the directory — otherwise the rename itself is not durable,
-    ///    and a power cut can resurrect the old manifest even though the new
-    ///    file's contents were synced
-    ///
-    /// Step 3 is the point either side of which a crash is survivable — see
-    /// [`crate::flush::planner`] for what each side leaves behind.
+    /// Atomically replace `manifest.json`: the flush commit point. Order matters:
+    /// write tmp, fsync it, rename over `manifest.json`, fsync the directory.
+    /// The rename is the commit; see [`crate::flush::planner`] for crash cases.
     pub fn commit(&self, data_dir: impl AsRef<Path>) -> Result<()> {
         use std::io::Write;
 
@@ -120,8 +80,7 @@ impl Manifest {
         let tmp: PathBuf = data_dir.join(MANIFEST_TMP_FILE);
         let final_path = data_dir.join(MANIFEST_FILE);
 
-        // Pretty-printed: this file is read by humans debugging a stalled flush
-        // far more often than it is written, and it is at most a few KiB.
+        // Pretty-printed for humans; it is small.
         let bytes = serde_json::to_vec_pretty(self)?;
 
         let mut f = std::fs::File::create(&tmp)?;
@@ -132,31 +91,15 @@ impl Manifest {
 
         std::fs::rename(&tmp, &final_path)?;
 
-        // Syncing the *directory* is what makes the rename itself durable.
+        // Makes the rename durable.
         std::fs::File::open(data_dir)?.sync_all()?;
         Ok(())
     }
 
-    /// Fold a config into the schema history, bumping epochs where needed.
-    ///
-    /// The epoch is **per series**. A global counter would fragment bystanders:
-    /// adding a key to `trades` would roll `quotes` from `.e7.` to `.e8.` too,
-    /// splitting its files across two epochs describing identical schemas.
-    ///
-    /// Adding, removing and reordering keys are safe — readers union by name, and
-    /// frames are positional *per epoch*. **Retyping is rejected**, because
-    /// `union_by_name` cannot reconcile a `utf8` column with an `int64` one of
-    /// the same name. Rename the key, or start a new series.
-    ///
-    /// Series in the history but absent from the config are left alone; re-adding
-    /// the name resumes the same epoch if the keys match. All-or-nothing: every
-    /// series is checked before any is mutated, so a rejected retype cannot leave
-    /// the manifest half-updated.
-    ///
-    /// Returns whether anything changed, so the caller knows whether it owes a
-    /// [`Manifest::commit`]. An epoch that exists only in memory is worse than
-    /// none — frames stamped with it are already durable, and the next start
-    /// would mint the same number for a different key list.
+    /// Fold a config into the schema history, bumping per-series epochs on
+    /// layout changes. Add/remove/reorder is fine; retyping is rejected (readers
+    /// union by name). All-or-nothing. Returns whether anything changed: the
+    /// caller must then [`Manifest::commit`] before stamping frames with it.
     pub fn reconcile(&mut self, config: &Config) -> Result<bool> {
         for series in &config.series {
             let history = self
@@ -171,18 +114,13 @@ impl Manifest {
         for series in &config.series {
             let history = self.series.entry(series.name.clone()).or_default();
 
-            // An epoch identifies a *layout*: positional order and types.
-            // `nullable` is neither -- flipping it leaves the frame encoding and
-            // the Parquet schema byte-identical -- so bumping for it would split
-            // a series across two epochs describing the same thing.
+            // An epoch is a layout (order + types); `nullable` does not bump it.
             let same_layout = history.last().is_some_and(|last| {
                 last.keys.len() == series.keys.len()
                     && std::iter::zip(&last.keys, &series.keys)
                         .all(|(a, b)| a.name == b.name && a.ty == b.ty)
             });
             if same_layout {
-                // Refresh in place so the history still reports what ingest
-                // currently enforces, without minting an epoch for it.
                 if let Some(last) = history.last_mut()
                     && last.keys != series.keys
                 {
@@ -222,12 +160,8 @@ impl Manifest {
         self.series.get(series)?.last().map(|e| e.epoch)
     }
 
-    /// The key list a frame stamped with `epoch` must be decoded against.
-    ///
-    /// `None` becomes a [`FrameFault::UnknownSchema`] at the reader, which the
-    /// flush counts and skips: old epochs are never removed, so a frame naming
-    /// one that is absent can only come from a truncated or hand-edited
-    /// manifest.
+    /// Keys for `epoch`. `None` becomes [`FrameFault::UnknownSchema`], which
+    /// the flush counts and skips.
     ///
     /// [`FrameFault::UnknownSchema`]: crate::wal::reader::FrameFault::UnknownSchema
     pub fn schema(&self, series: &str, epoch: u32) -> Option<&[KeyDef]> {
@@ -239,11 +173,7 @@ impl Manifest {
     }
 }
 
-/// Reject a key whose type differs from any it has ever had.
-///
-/// The whole history, not just the latest epoch: `union_by_name` spans every
-/// epoch's files, so dropping a `string` key and re-adding it as an `i64` two
-/// epochs later breaks the same query as changing it in place.
+/// Reject a key whose type differs from any it has had in any epoch.
 fn check_no_retype(series: &str, history: &[EpochSchema], keys: &[KeyDef]) -> Result<()> {
     for past in history {
         for old in &past.keys {
@@ -312,8 +242,6 @@ mod tests {
         assert_eq!(m.series["trades"].len(), 1, "history must not grow");
     }
 
-    /// The caller commits on `true` and skips the write on `false`, so a wrong
-    /// answer either loses a minted epoch or rewrites the file on every restart.
     #[test]
     fn reconcile_reports_whether_it_changed_anything() {
         let cfg = config(&[("trades", vec![key("symbol", KeyType::Str)])]);
@@ -329,8 +257,7 @@ mod tests {
         assert!(m.reconcile(&grown).unwrap());
         assert!(!m.reconcile(&grown).unwrap());
 
-        // A nullable-only edit mints no epoch but still rewrites the history,
-        // so it has to count as a change or the file goes stale.
+        // Nullable-only: no epoch, but still a change.
         let mut relaxed = key("symbol", KeyType::Str);
         relaxed.nullable = true;
         let same_layout = config(&[("trades", vec![relaxed, key("size", KeyType::I64)])]);
@@ -360,8 +287,6 @@ mod tests {
         .unwrap();
 
         assert_eq!(m.current_epoch("trades"), Some(1));
-        // The bystander keeps its epoch *and* its history verbatim -- this is
-        // the whole reason the epoch is per series rather than global.
         assert_eq!(m.current_epoch("quotes"), Some(0));
         assert_eq!(m.series["quotes"], quotes_before);
     }
@@ -398,14 +323,11 @@ mod tests {
         assert!(msg.contains("\"size\""), "{msg}");
         assert!(msg.contains("string"), "{msg}");
         assert!(msg.contains("i64"), "{msg}");
-        // A rejected reconcile must leave the history untouched.
         assert_eq!(m.current_epoch("t"), Some(0));
     }
 
     #[test]
     fn retyping_a_key_removed_two_epochs_ago_is_still_rejected() {
-        // Old Parquet still carries the column, and readers union by name across
-        // every epoch -- so the gap does not make this safe.
         let mut m = Manifest::default();
         m.reconcile(&config(&[("t", vec![key("size", KeyType::Str)])]))
             .unwrap();
@@ -418,11 +340,6 @@ mod tests {
 
     #[test]
     fn nullable_only_change_does_not_mint_an_epoch() {
-        // An epoch names a layout. `nullable` changes neither the frame encoding
-        // nor the Parquet schema (key columns are always written nullable), so
-        // minting one here would fragment the series' files across two epochs
-        // describing the same thing -- while the history must still report what
-        // ingest now enforces.
         let mut m = Manifest::default();
         m.reconcile(&config(&[("t", vec![key("k", KeyType::Str)])]))
             .unwrap();
@@ -467,7 +384,6 @@ mod tests {
         m.commit(dir.path()).unwrap();
 
         assert_eq!(Manifest::load(dir.path()).unwrap(), m);
-        // The staging file must not survive a successful commit.
         assert!(!dir.path().join(MANIFEST_TMP_FILE).exists());
     }
 
@@ -478,8 +394,6 @@ mod tests {
         assert_eq!(Manifest::default().last_flush_at, None);
     }
 
-    /// `load` cannot distinguish "fresh" from "lost". This is how the caller
-    /// tells them apart.
     #[test]
     fn exists_separates_a_fresh_directory_from_a_lost_manifest() {
         let dir = tempfile::tempdir().unwrap();
@@ -490,7 +404,6 @@ mod tests {
 
         std::fs::remove_file(dir.path().join(MANIFEST_FILE)).unwrap();
         assert!(!Manifest::exists(dir.path()));
-        // ...while `load` reports the same thing in both cases.
         assert_eq!(Manifest::load(dir.path()).unwrap(), Manifest::default());
     }
 
@@ -503,8 +416,7 @@ mod tests {
         };
         committed.commit(dir.path()).unwrap();
 
-        // A crash between the staging write and the rename leaves this behind,
-        // describing a flush that never committed.
+        // Left by a crash before the rename.
         std::fs::write(
             dir.path().join(MANIFEST_TMP_FILE),
             br#"{"last_flushed_segment": 999}"#,
